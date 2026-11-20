@@ -1,0 +1,12 @@
+[package]
+name = "zenith-terminal"
+description = "PTY-backed terminal emulator core for the Zenith editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+anyhow.workspace = true
+log.workspace = true

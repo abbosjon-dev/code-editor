@@ -1,0 +1,136 @@
+//! User settings (`settings.toml`) and session state.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use zenith_ai::AgentProfile;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// "zenith-midnight" or "zenith-daylight".
+    pub theme: String,
+    /// Syntax highlighting theme (any bat/two-face theme name, e.g. "OneHalfDark", "Dracula", "Nord").
+    pub syntax_theme: String,
+    pub ui_font_size: f32,
+    pub editor_font_size: f32,
+    pub terminal_font_size: f32,
+    pub line_height: f32,
+    pub tab_size: usize,
+    pub insert_spaces: bool,
+    pub show_indent_guides: bool,
+    pub show_minimap: bool,
+    pub cursor_blink: bool,
+    pub auto_save: bool,
+    pub format_trim_trailing_whitespace: bool,
+    /// Custom shell for new terminals (empty = system default).
+    pub shell: String,
+    /// Which agent the "Ask AI" shortcuts talk to.
+    pub default_agent: String,
+    /// Extra / overridden AI agents.
+    pub agents: Vec<AgentProfile>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: "zenith-midnight".into(),
+            syntax_theme: "OneHalfDark".into(),
+            ui_font_size: 13.5,
+            editor_font_size: 14.0,
+            terminal_font_size: 13.0,
+            line_height: 1.5,
+            tab_size: 4,
+            insert_spaces: true,
+            show_indent_guides: true,
+            show_minimap: true,
+            cursor_blink: true,
+            auto_save: false,
+            format_trim_trailing_whitespace: false,
+            shell: String::new(),
+            default_agent: "claude".into(),
+            agents: vec![],
+        }
+    }
+}
+
+pub fn config_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("ZENITH_CONFIG_DIR") {
+        return PathBuf::from(p);
+    }
+    directories::ProjectDirs::from("dev", "Zenith", "zenith")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".zenith"))
+}
+
+pub fn settings_path() -> PathBuf {
+    config_dir().join("settings.toml")
+}
+
+pub fn plugins_dir() -> PathBuf {
+    config_dir().join("plugins")
+}
+
+fn session_path() -> PathBuf {
+    config_dir().join("session.json")
+}
+
+impl Settings {
+    pub fn load() -> (Self, Option<String>) {
+        let path = settings_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(s) => (s, None),
+                Err(e) => (Self::default(), Some(format!("settings.toml: {e}"))),
+            },
+            Err(_) => {
+                let s = Self::default();
+                let _ = s.write_default(&path);
+                (s, None)
+            }
+        }
+    }
+
+    fn write_default(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let body = toml::to_string_pretty(self).unwrap_or_default();
+        let header = "# Zenith settings. Saved changes apply immediately.\n\
+# Add your own AI agent CLIs like this:\n\
+#\n\
+# [[agents]]\n\
+# id = \"my-agent\"\n\
+# name = \"My Agent\"\n\
+# command = \"my-agent-cli\"\n\
+# args = [\"--flag\"]\n\n";
+        std::fs::write(path, format!("{header}{body}"))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    pub workspace: Option<PathBuf>,
+    pub open_files: Vec<PathBuf>,
+    pub active: usize,
+    pub recent_workspaces: Vec<PathBuf>,
+    pub sidebar_width: Option<f32>,
+    pub zoom: f32,
+}
+
+impl Session {
+    pub fn load() -> Self {
+        std::fs::read_to_string(session_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = session_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(t) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, t);
+        }
+    }
+}

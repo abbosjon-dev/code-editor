@@ -1,0 +1,34 @@
+[package]
+name = "zenith-app"
+description = "Zenith — a fast, extensible, AI-native code editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "zenith"
+
+[[bin]]
+name = "zenith"
+path = "src/main.rs"
+
+[dependencies]
+zenith-core.workspace = true
+zenith-terminal.workspace = true
+zenith-plugin.workspace = true
+zenith-ai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+log.workspace = true
+
+eframe = { version = "0.31.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.31.1", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-onig"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
+rfd = "0.18"
+ignore = "0.4"
+nucleo-matcher = "0.3"
+directories = "6"
+unicode-width = "0.2"
+env_logger = "0.11"
+

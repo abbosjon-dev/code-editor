@@ -1,0 +1,179 @@
+//! Built-in commands (shown in the command palette and menus).
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmd {
+    NewFile,
+    OpenFile,
+    OpenFolder,
+    Save,
+    SaveAs,
+    SaveAll,
+    CloseTab,
+    CloseAll,
+    QuickOpen,
+    CommandPalette,
+    GotoLine,
+    Find,
+    Replace,
+    FindInFiles,
+    ToggleSidebar,
+    ToggleTerminal,
+    ToggleAiPanel,
+    NewTerminal,
+    NextTab,
+    PrevTab,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ToggleMinimap,
+    SelectTheme,
+    SelectSyntaxTheme,
+    SelectLanguage,
+    OpenSettings,
+    OpenPluginsFolder,
+    ReloadPlugins,
+    AskAgent,
+    SendSelectionToAgent,
+    SendFileToAgent,
+    ShowPlugins,
+    ShowExplorer,
+    ShowAgents,
+    ReloadFile,
+    About,
+    Quit,
+}
+
+impl Cmd {
+    pub fn all() -> &'static [Cmd] {
+        use Cmd::*;
+        &[
+            NewFile,
+            OpenFile,
+            OpenFolder,
+            Save,
+            SaveAs,
+            SaveAll,
+            CloseTab,
+            CloseAll,
+            QuickOpen,
+            CommandPalette,
+            GotoLine,
+            Find,
+            Replace,
+            FindInFiles,
+            ToggleSidebar,
+            ToggleTerminal,
+            ToggleAiPanel,
+            NewTerminal,
+            NextTab,
+            PrevTab,
+            ZoomIn,
+            ZoomOut,
+            ZoomReset,
+            ToggleMinimap,
+            SelectTheme,
+            SelectSyntaxTheme,
+            SelectLanguage,
+            OpenSettings,
+            OpenPluginsFolder,
+            ReloadPlugins,
+            AskAgent,
+            SendSelectionToAgent,
+            SendFileToAgent,
+            ShowPlugins,
+            ShowExplorer,
+            ShowAgents,
+            ReloadFile,
+            About,
+            Quit,
+        ]
+    }
+
+    pub fn title(self) -> &'static str {
+        use Cmd::*;
+        match self {
+            NewFile => "File: New File",
+            OpenFile => "File: Open File…",
+            OpenFolder => "File: Open Folder…",
+            Save => "File: Save",
+            SaveAs => "File: Save As…",
+            SaveAll => "File: Save All",
+            CloseTab => "View: Close Editor",
+            CloseAll => "View: Close All Editors",
+            QuickOpen => "Go: Quick Open File…",
+            CommandPalette => "View: Command Palette",
+            GotoLine => "Go: Go to Line…",
+            Find => "Edit: Find",
+            Replace => "Edit: Replace",
+            FindInFiles => "Search: Find in Files",
+            ToggleSidebar => "View: Toggle Sidebar",
+            ToggleTerminal => "View: Toggle Terminal",
+            ToggleAiPanel => "View: Toggle AI Agent Panel",
+            NewTerminal => "Terminal: New Terminal",
+            NextTab => "View: Next Editor",
+            PrevTab => "View: Previous Editor",
+            ZoomIn => "View: Zoom In",
+            ZoomOut => "View: Zoom Out",
+            ZoomReset => "View: Reset Zoom",
+            ToggleMinimap => "View: Toggle Minimap",
+            SelectTheme => "Preferences: Color Theme",
+            SelectSyntaxTheme => "Preferences: Syntax Theme",
+            SelectLanguage => "Editor: Change Language Mode",
+            OpenSettings => "Preferences: Open Settings (TOML)",
+            OpenPluginsFolder => "Plugins: Open Plugins Folder",
+            ReloadPlugins => "Plugins: Reload Plugins",
+            AskAgent => "AI: Ask Agent About Selection…",
+            SendSelectionToAgent => "AI: Send Selection to Agent",
+            SendFileToAgent => "AI: Send Current File to Agent",
+            ShowPlugins => "View: Show Plugins",
+            ShowExplorer => "View: Show Explorer",
+            ShowAgents => "AI: Show Agents",
+            ReloadFile => "File: Revert / Reload From Disk",
+            About => "Help: About Zenith",
+            Quit => "File: Quit",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        use Cmd::*;
+        let mac = cfg!(target_os = "macos");
+        macro_rules! k {
+            ($m:literal, $o:literal) => {
+                if mac {
+                    $m
+                } else {
+                    $o
+                }
+            };
+        }
+        match self {
+            NewFile => k!("⌘N", "Ctrl+N"),
+            OpenFile => k!("⌘O", "Ctrl+O"),
+            OpenFolder => k!("⌘⇧O", "Ctrl+Shift+O"),
+            Save => k!("⌘S", "Ctrl+S"),
+            SaveAs => k!("⌘⇧S", "Ctrl+Shift+S"),
+            SaveAll => k!("⌘⌥S", "Ctrl+Alt+S"),
+            CloseTab => k!("⌘W", "Ctrl+W"),
+            QuickOpen => k!("⌘P", "Ctrl+P"),
+            CommandPalette => k!("⌘⇧P", "Ctrl+Shift+P"),
+            GotoLine => k!("⌘G", "Ctrl+G"),
+            Find => k!("⌘F", "Ctrl+F"),
+            Replace => k!("⌘H", "Ctrl+H"),
+            FindInFiles => k!("⌘⇧F", "Ctrl+Shift+F"),
+            ToggleSidebar => k!("⌘B", "Ctrl+B"),
+            ToggleTerminal => k!("⌃`", "Ctrl+`"),
+            ToggleAiPanel => k!("⌘⇧A", "Ctrl+Shift+A"),
+            NewTerminal => k!("⌃⇧`", "Ctrl+Shift+`"),
+            NextTab => k!("⌃Tab", "Ctrl+Tab"),
+            PrevTab => k!("⌃⇧Tab", "Ctrl+Shift+Tab"),
+            ZoomIn => k!("⌘=", "Ctrl+="),
+            ZoomOut => k!("⌘-", "Ctrl+-"),
+            ZoomReset => k!("⌘0", "Ctrl+0"),
+            OpenSettings => k!("⌘,", "Ctrl+,"),
+            AskAgent => k!("⌘⇧K", "Ctrl+Shift+I"),
+            SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
+            Quit => k!("⌘Q", "Ctrl+Q"),
+            _ => "",
+        }
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "zenith-core"
+description = "Text buffer, selections, undo/redo and search for the Zenith editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey.workspace = true

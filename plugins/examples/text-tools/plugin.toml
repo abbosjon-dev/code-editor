@@ -1,0 +1,28 @@
+id = "text-tools"
+name = "Text Tools"
+version = "0.1.0"
+description = "Example plugin: word count, sort lines, UPPER/lower case, ask AI to document code."
+# Any executable works. Relative paths are resolved inside this folder.
+run = ["python3", "main.py"]
+# Editor events this plugin wants to receive.
+events = ["file_saved"]
+
+[[commands]]
+id = "text-tools.word-count"
+title = "Text Tools: Word Count"
+
+[[commands]]
+id = "text-tools.sort-lines"
+title = "Text Tools: Sort Selected Lines"
+
+[[commands]]
+id = "text-tools.upper"
+title = "Text Tools: UPPERCASE Selection"
+
+[[commands]]
+id = "text-tools.lower"
+title = "Text Tools: lowercase Selection"
+
+[[commands]]
+id = "text-tools.ai-docs"
+title = "Text Tools: Ask AI to Document Selection"

@@ -1,0 +1,13 @@
+[package]
+name = "zenith-plugin"
+description = "Out-of-process plugin host for the Zenith editor (JSON lines over stdio)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+log.workspace = true

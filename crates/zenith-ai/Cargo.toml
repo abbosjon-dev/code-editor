@@ -1,0 +1,10 @@
+[package]
+name = "zenith-ai"
+description = "AI agent CLI profiles (Claude Code, Codex, Gemini, Aider, ...) for the Zenith editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+which.workspace = true
