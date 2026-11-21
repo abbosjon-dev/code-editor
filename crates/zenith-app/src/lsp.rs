@@ -26,14 +26,41 @@ pub struct LspManager {
 
 /// What the app should do with an event that isn't tied to a document.
 pub enum LspOutcome {
-    GotoLocation { path: PathBuf, line: u32, character: u32 },
+    GotoLocation {
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     Message(String),
-    References { request: u64, locations: Vec<zenith_lsp::Location> },
-    WorkspaceEdit { request: u64, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>, error: Option<String> },
-    Formatting { request: u64, edits: Vec<zenith_lsp::TextEdit> },
-    CodeActions { request: u64, actions: Vec<zenith_lsp::CodeAction> },
-    Symbols { request: u64, symbols: Vec<zenith_lsp::Symbol> },
-    ApplyEdit { edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)> },
+    References {
+        request: u64,
+        locations: Vec<zenith_lsp::Location>,
+    },
+    WorkspaceEdit {
+        request: u64,
+        edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>,
+        error: Option<String>,
+    },
+    Formatting {
+        request: u64,
+        edits: Vec<zenith_lsp::TextEdit>,
+    },
+    CodeActions {
+        request: u64,
+        actions: Vec<zenith_lsp::CodeAction>,
+    },
+    Symbols {
+        request: u64,
+        symbols: Vec<zenith_lsp::Symbol>,
+    },
+    ApplyEdit {
+        edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>,
+    },
+    /// Diagnostics for any file (open or not), for the Problems panel.
+    Diagnostics {
+        path: PathBuf,
+        diagnostics: Vec<zenith_lsp::Diagnostic>,
+    },
 }
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -263,9 +290,11 @@ impl LspManager {
         for ev in self.rx.try_iter().collect::<Vec<_>>() {
             match ev {
                 LspEvent::Diagnostics { path, diagnostics, .. } => {
+                    let path = path.canonicalize().unwrap_or(path);
                     if let Some(doc) = docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
-                        doc.set_diagnostics(diagnostics);
+                        doc.set_diagnostics(diagnostics.clone());
                     }
+                    out.push(LspOutcome::Diagnostics { path, diagnostics });
                 }
                 LspEvent::Completion { request, items } => {
                     for doc in docs.iter_mut() {

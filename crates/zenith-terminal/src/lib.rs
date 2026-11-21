@@ -349,3 +349,88 @@ mod tests {
         }
     }
 }
+
+/// A clickable thing found in terminal output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    Url(String),
+    /// A file path with optional 1-based line and column (`src/a.rs:12:5`).
+    File {
+        path: String,
+        line: Option<usize>,
+        col: Option<usize>,
+    },
+}
+
+/// Find the link under char column `col` of a terminal row.
+pub fn link_at(row: &str, col: usize) -> Option<Link> {
+    let chars: Vec<char> = row.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return None;
+    }
+    let stop = |c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}')
+    };
+    let mut s = col;
+    while s > 0 && !stop(chars[s - 1]) {
+        s -= 1;
+    }
+    let mut e = col;
+    while e < chars.len() && !stop(chars[e]) {
+        e += 1;
+    }
+    let mut token: String = chars[s..e].iter().collect();
+    // Trailing punctuation is usually not part of the link.
+    while token.ends_with(['.', ',', ';', ':', '!', '?']) {
+        token.pop();
+    }
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return Some(Link::Url(token));
+    }
+    // Rust-style `--> src/main.rs:3:5` and Python-style `File "x.py", line 3` (path part only).
+    let mut parts = token.rsplitn(3, ':').collect::<Vec<_>>();
+    parts.reverse();
+    let (path, line, col) = match parts.as_slice() {
+        [p, l, c] if l.parse::<usize>().is_ok() && c.parse::<usize>().is_ok() => {
+            (p.to_string(), l.parse().ok(), c.parse().ok())
+        }
+        [p, l, c] if c.parse::<usize>().is_ok() => (format!("{p}:{l}"), c.parse().ok(), None),
+        [p, l] if l.parse::<usize>().is_ok() => (p.to_string(), l.parse().ok(), None),
+        _ => (token.clone(), None, None),
+    };
+    // Must look like a file: has an extension or a path separator, and no URL-ish scheme.
+    let looks_like_file = !path.is_empty()
+        && !path.contains("://")
+        && (path.contains('/')
+            || path.contains('\\')
+            || path.rsplit_once('.').is_some_and(|(a, ext)| {
+                !a.is_empty() && !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            }));
+    looks_like_file.then_some(Link::File { path, line, col })
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn finds_links() {
+        let row = "  --> src/main.rs:12:5 and see https://example.com/docs.";
+        assert_eq!(link_at(row, 10), Some(Link::File { path: "src/main.rs".into(), line: Some(12), col: Some(5) }));
+        assert_eq!(link_at(row, 40), Some(Link::Url("https://example.com/docs".into())));
+        assert_eq!(link_at(row, 25), None); // "and"
+        assert_eq!(
+            link_at("error in app.py:7", 12),
+            Some(Link::File { path: "app.py".into(), line: Some(7), col: None })
+        );
+        assert_eq!(
+            link_at("C:\\proj\\a.rs:3:1", 3),
+            Some(Link::File { path: "C:\\proj\\a.rs".into(), line: Some(3), col: Some(1) })
+        );
+        assert_eq!(link_at("hello world", 2), None);
+        assert_eq!(
+            link_at("  File \"/tmp/x.py\", line 3", 10),
+            Some(Link::File { path: "/tmp/x.py".into(), line: None, col: None })
+        );
+    }
+}

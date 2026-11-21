@@ -79,6 +79,8 @@ impl TermTab {
 
 pub enum TermEvent {
     Restart,
+    /// Ctrl/Cmd+click on a file path or URL in the output.
+    OpenLink(zenith_terminal::Link),
 }
 
 fn color(c: Color, p: &Palette, default: Color32) -> Color32 {
@@ -154,6 +156,21 @@ pub fn terminal_ui(
 
     // --- scroll wheel ---
     let mut event = None;
+
+    // --- Ctrl/Cmd+click links (file:line:col, URLs) ---
+    let link_mod = ui.input(|i| i.modifiers.command);
+    if link_mod {
+        if let Some(pos) = resp.hover_pos() {
+            let (r, c) = cell_at(pos);
+            let row = term.lock().screen().contents_between(r, 0, r, cols);
+            if let Some(link) = zenith_terminal::link_at(&row, c as usize) {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                if resp.clicked() {
+                    event = Some(TermEvent::OpenLink(link));
+                }
+            }
+        }
+    }
     if resp.hovered() {
         let dy = ui.input(|i| i.raw_scroll_delta.y);
         if dy != 0.0 {

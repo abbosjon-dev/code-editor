@@ -33,6 +33,7 @@ enum SidebarView {
     Explorer,
     Search,
     Git,
+    Problems,
     Agents,
     Plugins,
 }
@@ -41,6 +42,18 @@ struct Toast {
     text: String,
     level: NotifyLevel,
     until: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabMenu {
+    Close,
+    CloseOthers,
+    CloseRight,
+    CloseSaved,
+    CopyPath,
+    CopyRelPath,
+    Reveal,
+    OtherPane,
 }
 
 enum InputKind {
@@ -128,6 +141,8 @@ pub struct ZenithApp {
     pending_code_actions: Option<u64>,
     pending_symbols: Option<u64>,
     code_actions: Vec<zenith_lsp::CodeAction>,
+    /// Diagnostics for every file the language servers reported on.
+    problems: std::collections::BTreeMap<PathBuf, Vec<zenith_lsp::Diagnostic>>,
     /// formatting request -> (document id, save afterwards)
     pending_format: HashMap<u64, (u64, bool)>,
     /// Set while saving the result of format-on-save (avoids a loop).
@@ -206,6 +221,7 @@ impl ZenithApp {
             pending_code_actions: None,
             pending_symbols: None,
             code_actions: vec![],
+            problems: Default::default(),
             pending_format: HashMap::new(),
             saving_formatted: false,
             last_session_save: Instant::now(),
@@ -265,6 +281,7 @@ impl ZenithApp {
         let path = path.canonicalize().unwrap_or(path);
         self.index = FileIndex::build(&path);
         self.git = Git::open(&path);
+        self.problems.clear();
         self.tree = Some(FileTree::new(path.clone()));
         self.session.recent_workspaces.retain(|p| p != &path);
         self.session.recent_workspaces.insert(0, path.clone());
@@ -855,6 +872,10 @@ impl ZenithApp {
                 self.sidebar = SidebarView::Explorer;
                 self.show_sidebar = true;
             }
+            Cmd::ShowProblems => {
+                self.sidebar = SidebarView::Problems;
+                self.show_sidebar = true;
+            }
             Cmd::ShowSourceControl => {
                 self.sidebar = SidebarView::Git;
                 self.show_sidebar = true;
@@ -1151,6 +1172,15 @@ impl ZenithApp {
                     }
                 }
                 LspOutcome::ApplyEdit { edits } => self.apply_edits_quiet(edits, false),
+                LspOutcome::Diagnostics { path, mut diagnostics } => {
+                    // Hints are mostly "related information" noise in a list view.
+                    diagnostics.retain(|d| d.severity != zenith_lsp::Severity::Hint);
+                    if diagnostics.is_empty() {
+                        self.problems.remove(&path);
+                    } else {
+                        self.problems.insert(path, diagnostics);
+                    }
+                }
                 LspOutcome::CodeActions { request, actions } => {
                     if self.pending_code_actions == Some(request) {
                         self.pending_code_actions = None;
@@ -1498,6 +1528,68 @@ impl ZenithApp {
         self.show_sidebar = true;
     }
 
+    fn problems_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use zenith_lsp::Severity;
+        let count = |s: Severity| self.problems.values().flatten().filter(|d| d.severity == s).count();
+        let (e, w) = (count(Severity::Error), count(Severity::Warning));
+        Self::section_header(ui, p, "PROBLEMS");
+        ui.label(RichText::new(format!("{e} errors, {w} warnings")).small().color(p.text_dim));
+        ui.add_space(6.0);
+        if self.problems.is_empty() {
+            ui.label(RichText::new("No problems have been detected.").color(p.text_dim));
+            return;
+        }
+        let mut open: Option<(PathBuf, zenith_lsp::LspPos)> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (path, diags) in &self.problems {
+                let rel = self.rel_path(path);
+                let (dir, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
+                let (icon, color) = theme::file_icon(name);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon).color(color));
+                    ui.label(RichText::new(name).strong());
+                    ui.label(RichText::new(dir).small().color(p.text_dim));
+                    ui.label(RichText::new(diags.len().to_string()).small().color(p.text_faint));
+                });
+                let mut sorted: Vec<&zenith_lsp::Diagnostic> = diags.iter().collect();
+                sorted.sort_by_key(|d| (d.severity, d.range.start));
+                for d in sorted {
+                    let (glyph, c) = match d.severity {
+                        Severity::Error => ("⊗", p.error),
+                        Severity::Warning => ("⚠", p.warning),
+                        _ => ("ℹ", p.accent),
+                    };
+                    let msg = d.message.lines().next().unwrap_or_default();
+                    let text = format!("{msg}  [{}:{}]", d.range.start.line + 1, d.range.start.character + 1);
+                    let r = ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(RichText::new(glyph).color(c));
+                        ui.add(egui::Label::new(RichText::new(text).size(12.5)).truncate().sense(Sense::click()))
+                    });
+                    let resp = r.inner;
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r.response.rect.expand(1.0), 3.0, p.bg_hover.gamma_multiply(0.5));
+                    }
+                    if resp.on_hover_text(&d.message).clicked() {
+                        open = Some((path.clone(), d.range.start));
+                    }
+                }
+                ui.add_space(6.0);
+            }
+        });
+        if let Some((path, pos)) = open {
+            if self.open_file(&path) {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    let idx = doc.lsp_to_char(pos);
+                    doc.buffer.clear_extra();
+                    doc.buffer.set_cursor(idx, false);
+                    doc.reveal_line = Some(pos.line as usize);
+                }
+                self.focus_editor = true;
+            }
+        }
+    }
+
     fn goto_definition(&mut self, idx: usize) {
         let root = self.workspace.clone();
         let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -1532,6 +1624,7 @@ impl ZenithApp {
             (cs, Key::I, Cmd::AskAgent, true),
             (cs, Key::E, Cmd::ShowExplorer, true),
             (cs, Key::G, Cmd::ShowSourceControl, true),
+            (cs, Key::M, Cmd::ShowProblems, true),
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
@@ -1742,6 +1835,7 @@ impl ZenithApp {
                 (SidebarView::Explorer, "🗐", "Explorer (Ctrl+Shift+E)"),
                 (SidebarView::Search, "🔍", "Search (Ctrl+Shift+F)"),
                 (SidebarView::Git, "⎇", "Source Control (Ctrl+Shift+G)"),
+                (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
             ] {
@@ -1844,6 +1938,7 @@ impl ZenithApp {
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
             SidebarView::Git => self.git_ui(ctx, ui, &p),
+            SidebarView::Problems => self.problems_ui(ui, &p),
         }
     }
 
@@ -2137,6 +2232,7 @@ impl ZenithApp {
         let p = self.colors.clone();
         let mut activate = None;
         let mut close = None;
+        let mut menu: Option<(TabMenu, usize)> = None;
         egui::ScrollArea::horizontal()
             .id_salt(("tabs", right))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -2207,6 +2303,27 @@ impl ZenithApp {
                         } else if resp.clicked() {
                             activate = Some(i);
                         }
+                        let has_path = doc.path().is_some();
+                        resp.context_menu(|ui| {
+                            for (label, action, enabled) in [
+                                ("Close", TabMenu::Close, true),
+                                ("Close Others", TabMenu::CloseOthers, true),
+                                ("Close to the Right", TabMenu::CloseRight, true),
+                                ("Close Saved", TabMenu::CloseSaved, true),
+                                ("Copy Path", TabMenu::CopyPath, has_path),
+                                ("Copy Relative Path", TabMenu::CopyRelPath, has_path),
+                                ("Reveal in Explorer", TabMenu::Reveal, has_path),
+                                ("Open in Other Pane", TabMenu::OtherPane, true),
+                            ] {
+                                if matches!(action, TabMenu::CopyPath | TabMenu::OtherPane) {
+                                    ui.separator();
+                                }
+                                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                                    menu = Some((action, i));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                         let path = doc.path().map(|p| p.display().to_string());
                         if let Some(path) = path {
                             resp.on_hover_text(path);
@@ -2221,6 +2338,71 @@ impl ZenithApp {
         }
         if let Some(i) = close {
             self.close_doc(i, false);
+        }
+        if let Some((action, i)) = menu {
+            self.tab_menu_action(ui.ctx(), action, i, right);
+        }
+    }
+
+    fn tab_menu_action(&mut self, ctx: &egui::Context, action: TabMenu, i: usize, right: bool) {
+        let Some(doc) = self.docs.get(i) else { return };
+        let id = doc.id;
+        let path = doc.path().map(Path::to_path_buf);
+        // Bulk closes keep unsaved files open instead of prompting for each one.
+        let mut close_ids = |pred: &dyn Fn(usize, &Document) -> bool| {
+            let ids: Vec<u64> = self.docs.iter().enumerate().filter(|(j, d)| pred(*j, d)).map(|(_, d)| d.id).collect();
+            let mut kept = 0;
+            for id in ids {
+                if let Some(j) = self.docs.iter().position(|d| d.id == id) {
+                    if self.docs[j].buffer.is_dirty() {
+                        kept += 1;
+                    } else {
+                        self.close_doc(j, true);
+                    }
+                }
+            }
+            if kept > 0 {
+                self.toast(format!("{kept} file(s) with unsaved changes were kept open"), NotifyLevel::Info);
+            }
+            if let Some(j) = self.docs.iter().position(|d| d.id == id) {
+                self.focus_pane(right);
+                self.active = j;
+            }
+        };
+        match action {
+            TabMenu::Close => self.close_doc(i, false),
+            TabMenu::CloseOthers => close_ids(&|j, _| j != i),
+            TabMenu::CloseRight => close_ids(&|j, _| j > i),
+            TabMenu::CloseSaved => close_ids(&|_, d| !d.buffer.is_dirty()),
+            TabMenu::CopyPath => {
+                if let Some(p) = path {
+                    ctx.copy_text(p.display().to_string());
+                }
+            }
+            TabMenu::CopyRelPath => {
+                if let Some(p) = path {
+                    let rel = self.rel_path(&p);
+                    ctx.copy_text(rel);
+                }
+            }
+            TabMenu::Reveal => {
+                if let (Some(p), Some(t)) = (path, &mut self.tree) {
+                    t.reveal(&p);
+                    self.sidebar = SidebarView::Explorer;
+                    self.show_sidebar = true;
+                }
+            }
+            TabMenu::OtherPane => {
+                if !self.split {
+                    self.split = true;
+                    self.focus_right = false;
+                    self.other = i;
+                } else if right == self.focus_right {
+                    self.other = i;
+                } else {
+                    self.active = i;
+                }
+            }
         }
     }
 
@@ -2483,6 +2665,7 @@ impl ZenithApp {
         let agents = self.agents.clone();
         let mut new_shell = false;
         let mut launch = None;
+        let mut open_link = None;
         let mut hide = false;
         let focus_req = self.focus_terminal;
         let panel = if ai { &mut self.ai } else { &mut self.bottom };
@@ -2543,8 +2726,10 @@ impl ZenithApp {
         let mut focused = false;
         if let Some(tab) = panel.active_mut() {
             let want_focus = focus_req == Some(tab.id);
-            if let Some(TermEvent::Restart) = terminal_ui(ui, tab, &p, font_size, want_focus) {
-                tab.restart(waker);
+            match terminal_ui(ui, tab, &p, font_size, want_focus) {
+                Some(TermEvent::Restart) => tab.restart(waker),
+                Some(TermEvent::OpenLink(link)) => open_link = Some((link, tab.spec.cwd.clone())),
+                None => {}
             }
             focused = ui.memory(|m| m.has_focus(ui.make_persistent_id(("zenith-term", tab.id))));
             if want_focus {
@@ -2575,6 +2760,38 @@ impl ZenithApp {
         }
         if let Some(id) = launch {
             self.launch_agent(&id);
+        }
+        if let Some((link, cwd)) = open_link {
+            self.open_terminal_link(link, cwd);
+        }
+    }
+
+    /// Open a file path or URL clicked in a terminal.
+    fn open_terminal_link(&mut self, link: zenith_terminal::Link, cwd: Option<PathBuf>) {
+        match link {
+            zenith_terminal::Link::Url(u) => open_url(&u),
+            zenith_terminal::Link::File { path, line, col } => {
+                let p = PathBuf::from(&path);
+                let candidates = if p.is_absolute() {
+                    vec![p]
+                } else {
+                    [cwd, self.workspace.clone()].into_iter().flatten().map(|d| d.join(&p)).collect()
+                };
+                let Some(found) = candidates.into_iter().find(|c| c.is_file()) else {
+                    self.toast(format!("File not found: {path}"), NotifyLevel::Warning);
+                    return;
+                };
+                if self.open_file(&found) {
+                    if let (Some(l), Some(doc)) = (line, self.docs.get_mut(self.active)) {
+                        let pos = zenith_core::Position::new(l.saturating_sub(1), col.unwrap_or(1).saturating_sub(1));
+                        let idx = doc.buffer.pos_to_char(pos);
+                        doc.buffer.clear_extra();
+                        doc.buffer.set_cursor(idx, false);
+                        doc.reveal_line = Some(pos.line);
+                    }
+                    self.focus_editor = true;
+                }
+            }
         }
     }
 
@@ -2930,6 +3147,15 @@ impl ZenithApp {
             });
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 fn open_in_os(path: &Path) {
