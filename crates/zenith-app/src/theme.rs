@@ -228,7 +228,8 @@ pub fn apply_style(ctx: &egui::Context, p: &Palette, ui_font_size: f32) {
     w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text_dim);
     w.noninteractive.corner_radius = radius;
 
-    w.inactive.bg_fill = p.bg_elevated;
+    // bg_fill: checkbox boxes and slider rails; weak_bg_fill: buttons.
+    w.inactive.bg_fill = p.bg_active;
     w.inactive.weak_bg_fill = p.bg_elevated;
     w.inactive.bg_stroke = Stroke::new(1.0_f32, p.border);
     w.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);

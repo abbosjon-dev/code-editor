@@ -14,6 +14,7 @@ mod palette;
 mod review;
 mod sample_plugin;
 mod settings;
+mod settings_ui;
 mod terminal_view;
 mod theme;
 mod workspace;

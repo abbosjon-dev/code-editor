@@ -54,4 +54,4 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 **v1.0**
 - [ ] Plugin marketplace / registry
 - [ ] Imzolangan installerlar (.dmg, .msi, .deb/.AppImage)
-- [ ] Sozlamalar UI
+- [x] Sozlamalar oynasi

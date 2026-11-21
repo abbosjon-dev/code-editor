@@ -132,6 +132,8 @@ pub struct ZenithApp {
     last_session_save: Instant,
     style_dirty: bool,
     focus_editor: bool,
+    show_settings: bool,
+    settings_section: crate::settings_ui::Section,
     /// Split editor: two panes side by side.
     split: bool,
     /// Doc index shown in the pane that does NOT have focus.
@@ -203,6 +205,8 @@ impl ZenithApp {
             last_session_save: Instant::now(),
             style_dirty: false,
             focus_editor: false,
+            show_settings: false,
+            settings_section: Default::default(),
             split: false,
             other: 0,
             focus_right: false,
@@ -415,10 +419,8 @@ impl ZenithApp {
         // Rewrite simple top-level keys while keeping comments/agents intact.
         let mut doc: toml::Table = toml::from_str(&text).unwrap_or_default();
         let fresh = toml::Table::try_from(&self.settings).unwrap_or_default();
-        for k in ["theme", "syntax_theme", "show_minimap"] {
-            if let Some(v) = fresh.get(k) {
-                doc.insert(k.into(), v.clone());
-            }
+        for (k, v) in fresh {
+            doc.insert(k, v);
         }
         if let Ok(out) = toml::to_string_pretty(&doc) {
             let _ = std::fs::write(path, out);
@@ -812,7 +814,8 @@ impl ZenithApp {
                     .collect();
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
-            Cmd::OpenSettings => {
+            Cmd::OpenSettings => self.show_settings = true,
+            Cmd::OpenSettingsFile => {
                 let p = settings::settings_path();
                 if !p.exists() {
                     let _ = Settings::load();
@@ -1916,7 +1919,7 @@ impl ZenithApp {
                     self.installed = self.agents.iter().map(|a| (a.id.clone(), a.is_installed())).collect();
                 }
                 if ui.button("+ Add custom agent").on_hover_text("Add an [[agents]] entry in settings.toml").clicked() {
-                    self.run(ctx, Cmd::OpenSettings);
+                    self.run(ctx, Cmd::OpenSettingsFile);
                 }
             });
             ui.add_space(10.0);
@@ -2759,6 +2762,50 @@ impl ZenithApp {
         }
     }
 
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let p = self.colors.clone();
+        let c = crate::settings_ui::window(
+            ctx,
+            &mut self.show_settings,
+            &mut self.settings_section,
+            &mut self.settings,
+            &self.agents,
+            &p,
+        );
+        let mut c = c;
+        if c.style {
+            let was_dark = self.colors.dark;
+            self.colors = Palette::by_name(&self.settings.theme);
+            self.style_dirty = true;
+            // Keep the default syntax themes paired with the UI theme.
+            if was_dark != self.colors.dark
+                && ["OneHalfDark", "OneHalfLight"].contains(&self.settings.syntax_theme.as_str())
+            {
+                self.settings.syntax_theme = if self.colors.dark { "OneHalfDark" } else { "OneHalfLight" }.into();
+                c.syntax_theme = true;
+            }
+        }
+        if c.syntax_theme {
+            let name = self.settings.syntax_theme.clone();
+            self.set_syntax_theme(name);
+        }
+        if c.lsp {
+            self.lsp.shutdown();
+            self.lsp = LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
+            self.lsp.restart(&mut self.docs);
+        }
+        if c.any {
+            self.write_settings();
+        }
+        if c.open_file {
+            self.show_settings = false;
+            self.run(ctx, Cmd::OpenSettingsFile);
+        }
+    }
+
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
@@ -2931,6 +2978,7 @@ impl eframe::App for ZenithApp {
             self.handle_palette(ctx, action);
         }
         self.dialogs(ctx);
+        self.settings_window(ctx);
         self.toasts_ui(ctx);
 
         // Agents may edit files on disk; poll for external changes now and then.
