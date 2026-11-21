@@ -138,3 +138,86 @@ fn rust_analyzer_references_rename_formatting() {
     let formatted = formatted.expect("formatting");
     assert!(formatted.contains("    let b = helper();"), "{formatted}");
 }
+
+#[test]
+#[ignore]
+fn rust_analyzer_signature_code_actions_symbols() {
+    use zenith_lsp::{apply_text_edits, LspRange};
+    let cfg = default_servers().into_iter().find(|s| s.name == "rust-analyzer").unwrap();
+    if !cfg.is_installed() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("zenith-lsp-e2e3-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo3\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        .unwrap();
+    // line 3: `add(1, ` -> signature help; line 4: assigning to an immutable binding -> quick fix.
+    let src = "struct Point { x: i32 }\nfn add(a: i32, b: i32) -> i32 { a + b }\nfn main() {\n    let s = add(1, 2);\n    let v = 1;\n    v = 2;\n    let _ = (s, v, Point { x: 0 }.x);\n}\n";
+    let file = dir.join("src/main.rs");
+    std::fs::write(&file, src).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut client = LspClient::start(cfg, &dir, tx, Arc::new(|| {})).unwrap();
+    client.did_open(&file, "rust", 1, src);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (mut sig, mut fixed, mut syms) = (None, None, None);
+    let (mut sq, mut cq, mut yq) = (None, None, None);
+    let mut diags: Vec<serde_json::Value> = vec![];
+    while Instant::now() < deadline && (sig.is_none() || fixed.is_none() || syms.is_none()) {
+        if sq.is_none() && sig.is_none() {
+            sq = Some(client.signature_help(&file, LspPos { line: 3, character: 19 }));
+        }
+        if cq.is_none() && fixed.is_none() && !diags.is_empty() {
+            let range = LspRange { start: LspPos { line: 5, character: 4 }, end: LspPos { line: 5, character: 9 } };
+            cq = Some(client.code_actions(&file, range, diags.clone()));
+        }
+        if yq.is_none() && syms.is_none() {
+            yq = Some(client.document_symbols(&file));
+        }
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(LspEvent::Diagnostics { diagnostics, .. }) => {
+                diags = diagnostics.iter().filter(|d| d.range.start.line == 5).map(|d| d.raw.clone()).collect();
+            }
+            Ok(LspEvent::SignatureHelp { request, help }) if Some(request) == sq => match help {
+                Some(h) if h.active.is_some() => sig = Some(h),
+                _ => {
+                    sq = None;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            },
+            Ok(LspEvent::CodeActions { request, actions }) if Some(request) == cq => {
+                match actions.iter().find(|a| a.title.to_lowercase().contains("mutable")) {
+                    Some(a) => {
+                        let edits = &a.edits.iter().find(|(p, _)| p.ends_with("main.rs")).unwrap().1;
+                        fixed = Some(apply_text_edits(src, edits));
+                    }
+                    None => {
+                        cq = None;
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+            Ok(LspEvent::Symbols { request, symbols }) if Some(request) == yq => {
+                if symbols.is_empty() {
+                    yq = None;
+                } else {
+                    syms = Some(symbols);
+                }
+            }
+            _ => {}
+        }
+    }
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+    let sig = sig.expect("signature help");
+    let (a, b) = sig.active.unwrap();
+    let param: String = sig.label.chars().skip(a).take(b - a).collect();
+    assert_eq!(param, "b: i32", "{sig:?}");
+    assert!(fixed.expect("quick fix").contains("let mut v = 1;"));
+    let syms = syms.expect("symbols");
+    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"Point") && names.contains(&"x") && names.contains(&"add") && names.contains(&"main"),
+        "{names:?}"
+    );
+}

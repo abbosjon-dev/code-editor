@@ -125,6 +125,9 @@ pub struct ZenithApp {
     pending_definition: Option<u64>,
     pending_references: Option<(u64, String)>,
     pending_rename: Option<u64>,
+    pending_code_actions: Option<u64>,
+    pending_symbols: Option<u64>,
+    code_actions: Vec<zenith_lsp::CodeAction>,
     /// formatting request -> (document id, save afterwards)
     pending_format: HashMap<u64, (u64, bool)>,
     /// Set while saving the result of format-on-save (avoids a loop).
@@ -200,6 +203,9 @@ impl ZenithApp {
             pending_definition: None,
             pending_references: None,
             pending_rename: None,
+            pending_code_actions: None,
+            pending_symbols: None,
+            code_actions: vec![],
             pending_format: HashMap::new(),
             saving_formatted: false,
             last_session_save: Instant::now(),
@@ -901,6 +907,19 @@ impl ZenithApp {
                     self.focus_editor = true;
                 }
             }
+            Cmd::CodeActions | Cmd::GotoSymbol | Cmd::TriggerParameterHints => {
+                let root = self.workspace.clone();
+                let Some(doc) = self.docs.get_mut(self.active) else { return };
+                if !doc.lsp_active {
+                    self.toast("No language server for this file", NotifyLevel::Info);
+                    return;
+                }
+                match cmd {
+                    Cmd::CodeActions => self.pending_code_actions = self.lsp.request_code_actions(doc, root.as_deref()),
+                    Cmd::GotoSymbol => self.pending_symbols = self.lsp.request_symbols(doc, root.as_deref()),
+                    _ => self.lsp.request_signature_help(doc, root.as_deref()),
+                }
+            }
             Cmd::RenameSymbol | Cmd::FindReferences | Cmd::FormatDocument => {
                 let root = self.workspace.clone();
                 let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -994,6 +1013,26 @@ impl ZenithApp {
                 self.launch_agent(&id);
             }
             PaletteAction::OpenRecent(p) => self.open_workspace(p),
+            PaletteAction::GotoPosition(line, character) => {
+                if let Some(doc) = self.active_doc() {
+                    let idx = doc.lsp_to_char(zenith_lsp::LspPos { line: line as u32, character: character as u32 });
+                    doc.buffer.clear_extra();
+                    doc.buffer.set_cursor(idx, false);
+                    doc.reveal_line = Some(line);
+                }
+                self.focus_editor = true;
+            }
+            PaletteAction::CodeAction(i) => {
+                let Some(action) = self.code_actions.get(i).cloned() else { return };
+                self.apply_edits_quiet(action.edits, false);
+                if let Some(cmd) = &action.command {
+                    let root = self.workspace.clone();
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        self.lsp.execute_command(doc, root.as_deref(), cmd);
+                    }
+                }
+                self.focus_editor = true;
+            }
         }
     }
 
@@ -1109,6 +1148,41 @@ impl ZenithApp {
                             Some(e) => self.toast(format!("Rename failed: {e}"), NotifyLevel::Error),
                             None => self.apply_workspace_edit(edits),
                         }
+                    }
+                }
+                LspOutcome::ApplyEdit { edits } => self.apply_edits_quiet(edits, false),
+                LspOutcome::CodeActions { request, actions } => {
+                    if self.pending_code_actions == Some(request) {
+                        self.pending_code_actions = None;
+                        if actions.is_empty() {
+                            self.toast("No code actions available here", NotifyLevel::Info);
+                        } else {
+                            let items = actions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, a)| Item {
+                                    label: format!("{}{}", if a.preferred { "★ " } else { "" }, a.title),
+                                    detail: a.kind.clone(),
+                                    action: PaletteAction::CodeAction(i),
+                                })
+                                .collect();
+                            self.code_actions = actions;
+                            self.palette.show(Mode::Pick, items, "Quick fix / code action");
+                        }
+                    }
+                }
+                LspOutcome::Symbols { request, symbols } => {
+                    if self.pending_symbols == Some(request) {
+                        self.pending_symbols = None;
+                        let items = symbols
+                            .iter()
+                            .map(|s| Item {
+                                label: format!("{}{}", "  ".repeat(s.depth), s.name),
+                                detail: format!("{}  {}", s.kind_label(), s.line + 1),
+                                action: PaletteAction::GotoPosition(s.line as usize, s.character as usize),
+                            })
+                            .collect();
+                        self.palette.show(Mode::Pick, items, "Go to symbol in file");
                     }
                 }
                 LspOutcome::Formatting { request, edits } => {
@@ -1361,6 +1435,11 @@ impl ZenithApp {
     /// Apply a rename: open documents are edited in their buffers (undoable),
     /// other files are rewritten on disk.
     fn apply_workspace_edit(&mut self, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>) {
+        self.apply_edits_quiet(edits, true);
+    }
+
+    /// Apply edits from the language server; `announce` shows a rename summary.
+    fn apply_edits_quiet(&mut self, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>, announce: bool) {
         let mut files = 0;
         let mut total = 0;
         for (path, file_edits) in edits {
@@ -1379,6 +1458,9 @@ impl ZenithApp {
                     self.toast(format!("{}: {e}", path.display()), NotifyLevel::Error);
                 }
             }
+        }
+        if !announce {
+            return;
         }
         if total == 0 {
             self.toast("Nothing to rename here", NotifyLevel::Info);
@@ -1453,6 +1535,9 @@ impl ZenithApp {
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
+            (cs, Key::Space, Cmd::TriggerParameterHints, false),
+            (cmd, Key::Period, Cmd::CodeActions, false),
+            (cmd, Key::T, Cmd::GotoSymbol, false),
             (cs, Key::Backtick, Cmd::NewTerminal, true),
             (ctrl | Modifiers::SHIFT, Key::Tab, Cmd::PrevTab, false),
             (ctrl, Key::Tab, Cmd::NextTab, false),
@@ -2244,6 +2329,12 @@ impl ZenithApp {
                 }
                 EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
                 EditorAction::Run(cmd) => self.run(ctx, cmd),
+                EditorAction::SignatureHelp => {
+                    let root = self.workspace.clone();
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        self.lsp.request_signature_help(doc, root.as_deref());
+                    }
+                }
             }
         }
     }

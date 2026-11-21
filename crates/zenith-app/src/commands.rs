@@ -53,6 +53,9 @@ pub enum Cmd {
     Unfold,
     FoldAll,
     UnfoldAll,
+    CodeActions,
+    GotoSymbol,
+    TriggerParameterHints,
     About,
     Quit,
 }
@@ -112,6 +115,9 @@ impl Cmd {
             Unfold,
             FoldAll,
             UnfoldAll,
+            CodeActions,
+            GotoSymbol,
+            TriggerParameterHints,
             About,
             Quit,
         ]
@@ -121,6 +127,9 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            CodeActions => "Edit: Quick Fix / Code Actions…",
+            GotoSymbol => "Go: Go to Symbol in File…",
+            TriggerParameterHints => "Edit: Trigger Parameter Hints",
             Fold => "Editor: Fold",
             Unfold => "Editor: Unfold",
             FoldAll => "Editor: Fold All",
@@ -216,6 +225,9 @@ impl Cmd {
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
             GotoDefinition => "F12",
+            CodeActions => k!("⌘.", "Ctrl+."),
+            GotoSymbol => k!("⌘T", "Ctrl+T"),
+            TriggerParameterHints => k!("⌘⇧Space", "Ctrl+Shift+Space"),
             Fold => k!("⌘⇧[", "Ctrl+Shift+["),
             Unfold => k!("⌘⇧]", "Ctrl+Shift+]"),
             RenameSymbol => "F2",

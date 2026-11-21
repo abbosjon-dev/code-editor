@@ -33,6 +33,8 @@ pub enum EditorAction {
     },
     /// Run an app command (from the context menu).
     Run(crate::commands::Cmd),
+    /// Ask for parameter hints at the caret.
+    SignatureHelp,
 }
 
 struct Metrics {
@@ -133,6 +135,11 @@ pub fn editor_ui(
     let fm = doc.fold_map();
     let total_rows = fm.row_count();
     let mut cursor_screen: Option<Pos2> = None;
+    let mut cursor_top: Option<Pos2> = None;
+    // Parameter hints are only valid on the line where they were requested.
+    if doc.signature.as_ref().is_some_and(|sg| sg.line != doc.buffer.cursor_pos().line) {
+        doc.signature = None;
+    }
     let mut hover_screen: Option<(Pos2, usize)> = None;
 
     let mut scroll = egui::ScrollArea::both()
@@ -195,6 +202,15 @@ pub fn editor_ui(
                         } else if ui.input(|i| i.modifiers.command) && !in_gutter {
                             doc.buffer.set_cursor(idx, false);
                             actions.push(EditorAction::GotoDefinition { idx });
+                        } else if in_gutter
+                            && pos.x < clip.min.x + 16.0
+                            && doc.lsp_active
+                            && doc.diagnostics.iter().any(|d| d.line == doc.buffer.char_to_pos(idx).line)
+                        {
+                            // Lightbulb: quick fixes for this line.
+                            doc.buffer.clear_extra();
+                            doc.buffer.set_cursor(idx, false);
+                            actions.push(EditorAction::Run(crate::commands::Cmd::CodeActions));
                         } else if in_gutter && !shift && pos.x > clip.min.x + gutter_w - 20.0 {
                             // Fold chevron column.
                             let line = doc.buffer.char_to_pos(idx).line;
@@ -460,6 +476,7 @@ pub fn editor_ui(
                 let cy = y_of_line(cursor.line);
                 let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
                 cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
+                cursor_top = Some(egui::pos2(cx, cy));
                 if has_focus {
                     let t = ui.input(|i| i.time) - cursor_epoch;
                     let visible = !s.cursor_blink || (t % 1.1) < 0.65;
@@ -535,7 +552,21 @@ pub fn editor_ui(
                         );
                     }
                 }
+                let bulb_line = doc.lsp_active && doc.diagnostics.iter().any(|d| d.line == cursor.line);
+                if bulb_line && !fm.is_hidden(cursor.line) && cursor.line >= first && cursor.line < last {
+                    let y = y_of_line(cursor.line) + m.line_h / 2.0;
+                    painter.text(
+                        egui::pos2(clip.min.x + 8.0, y),
+                        Align2::CENTER_CENTER,
+                        "💡",
+                        FontId::proportional(m.font.size * 0.85),
+                        p.warning,
+                    );
+                }
                 for d in doc.diagnostics.iter().rev() {
+                    if bulb_line && d.line == cursor.line {
+                        continue;
+                    }
                     if d.line >= first && d.line < last && d.severity <= Severity::Warning && !fm.is_hidden(d.line) {
                         let y = y_of_line(d.line) + m.line_h / 2.0;
                         painter.circle_filled(egui::pos2(clip.min.x + 6.0, y), 3.0, severity_color(p, d.severity));
@@ -579,6 +610,12 @@ pub fn editor_ui(
         if out.inner_rect.contains(pos - egui::vec2(0.0, 1.0)) {
             completion_popup(ui, doc, p, pos, id, &m);
         }
+    }
+
+    // --- parameter hints ---
+    if let (Some(top), true, Some(sig)) = (cursor_top, has_focus, doc.signature.as_ref().and_then(|s| s.help.as_ref()))
+    {
+        signature_popup(ui, p, top, sig, id, &m);
     }
 
     // --- hover: diagnostics + language server info ---
@@ -694,6 +731,50 @@ fn completion_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, pos: Pos
         doc.accept_completion();
         ui.memory_mut(|mem| mem.request_focus(id));
     }
+}
+
+fn signature_popup(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    top: Pos2,
+    sig: &zenith_lsp::SignatureHelp,
+    id: egui::Id,
+    m: &Metrics,
+) {
+    egui::Area::new(id.with("signature"))
+        .order(egui::Order::Foreground)
+        .pivot(Align2::LEFT_BOTTOM)
+        .fixed_pos(top - egui::vec2(8.0, 2.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).fill(p.bg_elevated).inner_margin(egui::Margin::symmetric(10, 6)).show(
+                ui,
+                |ui| {
+                    ui.set_max_width(640.0);
+                    let font = FontId::monospace(m.font.size * 0.92);
+                    let mut job = LayoutJob::default();
+                    let chars: Vec<char> = sig.label.chars().collect();
+                    let (a, b) = sig.active.unwrap_or((0, 0));
+                    let fmt = |color: Color32, underline: bool| TextFormat {
+                        font_id: font.clone(),
+                        color,
+                        underline: if underline { Stroke::new(1.0_f32, color) } else { Stroke::NONE },
+                        ..Default::default()
+                    };
+                    let part = |r: std::ops::Range<usize>| {
+                        chars[r.start.min(chars.len())..r.end.min(chars.len())].iter().collect::<String>()
+                    };
+                    job.append(&part(0..a), 0.0, fmt(p.text_dim, false));
+                    job.append(&part(a..b), 0.0, fmt(p.accent, true));
+                    job.append(&part(b..chars.len()), 0.0, fmt(p.text_dim, false));
+                    ui.label(job);
+                    if !sig.documentation.is_empty() {
+                        let doc: String = sig.documentation.lines().take(4).collect::<Vec<_>>().join("\n");
+                        ui.label(egui::RichText::new(doc).small().color(p.text_faint));
+                    }
+                },
+            );
+        });
 }
 
 fn hover_popup(ui: &mut egui::Ui, p: &Palette, pos: Pos2, diags: &[String], info: Option<&str>, id: egui::Id) {
@@ -929,6 +1010,10 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
                 }
             }
         }
+        if matches!(ev, Event::Key { key: Key::Escape, pressed: true, .. }) && doc.signature.is_some() {
+            doc.signature = None;
+            continue;
+        }
         match ev {
             Event::Text(t) => {
                 for c in t.chars() {
@@ -936,6 +1021,13 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
                         doc.buffer.edit_each(|b| b.type_char(c));
                         if !doc.lsp_active || doc.buffer.has_multi() {
                             continue;
+                        }
+                        if c == '(' || c == ',' {
+                            actions.push(EditorAction::SignatureHelp);
+                        } else if c == ')' {
+                            doc.signature = None;
+                        } else if doc.signature.is_some() {
+                            actions.push(EditorAction::SignatureHelp);
                         }
                         let ident = c.is_alphanumeric() || c == '_';
                         if doc.lsp_triggers.contains(&c) {

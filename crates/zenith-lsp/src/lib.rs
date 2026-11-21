@@ -116,6 +116,8 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub source: Option<String>,
+    /// The diagnostic as sent by the server (echoed back in code action requests).
+    pub raw: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +164,56 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
+/// The signature of the call around the caret.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignatureHelp {
+    pub label: String,
+    /// Char range of the active parameter inside `label`.
+    pub active: Option<(usize, usize)>,
+    pub documentation: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeAction {
+    pub title: String,
+    pub kind: String,
+    pub preferred: bool,
+    pub edits: Vec<(PathBuf, Vec<TextEdit>)>,
+    /// `Command` to run via workspace/executeCommand, if any.
+    pub command: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    pub detail: String,
+    pub kind: u32,
+    pub line: u32,
+    pub character: u32,
+    pub depth: usize,
+}
+
+impl Symbol {
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            2 => "module",
+            5 => "class",
+            6 => "method",
+            8 => "field",
+            9 => "constructor",
+            10 => "enum",
+            11 => "interface",
+            12 => "function",
+            13 => "variable",
+            14 => "constant",
+            22 => "enum member",
+            23 => "struct",
+            26 => "type param",
+            _ => "symbol",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Location {
     pub path: PathBuf,
@@ -202,6 +254,22 @@ pub enum LspEvent {
         request: u64,
         edits: Vec<TextEdit>,
     },
+    SignatureHelp {
+        request: u64,
+        help: Option<SignatureHelp>,
+    },
+    CodeActions {
+        request: u64,
+        actions: Vec<CodeAction>,
+    },
+    Symbols {
+        request: u64,
+        symbols: Vec<Symbol>,
+    },
+    /// The server asked us to apply an edit (e.g. after a code action command).
+    ApplyEdit {
+        edits: Vec<(PathBuf, Vec<TextEdit>)>,
+    },
     Progress {
         server: String,
         message: Option<String>,
@@ -227,6 +295,9 @@ enum Pending {
     References,
     Rename,
     Formatting,
+    SignatureHelp,
+    CodeAction,
+    Symbols,
     Other,
 }
 
@@ -315,7 +386,7 @@ impl LspClient {
                 "capabilities": {
                     "general": { "positionEncodings": ["utf-16"] },
                     "window": { "workDoneProgress": true },
-                    "workspace": { "configuration": true, "workspaceFolders": true },
+                    "workspace": { "configuration": true, "workspaceFolders": true, "applyEdit": true },
                     "textDocument": {
                         "synchronization": { "didSave": true, "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false },
@@ -327,7 +398,20 @@ impl LspClient {
                         "definition": { "linkSupport": true },
                         "references": {},
                         "rename": { "prepareSupport": false },
-                        "formatting": {}
+                        "formatting": {},
+                        "signatureHelp": {
+                            "signatureInformation": {
+                                "documentationFormat": ["plaintext", "markdown"],
+                                "parameterInformation": { "labelOffsetSupport": true }
+                            }
+                        },
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": { "valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports"] }
+                            },
+                            "isPreferredSupport": true
+                        },
+                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
                     }
                 }
             }
@@ -438,6 +522,34 @@ impl LspClient {
         self.request("textDocument/formatting", params, Pending::Formatting)
     }
 
+    pub fn signature_help(&mut self, path: &Path, pos: LspPos) -> u64 {
+        self.request("textDocument/signatureHelp", Self::doc_pos(path, pos), Pending::SignatureHelp)
+    }
+
+    /// Code actions for a range; `diagnostics` are the raw diagnostics overlapping it.
+    pub fn code_actions(&mut self, path: &Path, range: LspRange, diagnostics: Vec<Value>) -> u64 {
+        let params = json!({
+            "textDocument": { "uri": text::path_to_uri(path) },
+            "range": range,
+            "context": { "diagnostics": diagnostics, "triggerKind": 1 }
+        });
+        self.request("textDocument/codeAction", params, Pending::CodeAction)
+    }
+
+    pub fn document_symbols(&mut self, path: &Path) -> u64 {
+        self.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": text::path_to_uri(path) } }),
+            Pending::Symbols,
+        )
+    }
+
+    /// Run a server-side command (from a code action).
+    pub fn execute_command(&mut self, command: &Value) {
+        let params = json!({ "command": command["command"], "arguments": command.get("arguments").cloned().unwrap_or(json!([])) });
+        self.request("workspace/executeCommand", params, Pending::Other);
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.request("shutdown", Value::Null, Pending::Other);
         self.notify("exit", Value::Null);
@@ -476,6 +588,11 @@ fn handle_message(
                     Value::Array(vec![Value::Null; n])
                 }
                 "workspace/workspaceFolders" => Value::Null,
+                "workspace/applyEdit" => {
+                    let edits = parse_workspace_edit(&msg["params"]["edit"]);
+                    out.push(LspEvent::ApplyEdit { edits });
+                    json!({ "applied": true })
+                }
                 _ => Value::Null,
             };
             write_now(stdin, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
@@ -553,6 +670,17 @@ fn handle_message(
                 Some(Pending::Formatting) => {
                     out.push(LspEvent::Formatting { request: id, edits: parse_text_edits(&result) });
                 }
+                Some(Pending::SignatureHelp) => {
+                    out.push(LspEvent::SignatureHelp { request: id, help: parse_signature_help(&result) });
+                }
+                Some(Pending::CodeAction) => {
+                    out.push(LspEvent::CodeActions { request: id, actions: parse_code_actions(&result) });
+                }
+                Some(Pending::Symbols) => {
+                    let mut symbols = vec![];
+                    parse_symbols(&result, 0, &mut symbols);
+                    out.push(LspEvent::Symbols { request: id, symbols });
+                }
                 Some(Pending::Other) | None => {}
             }
         }
@@ -576,6 +704,7 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
         },
         message: v["message"].as_str()?.to_string(),
         source: v["source"].as_str().map(str::to_string),
+        raw: v.clone(),
     })
 }
 
@@ -675,6 +804,85 @@ pub(crate) fn parse_workspace_edit(v: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
     out
 }
 
+pub(crate) fn parse_signature_help(v: &Value) -> Option<SignatureHelp> {
+    let sigs = v["signatures"].as_array()?;
+    let active_sig = v["activeSignature"].as_u64().unwrap_or(0) as usize;
+    let sig = sigs.get(active_sig).or(sigs.first())?;
+    let label = sig["label"].as_str()?.to_string();
+    let active_param = sig["activeParameter"].as_u64().or(v["activeParameter"].as_u64()).unwrap_or(0) as usize;
+    let active = sig["parameters"].as_array().and_then(|ps| ps.get(active_param)).and_then(|p| match &p["label"] {
+        // [start, end] in UTF-16 units of the signature label.
+        Value::Array(a) if a.len() == 2 => {
+            let (s, e) = (a[0].as_u64()? as u32, a[1].as_u64()? as u32);
+            Some((text::utf16_to_char_col(&label, s), text::utf16_to_char_col(&label, e)))
+        }
+        Value::String(name) => {
+            let byte = label.find(name.as_str())?;
+            let start = label[..byte].chars().count();
+            Some((start, start + name.chars().count()))
+        }
+        _ => None,
+    });
+    let doc = match &sig["documentation"] {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o.get("value").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        _ => String::new(),
+    };
+    Some(SignatureHelp { label, active, documentation: text::clean_markdown(&doc) })
+}
+
+pub(crate) fn parse_code_actions(v: &Value) -> Vec<CodeAction> {
+    let Some(list) = v.as_array() else { return vec![] };
+    list.iter()
+        .filter_map(|a| {
+            let title = a["title"].as_str()?.to_string();
+            // A bare Command (no "kind"/"edit", but "command" is a string).
+            if a["command"].is_string() {
+                return Some(CodeAction {
+                    title,
+                    kind: String::new(),
+                    preferred: false,
+                    edits: vec![],
+                    command: Some(a.clone()),
+                });
+            }
+            if a.get("disabled").is_some() {
+                return None;
+            }
+            Some(CodeAction {
+                title,
+                kind: a["kind"].as_str().unwrap_or_default().to_string(),
+                preferred: a["isPreferred"].as_bool().unwrap_or(false),
+                edits: parse_workspace_edit(&a["edit"]),
+                command: a.get("command").filter(|c| c.is_object()).cloned(),
+            })
+        })
+        .collect()
+}
+
+/// Flatten DocumentSymbol trees (or SymbolInformation lists) in document order.
+pub(crate) fn parse_symbols(v: &Value, depth: usize, out: &mut Vec<Symbol>) {
+    let Some(list) = v.as_array() else { return };
+    for s in list {
+        let Some(name) = s["name"].as_str() else { continue };
+        let range =
+            parse_range(&s["selectionRange"]).or_else(|| parse_range(&s["location"]["range"])).unwrap_or_default();
+        out.push(Symbol {
+            name: name.to_string(),
+            detail: s["detail"].as_str().or(s["containerName"].as_str()).unwrap_or_default().to_string(),
+            kind: s["kind"].as_u64().unwrap_or(0) as u32,
+            line: range.start.line,
+            character: range.start.character,
+            depth,
+        });
+        parse_symbols(&s["children"], depth + 1, out);
+    }
+    if depth == 0 {
+        // SymbolInformation lists are not ordered.
+        out.sort_by_key(|s| (s.line, s.character));
+    }
+}
+
 /// Apply LSP text edits (UTF-16 positions) to a string.
 pub fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     // Byte offset of each line start.
@@ -723,6 +931,40 @@ mod tests {
             TextEdit { range: LspRange { start: pos(1, 4), end: pos(1, 5) }, new_text: "y".into() },
         ];
         assert_eq!(apply_text_edits(text, &edits), "let 😀y = 1;\ny + y\n");
+    }
+
+    #[test]
+    fn parses_signature_help() {
+        let v = json!({ "signatures": [{ "label": "fn add(a: i32, b: i32) -> i32",
+            "parameters": [{ "label": [7, 13] }, { "label": [15, 21] }] }], "activeSignature": 0, "activeParameter": 1 });
+        let h = parse_signature_help(&v).unwrap();
+        assert_eq!(&h.label[15..21], "b: i32");
+        assert_eq!(h.active, Some((15, 21)));
+        let v = json!({ "signatures": [{ "label": "f(x, y)", "parameters": [{ "label": "x" }, { "label": "y" }], "activeParameter": 0 }] });
+        assert_eq!(parse_signature_help(&v).unwrap().active, Some((2, 3)));
+        assert!(parse_signature_help(&json!(null)).is_none());
+    }
+
+    #[test]
+    fn parses_code_actions_and_symbols() {
+        let uri = text::path_to_uri(&std::env::temp_dir().join("c.rs"));
+        let v = json!([
+            { "title": "Add missing import", "kind": "quickfix", "isPreferred": true,
+              "edit": { "changes": { uri: [{ "range": { "start": {"line":0,"character":0}, "end": {"line":0,"character":0} }, "newText": "use x;\n" }] } } },
+            { "title": "Run cargo fix", "command": "rust-analyzer.runFix", "arguments": [] },
+            { "title": "Disabled", "kind": "refactor", "disabled": { "reason": "no" } }
+        ]);
+        let a = parse_code_actions(&v);
+        assert_eq!(a.len(), 2);
+        assert!(a[0].preferred && a[0].edits.len() == 1);
+        assert!(a[1].command.is_some());
+        let s = json!([{ "name": "Foo", "kind": 23, "range": {}, "selectionRange": { "start": {"line":2,"character":7}, "end": {"line":2,"character":10} },
+            "children": [{ "name": "bar", "kind": 8, "selectionRange": { "start": {"line":3,"character":4}, "end": {"line":3,"character":7} } }] }]);
+        let mut out = vec![];
+        parse_symbols(&s, 0, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].depth, 1);
+        assert_eq!(out[0].kind_label(), "struct");
     }
 
     #[test]

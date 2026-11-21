@@ -19,6 +19,8 @@ pub struct DocDiagnostic {
     pub line: usize,
     pub severity: Severity,
     pub message: String,
+    /// As sent by the server (needed for code action requests).
+    pub raw: serde_json::Value,
 }
 
 /// Completion popup state.
@@ -30,6 +32,13 @@ pub struct Completion {
     pub filtered: Vec<usize>,
     pub selected: usize,
     pub received: bool,
+}
+
+/// Parameter hints for the call around the caret.
+pub struct Signature {
+    pub request: u64,
+    pub line: usize,
+    pub help: Option<zenith_lsp::SignatureHelp>,
 }
 
 pub struct Hover {
@@ -67,6 +76,7 @@ pub struct Document {
     pub diagnostics: Vec<DocDiagnostic>,
     pub completion: Option<Completion>,
     pub hover: Option<Hover>,
+    pub signature: Option<Signature>,
     /// Buffer version last sent to the language server.
     pub lsp_version: Option<u64>,
     pub lsp_sent_at: Option<std::time::Instant>,
@@ -125,6 +135,7 @@ impl Document {
             diagnostics: vec![],
             completion: None,
             hover: None,
+            signature: None,
             lsp_version: None,
             lsp_sent_at: None,
             lsp_triggers: vec![],
@@ -492,6 +503,7 @@ impl Document {
                     line: d.range.start.line as usize,
                     severity: d.severity,
                     message: d.message,
+                    raw: d.raw,
                 }
             })
             .collect();

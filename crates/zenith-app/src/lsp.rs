@@ -29,6 +29,9 @@ pub enum LspOutcome {
     References { request: u64, locations: Vec<zenith_lsp::Location> },
     WorkspaceEdit { request: u64, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>, error: Option<String> },
     Formatting { request: u64, edits: Vec<zenith_lsp::TextEdit> },
+    CodeActions { request: u64, actions: Vec<zenith_lsp::CodeAction> },
+    Symbols { request: u64, symbols: Vec<zenith_lsp::Symbol> },
+    ApplyEdit { edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)> },
 }
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -192,6 +195,53 @@ impl LspManager {
         Some(self.client_for(doc, root)?.formatting(&path, tab, spaces))
     }
 
+    pub fn request_signature_help(&mut self, doc: &mut Document, root: Option<&Path>) {
+        self.sync(doc, root, true);
+        let Some(path) = doc.path().map(Path::to_path_buf) else { return };
+        let pos = doc.to_lsp(doc.buffer.sel.head);
+        let line = doc.buffer.cursor_pos().line;
+        let Some(c) = self.client_for(doc, root) else { return };
+        let request = c.signature_help(&path, pos);
+        let help = doc.signature.take().and_then(|s| s.help);
+        doc.signature = Some(crate::document::Signature { request, line, help });
+    }
+
+    /// Code actions at the selection (or caret line), with overlapping diagnostics.
+    pub fn request_code_actions(&mut self, doc: &mut Document, root: Option<&Path>) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        let (mut a, mut b) = (doc.buffer.sel.start(), doc.buffer.sel.end());
+        let line = doc.buffer.char_to_pos(a).line;
+        // With no selection, ask about the diagnostic on this line (servers
+        // only offer quick fixes for ranges that touch the problem).
+        if a == b {
+            let on_line: Vec<_> = doc.diagnostics.iter().filter(|d| d.line == line).collect();
+            if let Some(d) = on_line.iter().find(|d| d.start <= a && a <= d.end).or(on_line.first()) {
+                (a, b) = (d.start, d.end);
+            }
+        }
+        let diags: Vec<serde_json::Value> = doc
+            .diagnostics
+            .iter()
+            .filter(|d| (d.start <= b && d.end >= a) || d.line == line)
+            .map(|d| d.raw.clone())
+            .collect();
+        let range = zenith_lsp::LspRange { start: doc.to_lsp(a), end: doc.to_lsp(b) };
+        Some(self.client_for(doc, root)?.code_actions(&path, range, diags))
+    }
+
+    pub fn request_symbols(&mut self, doc: &mut Document, root: Option<&Path>) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        Some(self.client_for(doc, root)?.document_symbols(&path))
+    }
+
+    pub fn execute_command(&mut self, doc: &mut Document, root: Option<&Path>, command: &serde_json::Value) {
+        if let Some(c) = self.client_for(doc, root) {
+            c.execute_command(command);
+        }
+    }
+
     /// Route server events into documents.
     pub fn poll(&mut self, docs: &mut [Document], pending_definition: &mut Option<u64>) -> Vec<LspOutcome> {
         let mut out = vec![];
@@ -238,6 +288,20 @@ impl LspManager {
                     out.push(LspOutcome::WorkspaceEdit { request, edits, error })
                 }
                 LspEvent::Formatting { request, edits } => out.push(LspOutcome::Formatting { request, edits }),
+                LspEvent::CodeActions { request, actions } => out.push(LspOutcome::CodeActions { request, actions }),
+                LspEvent::Symbols { request, symbols } => out.push(LspOutcome::Symbols { request, symbols }),
+                LspEvent::ApplyEdit { edits } => out.push(LspOutcome::ApplyEdit { edits }),
+                LspEvent::SignatureHelp { request, help } => {
+                    for doc in docs.iter_mut() {
+                        if doc.signature.as_ref().is_some_and(|s| s.request == request) {
+                            match help {
+                                Some(h) => doc.signature.as_mut().unwrap().help = Some(h),
+                                None => doc.signature = None,
+                            }
+                            break;
+                        }
+                    }
+                }
                 LspEvent::Progress { server, message } => match message {
                     Some(m) => {
                         self.progress.insert(server, m);

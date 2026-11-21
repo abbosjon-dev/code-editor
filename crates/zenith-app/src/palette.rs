@@ -18,6 +18,8 @@ pub enum PaletteAction {
     SetLanguage(String),
     LaunchAgent(String),
     OpenRecent(std::path::PathBuf),
+    CodeAction(usize),
+    GotoPosition(usize, usize),
 }
 
 #[derive(Clone)]
@@ -115,6 +117,11 @@ impl CommandPalette {
             return None;
         }
         let mut chosen = None;
+        if self.focus {
+            // Lay out again next frame once list sizes are known (the palette
+            // may have been opened by a background event, not by input).
+            ctx.request_repaint();
+        }
         let screen = ctx.screen_rect();
         let width = (screen.width() * 0.5).clamp(420.0, 680.0);
         let mut close = false;
@@ -175,11 +182,11 @@ impl CommandPalette {
                             ui.label(egui::RichText::new("No matching results").color(p.text_dim));
                         }
                         let row_h = 30.0;
-                        egui::ScrollArea::vertical().max_height(row_h * 12.0).auto_shrink([false, true]).show_rows(
-                            ui,
-                            row_h,
-                            self.filtered.len(),
-                            |ui, range| {
+                        egui::ScrollArea::vertical()
+                            .max_height(row_h * 12.0)
+                            .min_scrolled_height(row_h * self.filtered.len().min(12) as f32)
+                            .auto_shrink([false, true])
+                            .show_rows(ui, row_h, self.filtered.len(), |ui, range| {
                                 for row in range {
                                     let item = &self.items[self.filtered[row]];
                                     let (rect, resp) =
@@ -229,8 +236,7 @@ impl CommandPalette {
                                         close = true;
                                     }
                                 }
-                            },
-                        );
+                            });
                     }
                     if ui.input(|i| i.key_pressed(Key::Escape)) {
                         close = true;
