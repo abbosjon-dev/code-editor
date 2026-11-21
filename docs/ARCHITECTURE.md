@@ -17,6 +17,7 @@
 | `zenith-core` | `Buffer` (rope), `Selection`, `History` (guruhlangan undo/redo), `find_all` | `ropey` |
 | `zenith-terminal` | PTY'da jarayon ishga tushirish, VT100 parse, DSR/DA so'rovlariga javob, scrollback | `portable-pty`, `vt100` |
 | `zenith-plugin` | Manifest topish, jarayonni boshqarish, JSON-lines protokoli | `serde_json`, `toml` |
+| `zenith-lsp` | LSP mijozi: server jarayonlari, Content-Length framing, server so'rovlariga javob, UTF-16 ↔ char | `serde_json`, `url` |
 | `zenith-ai` | Agent profillari, foydalanuvchi agentlarini birlashtirish, kontekst prompt | `which` |
 | `zenith-app` | Oyna, panellar, muharrir vidjeti, terminal ko'rinishi, palitra, temalar | `eframe`, `syntect`, `ignore`, `nucleo-matcher` |
 
@@ -33,11 +34,13 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 
 ## Yo'l xaritasi (Roadmap)
 
-**v0.1 (hozirgi)** — muharrir, terminal, AI agent panel, pluginlar, qidiruv, temalar, CI (3 OS).
+**v0.1** — muharrir, terminal, AI agent panel, pluginlar, qidiruv, temalar, CI (3 OS).
+
+**v0.2 (hozirgi)** — ✅ LSP: avtomatik to'ldirish, diagnostika, hover, ta'rifga o'tish.
 
 **v0.2**
 - [ ] Ko'p kursor (multi-cursor) va ustun bo'yicha belgilash
-- [ ] LSP mijozi: avtomatik to'ldirish, xatolar, "go to definition", hover (rust-analyzer, pyright, tsserver…)
+- [ ] LSP: rename, find references, format on save, signature help, code actions
 - [ ] Git integratsiyasi: o'zgarishlar gutter'da, diff ko'rinishi, commit paneli
 - [ ] Faylni tashqaridan o'zgarganda konflikt dialogi (hozir: toza bufer avtomatik qayta yuklanadi)
 - [ ] Split editor (yonma-yon)

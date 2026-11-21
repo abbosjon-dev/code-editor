@@ -18,6 +18,7 @@ use crate::document::Document;
 use crate::editor_view::{editor_ui, EditorAction};
 use crate::file_tree::{FileTree, TreeAction};
 use crate::highlight;
+use crate::lsp::{LspManager, LspOutcome};
 use crate::palette::{command_items, CommandPalette, Item, Mode, PaletteAction};
 use crate::settings::{self, Session, Settings};
 use crate::terminal_view::{terminal_ui, TermEvent, TermKind, TermTab};
@@ -115,6 +116,8 @@ pub struct ZenithApp {
     waker: Waker,
     allow_close: bool,
     pending_sends: Vec<PendingSend>,
+    lsp: LspManager,
+    pending_definition: Option<u64>,
     last_session_save: Instant,
     style_dirty: bool,
     focus_editor: bool,
@@ -136,6 +139,8 @@ impl ZenithApp {
         if session.zoom > 0.0 {
             cc.egui_ctx.set_zoom_factor(session.zoom);
         }
+        let settings_lsp = (settings.language_servers.clone(), settings.lsp_enabled);
+        let waker_lsp = waker.clone();
         let agents = merge_agents(&settings.agents);
         let installed = agents.iter().map(|a| (a.id.clone(), a.is_installed())).collect();
 
@@ -171,6 +176,8 @@ impl ZenithApp {
             waker,
             allow_close: false,
             pending_sends: vec![],
+            lsp: LspManager::new(&settings_lsp.0, settings_lsp.1, waker_lsp),
+            pending_definition: None,
             last_session_save: Instant::now(),
             style_dirty: false,
             focus_editor: false,
@@ -228,6 +235,7 @@ impl ZenithApp {
         self.session.recent_workspaces.insert(0, path.clone());
         self.session.recent_workspaces.truncate(10);
         self.workspace = Some(path);
+        self.lsp.restart(&mut self.docs);
         self.load_plugins();
         self.save_session();
     }
@@ -331,6 +339,11 @@ impl ZenithApp {
                         self.reload_settings();
                     }
                     self.plugins.emit("file_saved", serde_json::json!({ "path": p }));
+                    let root = self.workspace.clone();
+                    if let Some(doc) = self.docs.get_mut(idx) {
+                        self.lsp.sync(doc, root.as_deref(), true);
+                        self.lsp.did_save(doc, root.as_deref());
+                    }
                 }
                 true
             }
@@ -355,6 +368,9 @@ impl ZenithApp {
         if theme_changed {
             self.set_syntax_theme(self.settings.syntax_theme.clone());
         }
+        self.lsp.shutdown();
+        self.lsp = LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
+        self.lsp.restart(&mut self.docs);
         self.style_dirty = true;
         self.toast("Settings reloaded", NotifyLevel::Info);
     }
@@ -391,7 +407,8 @@ impl ZenithApp {
             self.dialog = Some(Dialog::UnsavedClose(self.docs[idx].id));
             return;
         }
-        self.docs.remove(idx);
+        let doc = self.docs.remove(idx);
+        self.lsp.did_close(&doc);
         if self.active >= self.docs.len() {
             self.active = self.docs.len().saturating_sub(1);
         } else if idx < self.active {
@@ -800,6 +817,22 @@ impl ZenithApp {
                     }
                 }
             }
+            Cmd::GotoDefinition => {
+                if let Some(idx) = self.docs.get(self.active).map(|d| d.buffer.sel.head) {
+                    self.goto_definition(idx);
+                }
+            }
+            Cmd::NextProblem => {
+                if let Some(msg) = self.active_doc().and_then(|d| d.next_diagnostic()) {
+                    self.toast(msg, NotifyLevel::Info);
+                }
+            }
+            Cmd::RestartLanguageServers => {
+                self.lsp =
+                    LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
+                self.lsp.restart(&mut self.docs);
+                self.toast("Language servers restarted", NotifyLevel::Info);
+            }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -924,6 +957,42 @@ impl ZenithApp {
                 self.new_terminal(Some(dir));
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Language servers
+    // ------------------------------------------------------------------
+
+    fn handle_lsp(&mut self) {
+        let root = self.workspace.clone();
+        for doc in &mut self.docs {
+            self.lsp.sync(doc, root.as_deref(), false);
+        }
+        for outcome in self.lsp.poll(&mut self.docs, &mut self.pending_definition) {
+            match outcome {
+                LspOutcome::GotoLocation { path, line, character } => {
+                    if self.open_file(&path) {
+                        if let Some(doc) = self.docs.get_mut(self.active) {
+                            let idx = doc.lsp_to_char(zenith_lsp::LspPos { line, character });
+                            doc.buffer.set_cursor(idx, false);
+                            doc.reveal_line = Some(line as usize);
+                        }
+                        self.focus_editor = true;
+                    }
+                }
+                LspOutcome::Message(m) => self.toast(m, NotifyLevel::Info),
+            }
+        }
+    }
+
+    fn goto_definition(&mut self, idx: usize) {
+        let root = self.workspace.clone();
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        if !doc.lsp_active {
+            self.toast("No language server for this file (see Settings → language_servers)", NotifyLevel::Info);
+            return;
+        }
+        self.pending_definition = self.lsp.request_definition(doc, root.as_deref(), idx);
     }
 
     // ------------------------------------------------------------------
@@ -1454,6 +1523,7 @@ impl ZenithApp {
         }
         let mut toggle = None;
         let mut exec = None;
+        let mut install_server: Option<String> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, pl) in self.plugins.plugins.iter_mut().enumerate() {
                 let running = pl.is_running();
@@ -1491,7 +1561,35 @@ impl ZenithApp {
                     });
                 ui.add_space(6.0);
             }
+            ui.add_space(8.0);
+            Self::section_header(ui, p, "LANGUAGE SERVERS");
+            let running = self.lsp.running();
+            for cfg in self.lsp.configs() {
+                let (dot, tip) = if running.contains(&cfg.name) {
+                    (p.success, "running")
+                } else if cfg.is_installed() {
+                    (p.accent, "installed — starts when you open a matching file")
+                } else {
+                    (p.text_faint, "not installed")
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("●").color(dot)).on_hover_text(tip);
+                    ui.label(RichText::new(&cfg.name).strong());
+                    ui.label(RichText::new(cfg.languages.join(", ")).small().color(p.text_dim));
+                    if dot == p.text_faint && !cfg.install_hint.is_empty() {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("⬇").on_hover_text(&cfg.install_hint).clicked() {
+                                install_server = Some(cfg.install_hint.clone());
+                            }
+                        });
+                    }
+                });
+            }
         });
+        if let Some(cmd) = install_server {
+            self.run_in_terminal(&cmd);
+            self.toast("Installing in terminal — then run “Language Servers: Restart”.", NotifyLevel::Info);
+        }
         if let Some((i, en)) = toggle {
             self.plugins.set_enabled(i, en);
         }
@@ -1668,6 +1766,25 @@ impl ZenithApp {
             }
             if self.index.indexing {
                 ui.label(small("indexing…".into()));
+            }
+            if let Some(doc) = self.docs.get(self.active) {
+                if doc.lsp_active {
+                    let (e, w) = doc.diagnostic_counts();
+                    let t = RichText::new(format!("⊗ {e}  ⚠ {w}")).size(12.0).color(if e > 0 {
+                        p.error
+                    } else if w > 0 {
+                        p.warning
+                    } else {
+                        p.text_dim
+                    });
+                    if ui.add(egui::Label::new(t).sense(Sense::click())).on_hover_text("Next problem (F8)").clicked() {
+                        cmd = Some(Cmd::NextProblem);
+                    }
+                }
+            }
+            for (server, msg) in &self.lsp.progress {
+                let m: String = msg.chars().take(48).collect();
+                ui.label(small(format!("⟳ {server}: {m}")));
             }
             let running_agents = self.ai.tabs.iter().filter(|t| t.is_alive()).count();
             if running_agents > 0 {
@@ -2129,6 +2246,7 @@ impl eframe::App for ZenithApp {
         self.index.poll();
         self.handle_plugin_events();
         self.flush_pending_sends();
+        self.handle_lsp();
 
         // Keystrokes reset the caret blink so it stays visible while typing.
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)))) {
@@ -2154,6 +2272,7 @@ impl eframe::App for ZenithApp {
             } else {
                 self.save_session();
                 self.plugins.shutdown();
+                self.lsp.shutdown();
             }
         }
 
@@ -2256,6 +2375,19 @@ impl eframe::App for ZenithApp {
                         self.send_to_agent(prompt, true, None);
                     }
                     EditorAction::SendSelectionToAgent => self.run(ctx, Cmd::SendSelectionToAgent),
+                    EditorAction::Complete { trigger } => {
+                        let root = self.workspace.clone();
+                        if let Some(doc) = self.docs.get_mut(self.active) {
+                            self.lsp.request_completion(doc, root.as_deref(), trigger);
+                        }
+                    }
+                    EditorAction::Hover { idx } => {
+                        let root = self.workspace.clone();
+                        if let Some(doc) = self.docs.get_mut(self.active) {
+                            self.lsp.request_hover(doc, root.as_deref(), idx);
+                        }
+                    }
+                    EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
                 }
             }
         });

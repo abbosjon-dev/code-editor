@@ -39,6 +39,9 @@ pub enum Cmd {
     ShowExplorer,
     ShowAgents,
     ReloadFile,
+    GotoDefinition,
+    NextProblem,
+    RestartLanguageServers,
     About,
     Quit,
 }
@@ -84,6 +87,9 @@ impl Cmd {
             ShowExplorer,
             ShowAgents,
             ReloadFile,
+            GotoDefinition,
+            NextProblem,
+            RestartLanguageServers,
             About,
             Quit,
         ]
@@ -93,6 +99,9 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            GotoDefinition => "Go: Go to Definition",
+            NextProblem => "Go: Next Problem",
+            RestartLanguageServers => "Language Servers: Restart",
             OpenFile => "File: Open File…",
             OpenFolder => "File: Open Folder…",
             Save => "File: Save",
@@ -173,6 +182,8 @@ impl Cmd {
             AskAgent => k!("⌘⇧K", "Ctrl+Shift+I"),
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
+            GotoDefinition => "F12",
+            NextProblem => "F8",
             _ => "",
         }
     }

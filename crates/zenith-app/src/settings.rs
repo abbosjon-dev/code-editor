@@ -29,6 +29,10 @@ pub struct Settings {
     pub default_agent: String,
     /// Extra / overridden AI agents.
     pub agents: Vec<AgentProfile>,
+    /// Language Server Protocol support (completion, diagnostics, go to definition).
+    pub lsp_enabled: bool,
+    /// Extra / overridden language servers (same `name` overrides a built-in).
+    pub language_servers: Vec<zenith_lsp::ServerConfig>,
 }
 
 impl Default for Settings {
@@ -50,6 +54,8 @@ impl Default for Settings {
             shell: String::new(),
             default_agent: "claude".into(),
             agents: vec![],
+            lsp_enabled: true,
+            language_servers: vec![],
         }
     }
 }
@@ -103,7 +109,15 @@ impl Settings {
 # id = \"my-agent\"\n\
 # name = \"My Agent\"\n\
 # command = \"my-agent-cli\"\n\
-# args = [\"--flag\"]\n\n";
+# args = [\"--flag\"]\n\
+#\n\
+# Language servers are used automatically when installed (rust-analyzer,\n\
+# pyright, typescript-language-server, gopls, clangd...). Add your own:\n\
+#\n\
+# [[language_servers]]\n\
+# name = \"pylsp\"\n\
+# command = \"pylsp\"\n\
+# languages = [\"python\"]\n\n";
         std::fs::write(path, format!("{header}{body}"))
     }
 }

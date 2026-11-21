@@ -15,6 +15,7 @@ macOS, Windows va Linux'da ishlaydi.
 | 🧩 **Pluginlar** | Plugin — istalgan tildagi dastur (Python, JS, Go, Rust…). Alohida jarayonda ishlaydi, shuning uchun plugin xatosi editorni hech qachon qotirmaydi yoki buzmaydi. [Qo'llanma →](docs/PLUGINS.md) |
 | ⌨ **Terminal** | To'liq terminal emulyatori (PTY: Unix'da openpty, Windows'da ConPTY), 256/truecolor, scrollback, sichqoncha, nusxa olish, bir nechta tab. |
 | 📝 **Muharrir** | Sintaksis ranglash (~200 til), avtomatik qavs yopish, aqlli indent, bir nechta tab, undo/redo, qidirish va almashtirish, minimap, indent chiziqlari, qavs juftini ko'rsatish, qatorni ko'chirish/nusxalash, izoh qo'yish. |
+| 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`). O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
 | 🔍 **Navigatsiya** | Buyruqlar palitrasi (`Ctrl+Shift+P`), fuzzy fayl qidirish (`Ctrl+P`), fayllar ichida qidirish (`Ctrl+Shift+F`, `.gitignore`'ni hisobga oladi), qatorga o'tish. |
 | 🎨 **Chiroyli UI** | Zenith Midnight (qorong'i) va Daylight (yorug') temalari, 30+ sintaksis temasi, JetBrains Mono + Inter shriftlari. |
 
@@ -60,6 +61,30 @@ args = ["--model", "best"]
 
 API kalitlarni sozlamalarga yozmang — agentlar sizning shell muhitingizdagi o'zgaruvchilarni meros qilib oladi.
 
+## Til serverlari (LSP)
+
+Kerakli server o'rnatilgan bo'lsa, faylni ochishingiz bilan ishlay boshlaydi — hech narsa sozlash shart emas.
+Holatni **Plugins** panelidagi *Language servers* bo'limida ko'rasiz (o'rnatilmaganlarini ⬇ tugmasi bilan o'rnatish mumkin).
+
+![LSP](docs/lsp.png)
+
+| Til | Server | O'rnatish |
+|---|---|---|
+| Rust | rust-analyzer | `rustup component add rust-analyzer` |
+| Python | pyright | `npm install -g pyright` |
+| TypeScript / JavaScript | typescript-language-server | `npm install -g typescript typescript-language-server` |
+| Go | gopls | `go install golang.org/x/tools/gopls@latest` |
+| C / C++ | clangd | paket menejeri orqali |
+
+Boshqa server qo'shish (`settings.toml`):
+
+```toml
+[[language_servers]]
+name = "pylsp"
+command = "pylsp"
+languages = ["python"]
+```
+
 ## Klaviatura
 
 | Amal | Windows / Linux | macOS |
@@ -75,6 +100,9 @@ API kalitlarni sozlamalarga yozmang — agentlar sizning shell muhitingizdagi o'
 | AI panel | `Ctrl+Shift+A` | `⌘⇧A` |
 | AI'dan so'rash (belgilangan kod) | `Ctrl+Shift+I` | `⌘⇧I` |
 | Belgilangan kodni agentga yuborish | `Ctrl+Shift+L` | `⌘⇧L` |
+| Avtomatik to'ldirish | `Ctrl+Space` | `⌃Space` |
+| Ta'rifga o'tish | `F12` / `Ctrl+bosish` | `F12` / `⌘+bosish` |
+| Keyingi xato | `F8` | `F8` |
 | Izoh qo'yish/olib tashlash | `Ctrl+/` | `⌘/` |
 | Qatorni ko'chirish / nusxalash | `Alt+↑↓` / `Alt+Shift+↑↓` | `⌥↑↓` / `⌥⇧↑↓` |
 | Keyingi moslikni belgilash | `Ctrl+D` | `⌘D` |
@@ -91,6 +119,7 @@ crates/
 ├── zenith-core      Matn buferi (ropey), kursor/belgilash, undo/redo, qidiruv — UI'ga bog'liq emas, testlangan
 ├── zenith-terminal  PTY + VT100 emulyatori (portable-pty, vt100), terminal so'rovlariga javob
 ├── zenith-plugin    Plugin xosti: manifest, JSON-lines protokoli, fon oqimlari
+├── zenith-lsp       Language Server Protocol mijozi (JSON-RPC, UTF-16 pozitsiyalar, snippetlar)
 ├── zenith-ai        AI agent profillari (Claude Code, Codex, Gemini, Aider…), prompt yasash
 └── zenith-app       GUI (eframe/egui): muharrir vidjeti, panellar, palitra, temalar
 plugins/examples/    Namuna plugin (Python)

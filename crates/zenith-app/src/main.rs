@@ -7,6 +7,7 @@ mod document;
 mod editor_view;
 mod file_tree;
 mod highlight;
+mod lsp;
 mod palette;
 mod sample_plugin;
 mod settings;

@@ -4608,6 +4608,7 @@ dependencies = [
  "unicode-width 0.2.3",
  "zenith-ai",
  "zenith-core",
+ "zenith-lsp",
  "zenith-plugin",
  "zenith-terminal",
 ]
@@ -4617,6 +4618,18 @@ name = "zenith-core"
 version = "0.1.0"
 dependencies = [
  "ropey",
+]
+
+[[package]]
+name = "zenith-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+ "url",
+ "which",
 ]
 
 [[package]]

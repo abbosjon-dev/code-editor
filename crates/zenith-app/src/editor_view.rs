@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 use unicode_width::UnicodeWidthChar;
 use zenith_core::{Position, Selection};
+use zenith_lsp::Severity;
 
 use crate::document::Document;
 use crate::settings::Settings;
@@ -15,8 +16,21 @@ use crate::theme::{Palette, MONO_BOLD, MONO_ITALIC};
 
 /// Things the editor asks the app to do.
 pub enum EditorAction {
-    AskAgent { question: String },
+    AskAgent {
+        question: String,
+    },
     SendSelectionToAgent,
+    /// Ask the language server for completions at the caret.
+    Complete {
+        trigger: Option<char>,
+    },
+    /// Ask for hover info at a char index.
+    Hover {
+        idx: usize,
+    },
+    GotoDefinition {
+        idx: usize,
+    },
 }
 
 struct Metrics {
@@ -100,8 +114,13 @@ pub fn editor_ui(
             )
         });
         let page = (viewport_h / m.line_h).max(1.0) as isize - 1;
-        moved = handle_keys(ui, doc, page);
+        let (m2, acts) = handle_keys(ui, doc, page);
+        moved = m2;
+        actions.extend(acts);
     }
+    doc.refilter_completion();
+    let mut cursor_screen: Option<Pos2> = None;
+    let mut hover_screen: Option<(Pos2, usize)> = None;
 
     let mut scroll = egui::ScrollArea::both()
         .id_salt(id.with("scroll"))
@@ -155,7 +174,11 @@ pub fn editor_ui(
                         doc.buffer.select_word_at(idx);
                     } else if ui.input(|i| i.pointer.primary_pressed()) && resp.hovered() {
                         let idx = hit(doc, pos);
-                        if in_gutter && !shift {
+                        doc.completion = None;
+                        if ui.input(|i| i.modifiers.command) && !in_gutter {
+                            doc.buffer.set_cursor(idx, false);
+                            actions.push(EditorAction::GotoDefinition { idx });
+                        } else if in_gutter && !shift {
                             let line = doc.buffer.char_to_pos(idx).line;
                             doc.buffer.select_line(line);
                         } else {
@@ -181,6 +204,26 @@ pub fn editor_ui(
                             doc.buffer.sel.head = idx;
                         }
                         doc.scroll_to_cursor = true;
+                    }
+                }
+                // Hover: after the pointer rests on text, ask for info.
+                if let Some(pos) = resp.hover_pos() {
+                    if pos.x > clip.min.x + gutter_w && !resp.dragged() {
+                        let line = ((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize;
+                        if line < doc.buffer.len_lines() {
+                            let chars = line_chars(doc, line);
+                            let vc = visual_cols(&chars, m.tab);
+                            let target = ((pos.x - text_x) / m.char_w).floor() as isize;
+                            if let Some(col) =
+                                (0..chars.len()).find(|&c| vc[c] as isize <= target && (vc[c + 1] as isize) > target)
+                            {
+                                let idx = doc.buffer.pos_to_char(Position::new(line, col));
+                                hover_screen = Some((pos, idx));
+                                if ui.input(|i| i.modifiers.command) {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                            }
+                        }
                     }
                 }
                 if resp.secondary_clicked() {
@@ -304,6 +347,29 @@ pub fn editor_ui(
                         }
                     }
 
+                    // Diagnostics: squiggly underline.
+                    for d in doc.diagnostics.iter().filter(|d| d.start <= line_end && d.end >= line_start) {
+                        let a = d.start.clamp(line_start, line_end) - line_start;
+                        let mut b = d.end.clamp(line_start, line_end) - line_start;
+                        if a == b {
+                            b = (a + 1).min(chars.len().max(a + 1));
+                        }
+                        let color = severity_color(p, d.severity);
+                        let (x0, x1) = (x_of(a), x_of(b).max(x_of(a) + m.char_w));
+                        let base = y + m.line_h - 3.0;
+                        let mut pts = vec![];
+                        let mut x = x0;
+                        let mut up = true;
+                        while x <= x1 {
+                            pts.push(egui::pos2(x, if up { base - 1.5 } else { base + 1.0 }));
+                            x += 2.5;
+                            up = !up;
+                        }
+                        if pts.len() >= 2 {
+                            painter.add(egui::Shape::line(pts, Stroke::new(1.0_f32, color)));
+                        }
+                    }
+
                     // Text.
                     if !chars.is_empty() {
                         let job = layout_line(&chars, doc.highlight.line(line), &m, p);
@@ -332,6 +398,7 @@ pub fn editor_ui(
                 let cx = text_x + cvc[cursor.col.min(cvc.len() - 1)] as f32 * m.char_w;
                 let cy = rect.min.y + cursor.line as f32 * m.line_h;
                 let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
+                cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
                 if has_focus {
                     let t = ui.input(|i| i.time) - cursor_epoch;
                     let visible = !s.cursor_blink || (t % 1.1) < 0.65;
@@ -362,6 +429,12 @@ pub fn editor_ui(
                 );
                 painter.rect_filled(gutter, 0.0, p.bg);
                 let num_font = FontId::monospace(s.editor_font_size * 0.86);
+                for d in doc.diagnostics.iter().rev() {
+                    if d.line >= first && d.line < last && d.severity <= Severity::Warning {
+                        let y = rect.min.y + d.line as f32 * m.line_h + m.line_h / 2.0;
+                        painter.circle_filled(egui::pos2(clip.min.x + 6.0, y), 3.0, severity_color(p, d.severity));
+                    }
+                }
                 for line in first..last {
                     let y = rect.min.y + line as f32 * m.line_h + m.line_h / 2.0;
                     let active = line == cursor.line;
@@ -383,8 +456,155 @@ pub fn editor_ui(
         minimap(ui, doc, p, &m, mm, &out, id);
     }
 
+    // --- completion popup ---
+    if let (Some(pos), true) = (cursor_screen, has_focus) {
+        if out.inner_rect.contains(pos - egui::vec2(0.0, 1.0)) {
+            completion_popup(ui, doc, p, pos, id, &m);
+        }
+    }
+
+    // --- hover: diagnostics + language server info ---
+    match hover_screen {
+        Some((pos, idx)) => {
+            let still = ui.input(|i| i.pointer.time_since_last_movement()) > 0.45;
+            let diag: Vec<String> = doc
+                .diagnostics
+                .iter()
+                .filter(|d| d.start <= idx && idx < d.end.max(d.start + 1))
+                .map(|d| d.message.clone())
+                .collect();
+            if still {
+                let same = doc.hover.as_ref().is_some_and(|h| h.idx == idx);
+                if !same && doc.lsp_active {
+                    actions.push(EditorAction::Hover { idx });
+                }
+                let info =
+                    doc.hover.as_ref().filter(|h| h.idx == idx).and_then(|h| h.text.clone()).filter(|t| !t.is_empty());
+                if !diag.is_empty() || info.is_some() {
+                    hover_popup(ui, p, pos, &diag, info.as_deref(), id);
+                }
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+        None => doc.hover = None,
+    }
+
     ui.allocate_rect(full, Sense::hover());
     actions
+}
+
+fn severity_color(p: &Palette, s: Severity) -> Color32 {
+    match s {
+        Severity::Error => p.error,
+        Severity::Warning => p.warning,
+        Severity::Info => p.accent,
+        Severity::Hint => p.text_faint,
+    }
+}
+
+fn completion_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, pos: Pos2, id: egui::Id, m: &Metrics) {
+    let Some(c) = &mut doc.completion else { return };
+    if c.filtered.is_empty() {
+        return;
+    }
+    let mut accept = None;
+    let row_h = (m.line_h).max(22.0);
+    let visible = c.filtered.len().min(10);
+    let start = c.selected.saturating_sub(visible - 1).min(c.filtered.len() - visible);
+    egui::Area::new(id.with("completion")).order(egui::Order::Foreground).fixed_pos(pos + egui::vec2(-8.0, 2.0)).show(
+        ui.ctx(),
+        |ui| {
+            egui::Frame::popup(ui.style()).fill(p.bg_elevated).inner_margin(4).show(ui, |ui| {
+                ui.set_width(420.0);
+                for (row, &i) in c.filtered.iter().enumerate().skip(start).take(visible) {
+                    let item = &c.items[i];
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(420.0, row_h), Sense::click());
+                    if row == c.selected {
+                        ui.painter().rect_filled(rect, 4.0, p.accent_soft);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(rect, 4.0, p.bg_hover);
+                    }
+                    let kind = item.kind_label();
+                    ui.painter().text(
+                        egui::pos2(rect.min.x + 8.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        kind,
+                        FontId::monospace(10.5),
+                        p.accent,
+                    );
+                    let label: String = item.label.chars().take(48).collect();
+                    let label_rect = ui.painter().text(
+                        egui::pos2(rect.min.x + 56.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::monospace(m.font.size * 0.95),
+                        p.text,
+                    );
+                    if let Some(detail) = &item.detail {
+                        let free = Rect::from_min_max(
+                            egui::pos2(label_rect.max.x + 16.0, rect.min.y),
+                            egui::pos2(rect.max.x - 8.0, rect.max.y),
+                        );
+                        if free.width() > 40.0 {
+                            let galley =
+                                ui.painter().layout_no_wrap(detail.clone(), FontId::proportional(11.5), p.text_dim);
+                            let x = (free.max.x - galley.size().x).max(free.min.x);
+                            ui.painter().with_clip_rect(free).galley(
+                                egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+                                galley,
+                                p.text_dim,
+                            );
+                        }
+                    }
+                    if resp.clicked() {
+                        accept = Some(row);
+                    }
+                }
+                if c.filtered.len() > visible {
+                    ui.label(
+                        egui::RichText::new(format!("{} / {}", c.selected + 1, c.filtered.len()))
+                            .small()
+                            .color(p.text_faint),
+                    );
+                }
+            });
+        },
+    );
+    if let Some(row) = accept {
+        c.selected = row;
+        doc.accept_completion();
+        ui.memory_mut(|mem| mem.request_focus(id));
+    }
+}
+
+fn hover_popup(ui: &mut egui::Ui, p: &Palette, pos: Pos2, diags: &[String], info: Option<&str>, id: egui::Id) {
+    egui::Area::new(id.with("hover"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pos + egui::vec2(12.0, 16.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).fill(p.bg_elevated).inner_margin(10).show(ui, |ui| {
+                ui.set_max_width(560.0);
+                for d in diags {
+                    ui.label(egui::RichText::new(format!("● {d}")).color(p.error));
+                }
+                if let Some(text) = info {
+                    if !diags.is_empty() {
+                        ui.separator();
+                    }
+                    let mut lines = text.lines();
+                    if let Some(first) = lines.next() {
+                        ui.label(egui::RichText::new(first).monospace().color(p.accent));
+                    }
+                    let rest: Vec<&str> = lines.take(18).collect();
+                    let rest = rest.join("\n");
+                    if !rest.trim().is_empty() {
+                        ui.label(egui::RichText::new(rest.trim()).color(p.text_dim));
+                    }
+                }
+            });
+        });
 }
 
 fn layout_line(chars: &[char], spans: Option<&[crate::highlight::Span]>, m: &Metrics, p: &Palette) -> LayoutJob {
@@ -560,16 +780,54 @@ fn matching_bracket(doc: &Document) -> Option<(usize, usize)> {
 }
 
 /// Returns true if the caret moved (so the view should follow it).
-fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> bool {
+fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec<EditorAction>) {
     let events = ui.input(|i| i.events.clone());
     let mac = cfg!(target_os = "macos");
     let mut moved = false;
+    let mut actions = vec![];
     for ev in events {
+        // Completion popup navigation takes priority.
+        if let (Some(c), Event::Key { key, pressed: true, modifiers, .. }) = (&mut doc.completion, &ev) {
+            if !c.filtered.is_empty() && modifiers.is_none() {
+                match key {
+                    Key::ArrowDown => {
+                        c.selected = (c.selected + 1) % c.filtered.len();
+                        continue;
+                    }
+                    Key::ArrowUp => {
+                        c.selected = (c.selected + c.filtered.len() - 1) % c.filtered.len();
+                        continue;
+                    }
+                    Key::Enter | Key::Tab => {
+                        doc.accept_completion();
+                        moved = true;
+                        continue;
+                    }
+                    Key::Escape => {
+                        doc.completion = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match ev {
             Event::Text(t) => {
                 for c in t.chars() {
                     if !c.is_control() {
                         doc.buffer.type_char(c);
+                        if !doc.lsp_active {
+                            continue;
+                        }
+                        let ident = c.is_alphanumeric() || c == '_';
+                        if doc.lsp_triggers.contains(&c) {
+                            doc.completion = None;
+                            actions.push(EditorAction::Complete { trigger: Some(c) });
+                        } else if ident && doc.completion.is_none() {
+                            actions.push(EditorAction::Complete { trigger: None });
+                        } else if !ident {
+                            doc.completion = None;
+                        }
                     }
                 }
                 moved = true;
@@ -609,13 +867,26 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> bool {
                 doc.buffer.insert(&t);
                 moved = true;
             }
+            Event::Key { key: Key::Space, pressed: true, modifiers, .. } if modifiers.ctrl => {
+                doc.completion = None;
+                actions.push(EditorAction::Complete { trigger: None });
+            }
+            Event::Key { key: Key::F12, pressed: true, .. } => {
+                actions.push(EditorAction::GotoDefinition { idx: doc.buffer.sel.head });
+            }
+            Event::Key { key: Key::F8, pressed: true, .. } => {
+                doc.next_diagnostic();
+            }
             Event::Key { key, pressed: true, modifiers, .. } if handle_key(doc, key, modifiers, mac, page) => {
+                if !matches!(key, Key::Backspace) {
+                    doc.completion = None;
+                }
                 moved = true;
             }
             _ => {}
         }
     }
-    moved
+    (moved, actions)
 }
 
 fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: isize) -> bool {
