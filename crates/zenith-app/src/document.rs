@@ -78,6 +78,8 @@ pub struct Document {
     pub git_base: Option<String>,
     pub git_hunks: crate::git::Hunks,
     git_hunks_version: Option<u64>,
+    /// Pending review of a change made outside the editor (e.g. by an AI agent).
+    pub review: Option<crate::review::Review>,
 }
 
 impl Document {
@@ -124,6 +126,7 @@ impl Document {
             git_base: None,
             git_hunks: vec![],
             git_hunks_version: None,
+            review: None,
         }
     }
 
@@ -196,6 +199,19 @@ impl Document {
         self.buffer.sel = sel;
         self.buffer.sel.clamp(self.buffer.len_chars());
         self.after_save();
+        Ok(())
+    }
+
+    /// Reload from disk, remembering the previous content for review.
+    pub fn reload_with_review(&mut self) -> std::io::Result<()> {
+        let base = match self.review.take() {
+            Some(r) => r.base,
+            None => self.buffer.text(),
+        };
+        self.reload_from_disk()?;
+        if self.buffer.text() != base {
+            self.review = Some(crate::review::Review { base, show: false });
+        }
         Ok(())
     }
 

@@ -10,6 +10,7 @@ mod git;
 mod highlight;
 mod lsp;
 mod palette;
+mod review;
 mod sample_plugin;
 mod settings;
 mod terminal_view;

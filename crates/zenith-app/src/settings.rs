@@ -31,6 +31,8 @@ pub struct Settings {
     pub agents: Vec<AgentProfile>,
     /// Language Server Protocol support (completion, diagnostics, go to definition).
     pub lsp_enabled: bool,
+    /// Keep the previous version when a file changes on disk (e.g. edited by an AI agent) so it can be reviewed and reverted.
+    pub review_external_changes: bool,
     /// Extra / overridden language servers (same `name` overrides a built-in).
     pub language_servers: Vec<zenith_lsp::ServerConfig>,
 }
@@ -55,6 +57,7 @@ impl Default for Settings {
             default_agent: "claude".into(),
             agents: vec![],
             lsp_enabled: true,
+            review_external_changes: true,
             language_servers: vec![],
         }
     }

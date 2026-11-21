@@ -2008,12 +2008,41 @@ impl ZenithApp {
                 ui.label(RichText::new(crumbs).size(12.0).color(p.text_dim));
             });
         }
-        let changed_on_disk = self.docs.get(shown).is_some_and(|d| !d.buffer.is_dirty() && d.changed_on_disk());
-        if changed_on_disk {
-            if let Some(doc) = self.docs.get_mut(shown) {
-                // Auto-reload clean buffers modified externally (e.g. by an AI agent).
-                let _ = doc.reload_from_disk();
+        let review = self.settings.review_external_changes;
+        let mut conflict = false;
+        if let Some(doc) = self.docs.get_mut(shown) {
+            if doc.changed_on_disk() {
+                if doc.buffer.is_dirty() {
+                    conflict = true;
+                } else {
+                    // Clean buffer modified externally (e.g. by an AI agent): load it,
+                    // keeping the old version for review.
+                    let res = if review { doc.reload_with_review() } else { doc.reload_from_disk() };
+                    if let Err(e) = res {
+                        log::warn!("reload failed: {e}");
+                    }
+                }
             }
+        }
+        if let Some(doc) = self.docs.get_mut(shown) {
+            let act = crate::review::banner(ui, doc, &p, conflict);
+            if let Some(a) = act {
+                if let Err(e) = crate::review::apply(doc, a) {
+                    self.toast(format!("{e}"), NotifyLevel::Error);
+                }
+            }
+        }
+        let showing_diff = self.docs.get(shown).is_some_and(|d| d.review.as_ref().is_some_and(|r| r.show));
+        if showing_diff {
+            let fs = self.settings.editor_font_size;
+            if let Some(doc) = self.docs.get_mut(shown) {
+                if let Some(a) = crate::review::diff_view(ui, doc, &p, fs) {
+                    if let Err(e) = crate::review::apply(doc, a) {
+                        self.toast(format!("{e}"), NotifyLevel::Error);
+                    }
+                }
+            }
+            return;
         }
         let focused_pane = !self.split || right == self.focus_right;
         let focus_editor = focused_pane && std::mem::take(&mut self.focus_editor);
