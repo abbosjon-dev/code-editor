@@ -26,13 +26,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev
       - name: Test
         run: cargo test --workspace
-      - name: Build release
-        run: cargo build --release -p zenith-app
-      - name: Upload binary
+      - name: Build packages
+        shell: bash
+        run: bash packaging/package.sh
+      - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
           name: zenith-${{ runner.os }}
-          path: |
-            target/release/zenith
-            target/release/zenith.exe
-          if-no-files-found: ignore
+          path: dist/*
