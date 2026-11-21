@@ -2416,8 +2416,13 @@ impl ZenithApp {
         let mut activate = None;
         let mut close = None;
         let mut menu: Option<(TabMenu, usize)> = None;
+        // Drag & drop reordering.
+        let mut tab_rects: Vec<egui::Rect> = vec![];
+        let mut dragging: Option<usize> = None;
+        let mut dropped: Option<usize> = None;
         egui::ScrollArea::horizontal()
             .id_salt(("tabs", right))
+            .drag_to_scroll(false)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2429,7 +2434,14 @@ impl ZenithApp {
                         let font = FontId::proportional(13.0);
                         let tw = ui.fonts(|f| f.layout_no_wrap(title.clone(), font.clone(), p.text).size().x);
                         let w = tw + 64.0;
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 36.0), Sense::click_and_drag());
+                        tab_rects.push(rect);
+                        if resp.dragged() {
+                            dragging = Some(i);
+                        }
+                        if resp.drag_stopped() {
+                            dropped = Some(i);
+                        }
                         let bg = if active {
                             p.bg
                         } else if resp.hovered() {
@@ -2522,9 +2534,53 @@ impl ZenithApp {
         if let Some(i) = close {
             self.close_doc(i, false);
         }
+        // Insertion marker while dragging, and the move on release.
+        let pointer = ui.ctx().pointer_latest_pos();
+        let target = |from: usize, x: f32| -> usize {
+            let mut t = tab_rects.iter().enumerate().filter(|(j, r)| *j != from && r.center().x < x).count();
+            t = t.min(tab_rects.len().saturating_sub(1));
+            t
+        };
+        if let (Some(from), Some(pos)) = (dragging, pointer) {
+            let t = target(from, pos.x);
+            if t != from {
+                let x = if t > from { tab_rects[t].max.x } else { tab_rects[t].min.x };
+                let r = tab_rects[from];
+                ui.painter().vline(x, r.y_range(), Stroke::new(2.0_f32, p.accent));
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if let (Some(from), Some(pos)) = (dropped, pointer) {
+            let to = target(from, pos.x);
+            if to != from {
+                self.move_tab(from, to);
+            }
+        }
         if let Some((action, i)) = menu {
             self.tab_menu_action(ui.ctx(), action, i, right);
         }
+    }
+
+    /// Move a tab, keeping both panes on the documents they were showing.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.docs.len() || to >= self.docs.len() || from == to {
+            return;
+        }
+        let doc = self.docs.remove(from);
+        self.docs.insert(to, doc);
+        let remap = |i: usize| -> usize {
+            if i == from {
+                to
+            } else if from < i && i <= to {
+                i - 1
+            } else if to <= i && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+        self.active = remap(self.active);
+        self.other = remap(self.other);
     }
 
     fn tab_menu_action(&mut self, ctx: &egui::Context, action: TabMenu, i: usize, right: bool) {
