@@ -160,6 +160,8 @@ pub struct Session {
     pub terminals: Vec<Option<PathBuf>>,
     /// Ids of open AI agent tabs.
     pub agents: Vec<String>,
+    /// Additional folders in the workspace (multi-root).
+    pub extra_roots: Vec<PathBuf>,
 }
 
 impl Session {

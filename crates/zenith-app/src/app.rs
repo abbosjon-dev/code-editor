@@ -115,6 +115,9 @@ pub struct ZenithApp {
     session: Session,
     workspace: Option<PathBuf>,
     tree: Option<FileTree>,
+    /// Additional workspace folders (multi-root), each with its own tree and index.
+    extra_trees: Vec<FileTree>,
+    extra_index: Vec<FileIndex>,
     index: FileIndex,
     git: Option<Git>,
     commit_message: String,
@@ -197,6 +200,8 @@ impl ZenithApp {
             session,
             workspace: None,
             tree: None,
+            extra_trees: vec![],
+            extra_index: vec![],
             index: FileIndex::empty(),
             git: None,
             commit_message: String::new(),
@@ -263,6 +268,9 @@ impl ZenithApp {
                 let saved = app.session.clone();
                 if let Some(ws) = saved.workspace.clone().filter(|w| w.is_dir()) {
                     app.open_workspace(ws);
+                    for r in saved.extra_roots.iter().filter(|r| r.is_dir()) {
+                        app.add_root(r.clone());
+                    }
                     for f in &saved.open_files {
                         if f.is_file() {
                             app.open_file(f);
@@ -296,6 +304,8 @@ impl ZenithApp {
         self.git = Git::open(&path);
         self.problems.clear();
         self.tree = Some(FileTree::new(path.clone()));
+        self.extra_trees.clear();
+        self.extra_index.clear();
         self.session.recent_workspaces.retain(|p| p != &path);
         self.session.recent_workspaces.insert(0, path.clone());
         self.session.recent_workspaces.truncate(10);
@@ -303,6 +313,47 @@ impl ZenithApp {
         self.lsp.restart(&mut self.docs);
         self.load_plugins();
         self.save_session();
+    }
+
+    fn refresh_trees(&mut self) {
+        for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
+            t.refresh();
+        }
+    }
+
+    fn reveal_in_trees(&mut self, path: &Path) {
+        for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
+            if path.starts_with(&t.root) {
+                t.reveal(path);
+            }
+        }
+    }
+
+    /// All workspace folders, primary first.
+    fn roots(&self) -> Vec<PathBuf> {
+        self.workspace.iter().cloned().chain(self.extra_trees.iter().map(|t| t.root.clone())).collect()
+    }
+
+    fn add_root(&mut self, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        if self.workspace.is_none() {
+            self.open_workspace(path);
+            return;
+        }
+        if self.roots().contains(&path) {
+            return;
+        }
+        self.extra_index.push(FileIndex::build(&path));
+        self.extra_trees.push(FileTree::new(path));
+        self.save_session();
+    }
+
+    fn remove_root(&mut self, i: usize) {
+        if i < self.extra_trees.len() {
+            self.extra_trees.remove(i);
+            self.extra_index.remove(i);
+            self.save_session();
+        }
     }
 
     fn load_plugins(&mut self) {
@@ -354,9 +405,7 @@ impl ZenithApp {
                 }
                 self.docs.push(doc);
                 self.active = self.docs.len() - 1;
-                if let Some(t) = &mut self.tree {
-                    t.reveal(&path);
-                }
+                self.reveal_in_trees(&path);
                 self.plugins.emit("file_opened", serde_json::json!({ "path": path }));
                 self.focus_editor = true;
                 true
@@ -397,8 +446,8 @@ impl ZenithApp {
             Ok(()) => {
                 let path = doc.path().map(Path::to_path_buf);
                 if let Some(p) = &path {
-                    if let Some(t) = &mut self.tree {
-                        if let Some(parent) = p.parent() {
+                    if let Some(parent) = p.parent() {
+                        for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
                             t.refresh_dir(parent);
                         }
                     }
@@ -503,10 +552,18 @@ impl ZenithApp {
     }
 
     fn rel_path(&self, p: &Path) -> String {
-        match &self.workspace {
-            Some(ws) => p.strip_prefix(ws).unwrap_or(p).to_string_lossy().replace('\\', "/"),
-            None => p.to_string_lossy().into_owned(),
+        if let Some(ws) = &self.workspace {
+            if let Ok(r) = p.strip_prefix(ws) {
+                return r.to_string_lossy().replace('\\', "/");
+            }
         }
+        for t in &self.extra_trees {
+            if let Ok(r) = p.strip_prefix(&t.root) {
+                let name = t.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return format!("{name}/{}", r.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        p.to_string_lossy().into_owned()
     }
 
     fn editor_context(&self) -> EditorContext {
@@ -545,6 +602,7 @@ impl ZenithApp {
         self.session.show_terminal = self.show_terminal;
         self.session.show_ai = self.show_ai;
         self.session.split = self.split;
+        self.session.extra_roots = self.extra_trees.iter().map(|t| t.root.clone()).collect();
         self.session.terminals = self.bottom.tabs.iter().filter(|t| t.is_alive()).map(|t| t.spec.cwd.clone()).collect();
         self.session.agents = self
             .ai
@@ -776,6 +834,11 @@ impl ZenithApp {
                     }
                 }
             }
+            Cmd::AddFolderToWorkspace => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.add_root(dir);
+                }
+            }
             Cmd::OpenFolder => {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.open_workspace(dir);
@@ -818,7 +881,17 @@ impl ZenithApp {
                         detail: String::new(),
                         action: PaletteAction::OpenFile(f.clone()),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let mut items = items;
+                for (t, idx) in self.extra_trees.iter().zip(self.extra_index.iter_mut()) {
+                    idx.poll();
+                    let name = t.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    items.extend(idx.files.iter().map(|f| Item {
+                        label: format!("{name}/{f}"),
+                        detail: String::new(),
+                        action: PaletteAction::OpenFile(t.root.join(f).to_string_lossy().into_owned()),
+                    }));
+                }
                 let ph = if self.workspace.is_some() {
                     "Search files by name"
                 } else {
@@ -1157,6 +1230,9 @@ impl ZenithApp {
                     self.toast(format!("{e:#}"), NotifyLevel::Error);
                 }
             }
+            PaletteAction::OpenFile(rel) if Path::new(&rel).is_absolute() => {
+                self.open_file(Path::new(&rel));
+            }
             PaletteAction::OpenFile(rel) => {
                 if let Some(ws) = self.workspace.clone() {
                     self.open_file(&ws.join(rel));
@@ -1435,9 +1511,7 @@ impl ZenithApp {
                     }
                 }
                 self.reload_git_bases();
-                if let Some(t) = &mut self.tree {
-                    t.refresh();
-                }
+                self.refresh_trees();
                 self.toast(format!("Switched to branch {branch}"), NotifyLevel::Info);
             }
             Err(e) => self.toast(format!("git: {e}"), NotifyLevel::Error),
@@ -1905,6 +1979,7 @@ impl ZenithApp {
                 item(ui, Cmd::NewFile, "New File");
                 item(ui, Cmd::OpenFile, "Open File…");
                 item(ui, Cmd::OpenFolder, "Open Folder…");
+                item(ui, Cmd::AddFolderToWorkspace, "Add Folder to Workspace…");
                 ui.menu_button("Open Recent", |ui| {
                     for r in self.session.recent_workspaces.clone() {
                         if ui.button(r.display().to_string()).clicked() {
@@ -2103,9 +2178,7 @@ impl ZenithApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(root) = self.workspace.clone() {
                             if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                                if let Some(t) = &mut self.tree {
-                                    t.refresh();
-                                }
+                                self.refresh_trees();
                                 self.index = FileIndex::build(&root);
                             }
                             if ui.small_button("🗀+").on_hover_text("New folder").clicked() {
@@ -2123,7 +2196,39 @@ impl ZenithApp {
                     ui.add_space(2.0);
                 }
                 let active_path = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
+                let mut remove = None;
                 let action = match &mut self.tree {
+                    Some(tree) if !self.extra_trees.is_empty() => {
+                        // Multi-root: every folder under its own header, one scroll area.
+                        let mut action = None;
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            if let Some(a) = tree.contents_ui(ui, &p, active_path.as_deref()) {
+                                action = Some(a);
+                            }
+                            for (i, t) in self.extra_trees.iter_mut().enumerate() {
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    let name = t
+                                        .root
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_uppercase())
+                                        .unwrap_or_default();
+                                    ui.label(RichText::new(name).strong().size(12.0));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("✕").on_hover_text("Remove folder from workspace").clicked()
+                                        {
+                                            remove = Some(i);
+                                        }
+                                    });
+                                });
+                                ui.add_space(2.0);
+                                if let Some(a) = t.contents_ui(ui, &p, active_path.as_deref()) {
+                                    action = Some(a);
+                                }
+                            }
+                        });
+                        action
+                    }
                     Some(tree) => tree.ui(ui, &p, active_path.as_deref()),
                     None => {
                         ui.add_space(12.0);
@@ -2145,6 +2250,9 @@ impl ZenithApp {
                 if let Some(a) = action {
                     self.handle_tree_action(ctx, a);
                 }
+                if let Some(i) = remove {
+                    self.remove_root(i);
+                }
             }
             SidebarView::Search => self.search_ui(ui, &p),
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
@@ -2156,10 +2264,10 @@ impl ZenithApp {
 
     fn search_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
         Self::section_header(ui, p, "SEARCH");
-        let Some(root) = self.workspace.clone() else {
+        if self.workspace.is_none() {
             ui.label(RichText::new("Open a folder to search in files.").color(p.text_dim));
             return;
-        };
+        }
         let mut start = false;
         let mut changed = false;
         let mut replace_all = false;
@@ -2231,7 +2339,7 @@ impl ZenithApp {
             self.search.job = None;
             self.search.error = None;
             if !self.search.query.is_empty() {
-                match SearchJob::start(&root, &self.search.query, self.search.opts) {
+                match SearchJob::start(&self.roots(), &self.search.query, self.search.opts) {
                     Ok(job) => self.search.job = Some(job),
                     Err(e) => self.search.error = Some(e),
                 }
@@ -2817,8 +2925,8 @@ impl ZenithApp {
                 }
             }
             TabMenu::Reveal => {
-                if let (Some(p), Some(t)) = (path, &mut self.tree) {
-                    t.reveal(&p);
+                if let Some(p) = path {
+                    self.reveal_in_trees(&p);
                     self.sidebar = SidebarView::Explorer;
                     self.show_sidebar = true;
                 }
@@ -3359,9 +3467,7 @@ impl ZenithApp {
                                 Ok(()) => {
                                     self.docs.retain(|d| d.path().is_none_or(|p| !p.starts_with(&path)));
                                     self.active = self.active.min(self.docs.len().saturating_sub(1));
-                                    if let Some(t) = &mut self.tree {
-                                        t.refresh();
-                                    }
+                                    self.refresh_trees();
                                 }
                                 Err(e) => self.toast(format!("Delete failed: {e}"), NotifyLevel::Error),
                             }
@@ -3600,9 +3706,7 @@ impl ZenithApp {
         if let Err(e) = result {
             self.toast(format!("{e}"), NotifyLevel::Error);
         }
-        if let Some(t) = &mut self.tree {
-            t.refresh();
-        }
+        self.refresh_trees();
         if let Some(ws) = &self.workspace {
             self.index = FileIndex::build(ws);
         }
@@ -3713,6 +3817,9 @@ impl eframe::App for ZenithApp {
             self.style_dirty = false;
         }
         self.index.poll();
+        for i in &mut self.extra_index {
+            i.poll();
+        }
         self.handle_plugin_events();
         self.flush_pending_sends();
         self.retry_failed_resumes();

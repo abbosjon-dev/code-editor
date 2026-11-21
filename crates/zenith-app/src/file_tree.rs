@@ -102,6 +102,15 @@ impl FileTree {
         out
     }
 
+    /// Just the rows (no scroll area), for stacking several roots in one view.
+    pub fn contents_ui(&mut self, ui: &mut egui::Ui, p: &Palette, active_file: Option<&Path>) -> Option<TreeAction> {
+        let mut action = None;
+        let root = self.root.clone();
+        ui.spacing_mut().item_spacing.y = 0.0;
+        self.dir_ui(ui, p, &root, 0, active_file, &mut action);
+        action
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, p: &Palette, active_file: Option<&Path>) -> Option<TreeAction> {
         let mut action = None;
         let root = self.root.clone();

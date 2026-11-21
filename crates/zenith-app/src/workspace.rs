@@ -111,46 +111,57 @@ pub const MAX_HITS: usize = 5_000;
 const MAX_LINE_SHOWN: usize = 240;
 
 impl SearchJob {
-    pub fn start(root: &Path, query: &str, opts: SearchOpts) -> Result<Self, String> {
+    /// Search every root; paths in extra roots are shown as `root-name/rel`.
+    pub fn start(roots: &[PathBuf], query: &str, opts: SearchOpts) -> Result<Self, String> {
         let re = build_regex(query, opts)?;
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let root = root.to_path_buf();
+        let roots = roots.to_vec();
         let c2 = cancel.clone();
         thread::spawn(move || {
             let mut total = 0;
-            let walker = ignore::WalkBuilder::new(&root).build();
-            for e in walker.flatten() {
-                if c2.load(Ordering::Relaxed) || total >= MAX_HITS {
-                    break;
-                }
-                if !e.file_type().is_some_and(|t| t.is_file()) {
-                    continue;
-                }
-                let Ok(meta) = e.metadata() else { continue };
-                if meta.len() > 4 * 1024 * 1024 {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(e.path()) else { continue };
-                if bytes.iter().take(8000).any(|b| *b == 0) {
-                    continue; // binary
-                }
-                let text = String::from_utf8_lossy(&bytes);
-                let rel = e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
-                let mut hits = vec![];
-                for (i, line) in text.lines().enumerate() {
-                    let found: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
-                    if found.is_empty() {
-                        continue;
-                    }
-                    hits.push(make_hit(e.path(), &rel, i, line, &found));
-                    total += 1;
-                    if total >= MAX_HITS {
+            for (ri, root) in roots.iter().enumerate() {
+                let prefix = if ri == 0 {
+                    String::new()
+                } else {
+                    format!("{}/", root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+                };
+                let walker = ignore::WalkBuilder::new(root).build();
+                for e in walker.flatten() {
+                    if c2.load(Ordering::Relaxed) || total >= MAX_HITS {
                         break;
                     }
-                }
-                if !hits.is_empty() && tx.send(hits).is_err() {
-                    break;
+                    if !e.file_type().is_some_and(|t| t.is_file()) {
+                        continue;
+                    }
+                    let Ok(meta) = e.metadata() else { continue };
+                    if meta.len() > 4 * 1024 * 1024 {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(e.path()) else { continue };
+                    if bytes.iter().take(8000).any(|b| *b == 0) {
+                        continue; // binary
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let rel = format!(
+                        "{prefix}{}",
+                        e.path().strip_prefix(root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/")
+                    );
+                    let mut hits = vec![];
+                    for (i, line) in text.lines().enumerate() {
+                        let found: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+                        if found.is_empty() {
+                            continue;
+                        }
+                        hits.push(make_hit(e.path(), &rel, i, line, &found));
+                        total += 1;
+                        if total >= MAX_HITS {
+                            break;
+                        }
+                    }
+                    if !hits.is_empty() && tx.send(hits).is_err() {
+                        return;
+                    }
                 }
             }
         });
