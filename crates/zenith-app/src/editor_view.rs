@@ -470,6 +470,30 @@ pub fn editor_ui(
                         painter.galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
                     }
 
+                    // Inline problem message at the end of the line ("error lens").
+                    if s.inline_diagnostics && last_seg {
+                        if let Some(d) = doc
+                            .diagnostics
+                            .iter()
+                            .filter(|d| d.line == line && d.severity <= Severity::Info)
+                            .min_by_key(|d| d.severity)
+                        {
+                            let color = severity_color(p, d.severity);
+                            let msg: String = d.message.lines().next().unwrap_or_default().chars().take(160).collect();
+                            let extra = if doc.folds.contains(&line) { 4.0 } else { 0.0 };
+                            let x = x_of(chars.len()) + m.char_w * (3.0 + extra);
+                            let galley = ui.fonts(|f| {
+                                f.layout_no_wrap(format!("● {msg}"), FontId::proportional(m.font.size * 0.85), color.gamma_multiply(0.85))
+                            });
+                            let r = Rect::from_min_size(
+                                egui::pos2(x - 6.0, y + 2.0),
+                                egui::vec2(galley.size().x + 12.0, m.line_h - 4.0),
+                            );
+                            painter.rect_filled(r, 4.0, color.gamma_multiply(0.10));
+                            painter.galley(egui::pos2(x, y + (m.line_h - galley.size().y) / 2.0), galley, color);
+                        }
+                    }
+
                     if doc.folds.contains(&line) && !fm.is_identity() && last_seg {
                         let x = x_of(chars.len()) + m.char_w;
                         let pill =

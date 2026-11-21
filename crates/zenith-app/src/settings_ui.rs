@@ -151,6 +151,7 @@ fn appearance(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= slider(ui, &mut s.line_height, 1.0..=2.2, "Line height", "Multiple of the font size");
     c.any |= checkbox(ui, &mut s.show_minimap, "Minimap", "Code overview on the right");
     c.any |= checkbox(ui, &mut s.word_wrap, "Word wrap", "Wrap long lines to the window (Alt+Z)");
+    c.any |= checkbox(ui, &mut s.inline_diagnostics, "Inline problems", "Show error/warning text at the end of the line");
     c.any |= checkbox(ui, &mut s.show_indent_guides, "Indent guides", "");
     c.any |= checkbox(ui, &mut s.cursor_blink, "Blinking cursor", "");
 }

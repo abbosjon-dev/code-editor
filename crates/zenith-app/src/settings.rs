@@ -22,6 +22,8 @@ pub struct Settings {
     pub show_minimap: bool,
     /// Soft-wrap long lines to the window width.
     pub word_wrap: bool,
+    /// Show problem messages at the end of their line.
+    pub inline_diagnostics: bool,
     pub cursor_blink: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
@@ -57,6 +59,7 @@ impl Default for Settings {
             show_indent_guides: true,
             show_minimap: true,
             word_wrap: false,
+            inline_diagnostics: true,
             cursor_blink: true,
             auto_save: false,
             format_trim_trailing_whitespace: false,
