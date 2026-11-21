@@ -20,7 +20,20 @@ macOS, Windows va Linux'da ishlaydi.
 | 🔍 **Navigatsiya** | Buyruqlar palitrasi (`Ctrl+Shift+P`), fuzzy fayl qidirish (`Ctrl+P`), fayllar ichida qidirish (`Ctrl+Shift+F`, `.gitignore`'ni hisobga oladi), qatorga o'tish. |
 | 🎨 **Chiroyli UI** | Zenith Midnight (qorong'i) va Daylight (yorug') temalari, 30+ sintaksis temasi, JetBrains Mono + Inter shriftlari. |
 
-## O'rnatish va ishga tushirish
+## Yuklab olish
+
+[Releases](https://github.com/abbosjon-dev/code-editor/releases) sahifasidan:
+
+| OS | Fayl | O'rnatish |
+|---|---|---|
+| **macOS** (Apple Silicon / Intel) | `Zenith-…-macos-arm64.dmg` / `…-x86_64.dmg` | DMG'ni oching, Zenith'ni Applications'ga torting. Ilova imzolanmagan: birinchi marta **o'ng tugma → Open** (yoki `xattr -dr com.apple.quarantine /Applications/Zenith.app`). |
+| **Windows** | `zenith-…-windows-x86_64.zip` | Arxivni oching va `zenith.exe` ni ishga tushiring. |
+| **Ubuntu / Debian** | `zenith_…_amd64.deb` | `sudo apt install ./zenith_…_amd64.deb` |
+| **Boshqa Linux** | `zenith-…-linux-x86_64.tar.gz` | Arxivni oching va `./install.sh` (foydalanuvchi uchun, `~/.local`ga). |
+
+Paketlarni o'zingiz yig'ish: `bash packaging/package.sh` (natija `dist/` papkasida).
+
+## Manba koddan ishga tushirish
 
 Talab: [Rust](https://rustup.rs) (stable).
 
