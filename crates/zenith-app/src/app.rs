@@ -62,6 +62,7 @@ enum InputKind {
     Rename(PathBuf),
     /// Rename the symbol at this char index (LSP).
     RenameSymbol(usize),
+    NewBranch,
 }
 
 enum Dialog {
@@ -882,6 +883,33 @@ impl ZenithApp {
                 self.sidebar = SidebarView::Explorer;
                 self.show_sidebar = true;
             }
+            Cmd::GitOpenChanges => {
+                if let Some(doc) = self.active_doc() {
+                    doc.show_git_diff = !doc.show_git_diff;
+                }
+            }
+            Cmd::GitSwitchBranch => {
+                let Some(g) = &self.git else {
+                    self.toast("This folder is not a Git repository", NotifyLevel::Info);
+                    return;
+                };
+                let current = g.branch.clone().unwrap_or_default();
+                let mut items: Vec<Item> = g
+                    .branches()
+                    .into_iter()
+                    .map(|b| Item {
+                        label: format!("⎇ {b}"),
+                        detail: if b == current { "current".into() } else { String::new() },
+                        action: PaletteAction::GitCheckout(b),
+                    })
+                    .collect();
+                items.push(Item {
+                    label: "+ Create new branch…".into(),
+                    detail: String::new(),
+                    action: PaletteAction::GitNewBranch,
+                });
+                self.palette.show(Mode::Pick, items, "Switch to branch");
+            }
             Cmd::ShowProblems => {
                 self.sidebar = SidebarView::Problems;
                 self.show_sidebar = true;
@@ -1052,6 +1080,15 @@ impl ZenithApp {
                     doc.reveal_line = Some(line);
                 }
                 self.focus_editor = true;
+            }
+            PaletteAction::GitCheckout(b) => self.git_switch(&b, false),
+            PaletteAction::GitNewBranch => {
+                self.dialog = Some(Dialog::Input {
+                    title: "New branch name".into(),
+                    value: String::new(),
+                    kind: InputKind::NewBranch,
+                    focus: true,
+                })
             }
             PaletteAction::CodeAction(i) => {
                 let Some(action) = self.code_actions.get(i).cloned() else { return };
@@ -1259,6 +1296,28 @@ impl ZenithApp {
         }
     }
 
+    /// Check out (or create) a branch, then refresh open files from disk.
+    fn git_switch(&mut self, branch: &str, create: bool) {
+        let Some(g) = &mut self.git else { return };
+        let res = if create { g.create_branch(branch) } else { g.checkout(branch) };
+        match res {
+            Ok(()) => {
+                // Clean buffers follow the new branch silently (not an agent edit).
+                for d in &mut self.docs {
+                    if !d.buffer.is_dirty() && d.changed_on_disk() {
+                        let _ = d.reload_from_disk();
+                    }
+                }
+                self.reload_git_bases();
+                if let Some(t) = &mut self.tree {
+                    t.refresh();
+                }
+                self.toast(format!("Switched to branch {branch}"), NotifyLevel::Info);
+            }
+            Err(e) => self.toast(format!("git: {e}"), NotifyLevel::Error),
+        }
+    }
+
     /// Re-read HEAD contents for open files (after commit / checkout).
     fn reload_git_bases(&mut self) {
         let Some(g) = &self.git else { return };
@@ -1455,7 +1514,12 @@ impl ZenithApp {
             self.reload_git_bases();
         }
         if let Some(path) = open {
-            self.open_file(&path);
+            if self.open_file(&path) {
+                // Show what changed; "Open file" in the diff goes back to editing.
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    doc.show_git_diff = doc.git_base.is_some();
+                }
+            }
         }
         if ai_commit {
             let msg = if self.commit_message.trim().is_empty() {
@@ -2700,6 +2764,16 @@ impl ZenithApp {
                 }
             }
         }
+        if self.docs.get(shown).is_some_and(|d| d.show_git_diff) {
+            let fs = self.settings.editor_font_size;
+            if let Some(doc) = self.docs.get_mut(shown) {
+                if let Some(crate::diff_view::DiffAction::Close) = crate::diff_view::ui(ui, doc, &p, fs) {
+                    doc.show_git_diff = false;
+                    self.focus_editor = true;
+                }
+            }
+            return;
+        }
         let showing_diff = self.docs.get(shown).is_some_and(|d| d.review.as_ref().is_some_and(|r| r.show));
         if showing_diff {
             let fs = self.settings.editor_font_size;
@@ -2832,7 +2906,10 @@ impl ZenithApp {
             ui.spacing_mut().item_spacing.x = 14.0;
             let small = |t: String| RichText::new(t).size(12.0).color(p.text_dim);
             if let Some(b) = self.git.as_ref().and_then(|g| g.branch.as_ref()) {
-                ui.label(small(format!("⎇ {b}")));
+                let r = ui.add(egui::Label::new(small(format!("⎇ {b}"))).sense(Sense::click()));
+                if r.on_hover_text("Switch branch").clicked() {
+                    cmd = Some(Cmd::GitSwitchBranch);
+                }
             }
             if self.index.indexing {
                 ui.label(small("indexing…".into()));
@@ -3314,6 +3391,10 @@ impl ZenithApp {
                 })
             }
             InputKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(&name)),
+            InputKind::NewBranch => {
+                self.git_switch(&name, true);
+                return;
+            }
             InputKind::RenameSymbol(idx) => {
                 let root = self.workspace.clone();
                 if let Some(doc) = self.docs.get_mut(self.active) {

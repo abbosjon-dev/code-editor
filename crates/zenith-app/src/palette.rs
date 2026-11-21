@@ -19,6 +19,8 @@ pub enum PaletteAction {
     LaunchAgent(String),
     OpenRecent(std::path::PathBuf),
     CodeAction(usize),
+    GitCheckout(String),
+    GitNewBranch,
     GotoPosition(usize, usize),
 }
 

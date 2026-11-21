@@ -3,6 +3,7 @@
 
 mod app;
 mod commands;
+mod diff_view;
 mod document;
 mod editor_view;
 mod file_tree;

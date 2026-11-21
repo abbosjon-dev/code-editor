@@ -113,6 +113,11 @@ languages = ["python"]
 
 ![Git](docs/git.png)
 
+Source Control'da faylni bossangiz, u HEAD bilan **yonma-yon diff** ko'rinishida ochiladi (Prev/Next bilan o'zgarishlar
+orasida yurish, "Open file" — tahrirga qaytish). Status qatoridagi branch nomini bossangiz — **branch almashtirish yoki yangi branch yaratish**.
+
+![Git diff](docs/git-diff.png)
+
 Tizimdagi `git` buyrug'idan foydalanadi (alohida kutubxona shart emas). Fon holati `--no-optional-locks` bilan o'qiladi,
 shuning uchun terminal yoki AI agent bilan bir vaqtda ishlaganda `index.lock` to'qnashuvi bo'lmaydi.
 

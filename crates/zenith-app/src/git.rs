@@ -101,6 +101,47 @@ pub fn parse_status(root: &Path, porcelain_z: &str) -> Vec<StatusEntry> {
 }
 
 /// Line-level diff of `current` against `base` for gutter markers.
+/// One row of a side-by-side diff: (old line number, new line number), either
+/// may be missing for pure deletions/insertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffRow {
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+    pub changed: bool,
+}
+
+/// Align two versions of a file into side-by-side rows.
+pub fn side_by_side(old: &str, new: &str) -> Vec<DiffRow> {
+    use similar::{DiffOp, TextDiff};
+    let diff = TextDiff::configure().timeout(Duration::from_millis(200)).diff_lines(old, new);
+    let mut rows = vec![];
+    for op in diff.ops() {
+        match *op {
+            DiffOp::Equal { old_index, new_index, len } => rows.extend((0..len).map(|k| DiffRow {
+                old: Some(old_index + k),
+                new: Some(new_index + k),
+                changed: false,
+            })),
+            DiffOp::Delete { old_index, old_len, .. } => {
+                rows.extend((0..old_len).map(|k| DiffRow { old: Some(old_index + k), new: None, changed: true }))
+            }
+            DiffOp::Insert { new_index, new_len, .. } => {
+                rows.extend((0..new_len).map(|k| DiffRow { old: None, new: Some(new_index + k), changed: true }))
+            }
+            DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                for k in 0..old_len.max(new_len) {
+                    rows.push(DiffRow {
+                        old: (k < old_len).then_some(old_index + k),
+                        new: (k < new_len).then_some(new_index + k),
+                        changed: true,
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
 pub fn diff_hunks(base: &str, current: &str) -> Hunks {
     use similar::{DiffOp, TextDiff};
     let diff = TextDiff::configure().timeout(Duration::from_millis(50)).diff_lines(base, current);
@@ -214,6 +255,25 @@ impl Git {
         git(&self.root, &["pull", "--ff-only"])
     }
 
+    /// Local branches, most recently committed first.
+    pub fn branches(&self) -> Vec<String> {
+        git(&self.root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads/"])
+            .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn checkout(&mut self, branch: &str) -> Result<(), String> {
+        git(&self.root, &["checkout", "-q", branch])?;
+        self.refresh_now();
+        Ok(())
+    }
+
+    pub fn create_branch(&mut self, branch: &str) -> Result<(), String> {
+        git(&self.root, &["checkout", "-q", "-b", branch])?;
+        self.refresh_now();
+        Ok(())
+    }
+
     fn refresh_now(&mut self) {
         self.status_rx = None;
         self.refresh();
@@ -251,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_alignment() {
+        let rows = side_by_side("a\nb\nc\n", "a\nB\nB2\nc\nd\n");
+        let pairs: Vec<_> = rows.iter().map(|r| (r.old, r.new, r.changed)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(0), Some(0), false),
+                (Some(1), Some(1), true),
+                (None, Some(2), true),
+                (Some(2), Some(3), false),
+                (None, Some(4), true),
+            ]
+        );
+    }
+
+    #[test]
     fn real_repo_roundtrip() {
         let dir = std::env::temp_dir().join(format!("zenith-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -272,6 +348,11 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(g.status[0].letter(), 'M');
+        g.commit("two").unwrap();
+        g.create_branch("feature").unwrap();
+        assert!(g.branches().contains(&"feature".to_string()));
+        let main = g.branches().into_iter().find(|b| b != "feature").unwrap();
+        g.checkout(&main).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
