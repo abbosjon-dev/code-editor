@@ -256,14 +256,17 @@ impl ZenithApp {
                 app.open_file(&p);
             }
             None => {
-                if let Some(ws) = app.session.workspace.clone().filter(|w| w.is_dir()) {
+                // open_workspace() saves the (still empty) session, so keep a copy first.
+                let saved = app.session.clone();
+                if let Some(ws) = saved.workspace.clone().filter(|w| w.is_dir()) {
                     app.open_workspace(ws);
-                    for f in app.session.open_files.clone() {
+                    for f in &saved.open_files {
                         if f.is_file() {
-                            app.open_file(&f);
+                            app.open_file(f);
                         }
                     }
-                    app.active = app.session.active.min(app.docs.len().saturating_sub(1));
+                    app.active = saved.active.min(app.docs.len().saturating_sub(1));
+                    app.restore_session_state(&saved);
                 }
             }
         }
@@ -519,9 +522,73 @@ impl ZenithApp {
     fn save_session(&mut self) {
         self.session.workspace = self.workspace.clone();
         self.session.open_files = self.docs.iter().filter_map(|d| d.path().map(Path::to_path_buf)).collect();
+        self.session.cursors =
+            self.docs.iter().filter_map(|d| d.path().map(|p| (p.to_path_buf(), d.buffer.sel.head))).collect();
         self.session.active = self.active;
+        self.session.show_sidebar = Some(self.show_sidebar);
+        self.session.sidebar = match self.sidebar {
+            SidebarView::Explorer => "explorer",
+            SidebarView::Search => "search",
+            SidebarView::Git => "git",
+            SidebarView::Problems => "problems",
+            SidebarView::Agents => "agents",
+            SidebarView::Plugins => "plugins",
+        }
+        .into();
+        self.session.show_terminal = self.show_terminal;
+        self.session.show_ai = self.show_ai;
+        self.session.split = self.split;
+        self.session.terminals = self.bottom.tabs.iter().filter(|t| t.is_alive()).map(|t| t.spec.cwd.clone()).collect();
+        self.session.agents = self
+            .ai
+            .tabs
+            .iter()
+            .filter(|t| t.is_alive())
+            .filter_map(|t| match &t.kind {
+                TermKind::Agent { id, .. } => Some(id.clone()),
+                TermKind::Shell => None,
+            })
+            .collect();
         self.session.save();
         self.last_session_save = Instant::now();
+    }
+
+    /// Re-apply carets, panels, terminals and agents from the saved session.
+    fn restore_session_state(&mut self, sess: &Session) {
+        for (path, idx) in &sess.cursors {
+            if let Some(doc) = self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
+                let idx = (*idx).min(doc.buffer.len_chars());
+                doc.buffer.set_cursor(idx, false);
+                doc.reveal_line = Some(doc.buffer.char_to_pos(idx).line);
+            }
+        }
+        if let Some(show) = sess.show_sidebar {
+            self.show_sidebar = show;
+        }
+        self.sidebar = match sess.sidebar.as_str() {
+            "search" => SidebarView::Search,
+            "git" => SidebarView::Git,
+            "problems" => SidebarView::Problems,
+            "agents" => SidebarView::Agents,
+            "plugins" => SidebarView::Plugins,
+            _ => SidebarView::Explorer,
+        };
+        if sess.split && self.docs.len() > 1 {
+            self.split = true;
+            self.other = (self.active + 1) % self.docs.len();
+        }
+        if self.settings.restore_terminals {
+            for cwd in &sess.terminals {
+                self.new_terminal(cwd.clone().filter(|d| d.is_dir()));
+            }
+            for id in &sess.agents {
+                self.start_agent(id, true);
+            }
+        }
+        self.show_terminal = sess.show_terminal && !self.bottom.tabs.is_empty();
+        self.show_ai = sess.show_ai && !self.ai.tabs.is_empty();
+        self.focus_terminal = None;
+        self.focus_editor = true;
     }
 
     // ------------------------------------------------------------------
@@ -555,6 +622,12 @@ impl ZenithApp {
     }
 
     fn launch_agent(&mut self, agent_id: &str) -> Option<u64> {
+        self.start_agent(agent_id, false)
+    }
+
+    /// Start an agent CLI; `resume` adds its resume arguments (continue the
+    /// previous conversation) when it has any.
+    fn start_agent(&mut self, agent_id: &str, resume: bool) -> Option<u64> {
         let agent = self.agents.iter().find(|a| a.id == agent_id).cloned()?;
         if !agent.is_installed() {
             self.installed.insert(agent.id.clone(), false);
@@ -568,14 +641,21 @@ impl ZenithApp {
         }
         self.installed.insert(agent.id.clone(), true);
         let id = self.id();
-        let mut spec = CommandSpec::program(agent.command.clone(), agent.args.clone()).with_cwd(self.workspace.clone());
+        let mut args = agent.args.clone();
+        if resume {
+            args.extend(agent.resume_args.iter().cloned());
+        }
+        let mut spec = CommandSpec::program(agent.command.clone(), args).with_cwd(self.workspace.clone());
         spec.env = agent.env.clone();
-        let tab = TermTab::spawn(
+        let mut tab = TermTab::spawn(
             id,
             TermKind::Agent { id: agent.id.clone(), name: agent.name.clone(), icon: agent.icon.clone() },
             spec,
             self.waker.clone(),
         );
+        if resume && !agent.resume_args.is_empty() {
+            tab.resumed = Some((Instant::now(), agent.resume_args.clone()));
+        }
         self.ai.tabs.push(tab);
         self.ai.active = self.ai.tabs.len() - 1;
         self.show_ai = true;
@@ -619,6 +699,30 @@ impl ZenithApp {
             (a, b)
         });
         build_context_prompt(rel.as_deref(), range, &sel, question)
+    }
+
+    /// An agent started with "continue last conversation" that exits within a
+    /// few seconds probably had nothing to continue: start it fresh instead.
+    fn retry_failed_resumes(&mut self) {
+        let waker = self.waker.clone();
+        for tab in &mut self.ai.tabs {
+            let Some((at, args)) = &tab.resumed else { continue };
+            if at.elapsed() > Duration::from_secs(8) {
+                tab.resumed = None;
+            } else if tab.term.is_some() && !tab.is_alive() {
+                let drop: Vec<String> = args.clone();
+                tab.spec.args.retain(|a| !drop.contains(a));
+                tab.resumed = None;
+                tab.restart(waker.clone());
+            }
+        }
+        if self.ai.tabs.iter().any(|t| t.resumed.is_some()) {
+            let w = self.waker.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                w();
+            });
+        }
     }
 
     fn flush_pending_sends(&mut self) {
@@ -3531,6 +3635,7 @@ impl eframe::App for ZenithApp {
         self.index.poll();
         self.handle_plugin_events();
         self.flush_pending_sends();
+        self.retry_failed_resumes();
         self.handle_lsp();
         self.handle_git();
 

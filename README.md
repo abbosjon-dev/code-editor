@@ -73,6 +73,9 @@ command = "my-agent-cli"
 args = ["--model", "best"]
 ```
 
+Editorni yopib qayta ochganingizda ochiq fayllar (kursor joyi bilan), panellar, terminallar va AI agentlar tiklanadi;
+Claude Code o'zining oxirgi suhbatini `--continue` bilan davom ettiradi (agentga `resume_args` bilan o'zingiz ham qo'shishingiz mumkin).
+
 API kalitlarni sozlamalarga yozmang — agentlar sizning shell muhitingizdagi o'zgaruvchilarni meros qilib oladi.
 
 ## AI o'zgarishlarini ko'rib chiqish

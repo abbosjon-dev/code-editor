@@ -37,6 +37,8 @@ pub struct Settings {
     pub review_external_changes: bool,
     /// Format files with the language server when saving.
     pub format_on_save: bool,
+    /// Reopen terminals and AI agents (continuing their last conversation when supported) on startup.
+    pub restore_terminals: bool,
     /// Extra / overridden language servers (same `name` overrides a built-in).
     pub language_servers: Vec<zenith_lsp::ServerConfig>,
 }
@@ -64,6 +66,7 @@ impl Default for Settings {
             lsp_enabled: true,
             review_external_changes: true,
             format_on_save: false,
+            restore_terminals: true,
             language_servers: vec![],
         }
     }
@@ -140,6 +143,17 @@ pub struct Session {
     pub recent_workspaces: Vec<PathBuf>,
     pub sidebar_width: Option<f32>,
     pub zoom: f32,
+    /// Caret position (char index) per open file.
+    pub cursors: Vec<(PathBuf, usize)>,
+    pub show_sidebar: Option<bool>,
+    pub sidebar: String,
+    pub show_terminal: bool,
+    pub show_ai: bool,
+    pub split: bool,
+    /// Working directories of open shell terminals.
+    pub terminals: Vec<Option<PathBuf>>,
+    /// Ids of open AI agent tabs.
+    pub agents: Vec<String>,
 }
 
 impl Session {

@@ -27,6 +27,10 @@ pub struct AgentProfile {
     /// Short icon/glyph shown in the UI.
     #[serde(default = "default_icon")]
     pub icon: String,
+    /// Extra arguments to continue the previous conversation when the
+    /// editor restores a session (e.g. `--continue` for Claude Code).
+    #[serde(default)]
+    pub resume_args: Vec<String>,
 }
 
 fn default_icon() -> String {
@@ -43,6 +47,7 @@ impl AgentProfile {
             env: vec![],
             install_hint: hint.into(),
             icon: icon.into(),
+            resume_args: vec![],
         }
     }
 
@@ -55,7 +60,10 @@ impl AgentProfile {
 /// The agents Zenith knows about out of the box.
 pub fn builtin_agents() -> Vec<AgentProfile> {
     vec![
-        AgentProfile::builtin("claude", "Claude Code", "claude", "✳", "npm install -g @anthropic-ai/claude-code"),
+        AgentProfile {
+            resume_args: vec!["--continue".into()],
+            ..AgentProfile::builtin("claude", "Claude Code", "claude", "✳", "npm install -g @anthropic-ai/claude-code")
+        },
         AgentProfile::builtin("codex", "OpenAI Codex", "codex", "◎", "npm install -g @openai/codex"),
         AgentProfile::builtin("gemini", "Gemini CLI", "gemini", "◈", "npm install -g @google/gemini-cli"),
         AgentProfile::builtin("aider", "Aider", "aider", "◆", "python -m pip install aider-install && aider-install"),

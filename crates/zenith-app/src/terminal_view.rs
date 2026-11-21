@@ -24,11 +24,13 @@ pub struct TermTab {
     pub error: Option<String>,
     selection: Option<((u16, u16), (u16, u16))>,
     scroll_accum: f32,
+    /// Set when started with resume arguments: (start time, args to drop if it exits right away).
+    pub resumed: Option<(std::time::Instant, Vec<String>)>,
 }
 
 impl TermTab {
     pub fn spawn(id: u64, kind: TermKind, spec: CommandSpec, waker: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let mut t = Self { id, term: None, kind, spec, error: None, selection: None, scroll_accum: 0.0 };
+        let mut t = Self { id, term: None, kind, spec, error: None, selection: None, scroll_accum: 0.0, resumed: None };
         t.restart(waker);
         t
     }

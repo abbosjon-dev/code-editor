@@ -187,6 +187,12 @@ fn ai(ui: &mut egui::Ui, s: &mut Settings, agents: &[AgentProfile], c: &mut Chan
     c.any |= ui.add(egui::TextEdit::singleline(&mut s.shell).hint_text("e.g. zsh, pwsh, bash -l")).lost_focus();
     ui.end_row();
 
+    c.any |= checkbox(
+        ui,
+        &mut s.restore_terminals,
+        "Restore terminals & agents",
+        "Reopen them on startup; Claude Code continues its last conversation",
+    );
     row_label(ui, "Custom agents", "Add [[agents]] entries in settings.toml");
     if ui.button("Edit settings.toml").clicked() {
         c.open_file = true;
