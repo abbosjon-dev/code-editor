@@ -143,6 +143,7 @@ pub fn editor_ui(
     let wrapping = fm.wrap_cols > 0;
     let mut cursor_screen: Option<Pos2> = None;
     let mut cursor_top: Option<Pos2> = None;
+    let mut hunk_anchor: Option<Pos2> = None;
     // Parameter hints are only valid on the line where they were requested.
     if doc.signature.as_ref().is_some_and(|sg| sg.line != doc.buffer.cursor_pos().line) {
         doc.signature = None;
@@ -223,6 +224,12 @@ pub fn editor_ui(
                             doc.buffer.clear_extra();
                             doc.buffer.set_cursor(idx, false);
                             actions.push(EditorAction::Run(crate::commands::Cmd::CodeActions));
+                        } else if in_gutter && !shift && pos.x > clip.min.x + gutter_w - 8.0 && {
+                            let l = doc.buffer.char_to_pos(idx).line;
+                            doc.git_hunks.iter().any(|&(a, b, _)| a <= l && l < b.max(a + 1))
+                        } {
+                            // Git change bar: show the change with a Revert button.
+                            doc.hunk_popup = Some(doc.buffer.char_to_pos(idx).line);
                         } else if in_gutter && !shift && pos.x > clip.min.x + gutter_w - 20.0 {
                             // Fold chevron column.
                             let line = doc.buffer.char_to_pos(idx).line;
@@ -471,6 +478,7 @@ pub fn editor_ui(
                     }
 
                     // Inline problem message at the end of the line ("error lens").
+                    let mut lens_drawn = false;
                     if s.inline_diagnostics && last_seg {
                         if let Some(d) = doc
                             .diagnostics
@@ -495,6 +503,30 @@ pub fn editor_ui(
                             );
                             painter.rect_filled(r, 4.0, color.gamma_multiply(0.10));
                             painter.galley(egui::pos2(x, y + (m.line_h - galley.size().y) / 2.0), galley, color);
+                            lens_drawn = true;
+                        }
+                    }
+                    // Inline git blame for the caret's line (file must match what's on disk).
+                    if s.inline_blame && last_seg && !lens_drawn && line == cursor.line && !doc.buffer.is_dirty() {
+                        if let Some(b) = doc.blame.as_ref().and_then(|b| b.get(line)) {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let text = if b.is_uncommitted() {
+                                "You • Uncommitted changes".to_string()
+                            } else {
+                                let summary: String = b.summary.chars().take(80).collect();
+                                format!("{}, {} • {}", b.author, crate::git::relative_time(b.time, now), summary)
+                            };
+                            let x = x_of(chars.len()) + m.char_w * 4.0;
+                            painter.text(
+                                egui::pos2(x, y + m.line_h / 2.0),
+                                Align2::LEFT_CENTER,
+                                text,
+                                FontId::proportional(m.font.size * 0.85),
+                                p.text_faint,
+                            );
                         }
                     }
 
@@ -541,6 +573,9 @@ pub fn editor_ui(
                     (text_x + (vc[col] - vc[seg_s]) as f32 * m.char_w, rect.min.y + row as f32 * m.line_h)
                 };
                 let (cx, cy) = caret_xy(doc, cursor.line, cursor.col);
+                if let Some(l) = doc.hunk_popup {
+                    hunk_anchor = Some(egui::pos2(text_x, y_of_line(l.min(total_lines.saturating_sub(1))) + m.line_h));
+                }
                 let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
                 cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
                 cursor_top = Some(egui::pos2(cx, cy));
@@ -679,6 +714,11 @@ pub fn editor_ui(
         }
     }
 
+    // --- git change popup ---
+    if let Some(anchor) = hunk_anchor {
+        hunk_popup(ui, doc, p, anchor, id, &m);
+    }
+
     // --- parameter hints ---
     if let (Some(top), true, Some(sig)) = (cursor_top, has_focus, doc.signature.as_ref().and_then(|s| s.help.as_ref()))
     {
@@ -797,6 +837,94 @@ fn completion_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, pos: Pos
         c.selected = row;
         doc.accept_completion();
         ui.memory_mut(|mem| mem.request_focus(id));
+    }
+}
+
+/// Popup for a git change: old vs new lines with a Revert button.
+fn hunk_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, anchor: Pos2, id: egui::Id, m: &Metrics) {
+    let Some(line) = doc.hunk_popup else { return };
+    let Some(base) = doc.git_base.clone() else {
+        doc.hunk_popup = None;
+        return;
+    };
+    let text = doc.buffer.text();
+    let hunks = crate::review::hunks(&base, &text);
+    let Some(h) = hunks
+        .iter()
+        .find(|h| {
+            let end = h.new_start + h.new_lines.len().max(1);
+            h.new_start <= line && line < end
+        })
+        .cloned()
+    else {
+        doc.hunk_popup = None;
+        return;
+    };
+    let mut close = ui.input(|i| i.key_pressed(Key::Escape));
+    let mut revert = false;
+    let area = egui::Area::new(id.with("hunk"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor + egui::vec2(-8.0, 2.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).fill(p.bg_elevated).inner_margin(8).show(ui, |ui| {
+                ui.set_max_width(640.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Change at line {}  −{} +{}",
+                            h.new_start + 1,
+                            h.old_lines.len(),
+                            h.new_lines.len()
+                        ))
+                        .small()
+                        .color(p.text_dim),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            close = true;
+                        }
+                        if ui
+                            .small_button("↺ Revert")
+                            .on_hover_text("Restore the committed version of these lines")
+                            .clicked()
+                        {
+                            revert = true;
+                        }
+                    });
+                });
+                let font = FontId::monospace(m.font.size * 0.9);
+                for (lines, sign, color) in [(&h.old_lines, "−", p.error), (&h.new_lines, "+", p.success)] {
+                    for l in lines.iter().take(20) {
+                        let t = format!("{sign} {}", l.trim_end_matches(['\n', '\r']));
+                        egui::Frame::new().fill(color.gamma_multiply(0.14)).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(egui::RichText::new(t).font(font.clone()).color(color));
+                        });
+                    }
+                }
+            });
+        });
+    // Clicking elsewhere closes the popup.
+    if ui.input(|i| i.pointer.any_pressed())
+        && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| !area.response.rect.contains(pos))
+        && !ui.input(|i| i.pointer.primary_pressed() && i.pointer.interact_pos().is_some_and(|q| q.x < anchor.x))
+    {
+        close = true;
+    }
+    if revert {
+        let start = doc.buffer.rope().line_to_char(h.new_start.min(doc.buffer.len_lines()));
+        let end_line = h.new_start + h.new_lines.len();
+        let end = if end_line >= doc.buffer.len_lines() {
+            doc.buffer.len_chars()
+        } else {
+            doc.buffer.rope().line_to_char(end_line)
+        };
+        let old: String = h.old_lines.concat();
+        doc.buffer.apply_edits(vec![(start, end, old)]);
+        close = true;
+    }
+    if close {
+        doc.hunk_popup = None;
     }
 }
 

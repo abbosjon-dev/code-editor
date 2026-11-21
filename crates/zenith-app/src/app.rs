@@ -350,6 +350,7 @@ impl ZenithApp {
                 }
                 if let Some(g) = &self.git {
                     doc.set_git_base(g.head_text(&path));
+                    doc.blame_rx = g.blame_async(&path);
                 }
                 self.docs.push(doc);
                 self.active = self.docs.len() - 1;
@@ -407,6 +408,9 @@ impl ZenithApp {
                         self.reload_settings();
                     }
                     self.plugins.emit("file_saved", serde_json::json!({ "path": p }));
+                    if let (Some(g), Some(doc)) = (&self.git, self.docs.get_mut(idx)) {
+                        doc.blame_rx = g.blame_async(p);
+                    }
                     let root = self.workspace.clone();
                     if let Some(doc) = self.docs.get_mut(idx) {
                         self.lsp.sync(doc, root.as_deref(), true);
@@ -1408,6 +1412,14 @@ impl ZenithApp {
         if let Some(doc) = self.docs.get_mut(self.active) {
             doc.update_git_hunks();
         }
+        for d in &mut self.docs {
+            if let Some(rx) = &d.blame_rx {
+                if let Ok(b) = rx.try_recv() {
+                    d.blame = Some(b);
+                    d.blame_rx = None;
+                }
+            }
+        }
     }
 
     /// Check out (or create) a branch, then refresh open files from disk.
@@ -1438,6 +1450,7 @@ impl ZenithApp {
         for d in &mut self.docs {
             if let Some(p) = d.path().map(Path::to_path_buf) {
                 d.set_git_base(g.head_text(&p));
+                d.blame_rx = g.blame_async(&p);
             }
         }
     }

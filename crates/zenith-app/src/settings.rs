@@ -24,6 +24,8 @@ pub struct Settings {
     pub word_wrap: bool,
     /// Show problem messages at the end of their line.
     pub inline_diagnostics: bool,
+    /// Show who last changed the caret's line (git blame) at its end.
+    pub inline_blame: bool,
     pub cursor_blink: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
@@ -60,6 +62,7 @@ impl Default for Settings {
             show_minimap: true,
             word_wrap: false,
             inline_diagnostics: true,
+            inline_blame: true,
             cursor_blink: true,
             auto_save: false,
             format_trim_trailing_whitespace: false,

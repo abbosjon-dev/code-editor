@@ -96,6 +96,11 @@ pub struct Document {
     pub show_git_diff: bool,
     /// Markdown: show the rendered preview beside the editor.
     pub md_preview: bool,
+    /// Per-line blame of the file on disk (valid while the buffer is clean).
+    pub blame: Option<Vec<crate::git::BlameLine>>,
+    pub blame_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::BlameLine>>>,
+    /// Line whose git change popup (gutter click) is open.
+    pub hunk_popup: Option<usize>,
     pub git_diff: crate::diff_view::DiffState,
     // --- folding ---
     /// Header lines of folded regions.
@@ -157,6 +162,9 @@ impl Document {
             review: None,
             show_git_diff: false,
             md_preview: false,
+            blame: None,
+            blame_rx: None,
+            hunk_popup: None,
             git_diff: Default::default(),
             folds: Default::default(),
             folds_gen: 0,

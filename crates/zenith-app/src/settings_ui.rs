@@ -153,6 +153,7 @@ fn appearance(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= checkbox(ui, &mut s.word_wrap, "Word wrap", "Wrap long lines to the window (Alt+Z)");
     c.any |=
         checkbox(ui, &mut s.inline_diagnostics, "Inline problems", "Show error/warning text at the end of the line");
+    c.any |= checkbox(ui, &mut s.inline_blame, "Inline git blame", "Author and commit of the caret's line");
     c.any |= checkbox(ui, &mut s.show_indent_guides, "Indent guides", "");
     c.any |= checkbox(ui, &mut s.cursor_blink, "Blinking cursor", "");
 }

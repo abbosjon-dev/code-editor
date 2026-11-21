@@ -117,7 +117,7 @@ languages = ["python"]
 ![Git](docs/git.png)
 
 Source Control'da faylni bossangiz, u HEAD bilan **yonma-yon diff** ko'rinishida ochiladi (Prev/Next bilan o'zgarishlar
-orasida yurish, "Open file" — tahrirga qaytish). Status qatoridagi branch nomini bossangiz — **branch almashtirish yoki yangi branch yaratish**.
+orasida yurish, "Open file" — tahrirga qaytish). Gutter'dagi rangli o'zgarish chizig'ini bossangiz — eski/yangi qatorlar va **↺ Revert** (faqat shu o'zgarishni qaytarish). Kursor turgan qator oxirida **git blame** (muallif, vaqt, commit xabari). Status qatoridagi branch nomini bossangiz — **branch almashtirish yoki yangi branch yaratish**.
 
 ![Git diff](docs/git-diff.png)
 

@@ -101,6 +101,82 @@ pub fn parse_status(root: &Path, porcelain_z: &str) -> Vec<StatusEntry> {
 }
 
 /// Line-level diff of `current` against `base` for gutter markers.
+/// Who last changed a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameLine {
+    pub hash: String,
+    pub author: String,
+    /// Unix seconds.
+    pub time: i64,
+    pub summary: String,
+}
+
+impl BlameLine {
+    pub fn is_uncommitted(&self) -> bool {
+        self.hash.chars().all(|c| c == '0')
+    }
+}
+
+/// Parse `git blame --porcelain` output into one entry per line.
+pub fn parse_blame(out: &str) -> Vec<BlameLine> {
+    use std::collections::HashMap;
+    let mut commits: HashMap<String, BlameLine> = HashMap::new();
+    let mut lines = vec![];
+    let mut cur: Option<String> = None;
+    for l in out.lines() {
+        if let Some(text) = l.strip_prefix('\t') {
+            let _ = text;
+            if let Some(h) = cur.take() {
+                lines.push(commits.get(&h).cloned().unwrap_or(BlameLine {
+                    hash: h,
+                    author: String::new(),
+                    time: 0,
+                    summary: String::new(),
+                }));
+            }
+            continue;
+        }
+        let mut parts = l.splitn(2, ' ');
+        let key = parts.next().unwrap_or("");
+        let val = parts.next().unwrap_or("");
+        if key.len() == 40 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+            cur = Some(key.to_string());
+            commits.entry(key.to_string()).or_insert_with(|| BlameLine {
+                hash: key.to_string(),
+                author: String::new(),
+                time: 0,
+                summary: String::new(),
+            });
+            continue;
+        }
+        if let Some(h) = &cur {
+            if let Some(c) = commits.get_mut(h) {
+                match key {
+                    "author" => c.author = val.to_string(),
+                    "author-time" => c.time = val.parse().unwrap_or(0),
+                    "summary" => c.summary = val.to_string(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// "3 days ago" style relative time.
+pub fn relative_time(then: i64, now: i64) -> String {
+    let d = (now - then).max(0);
+    let (n, unit) = match d {
+        0..60 => return "just now".into(),
+        60..3600 => (d / 60, "minute"),
+        3600..86_400 => (d / 3600, "hour"),
+        86_400..2_592_000 => (d / 86_400, "day"),
+        2_592_000..31_536_000 => (d / 2_592_000, "month"),
+        _ => (d / 31_536_000, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 /// One row of a side-by-side diff: (old line number, new line number), either
 /// may be missing for pure deletions/insertions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +331,18 @@ impl Git {
         git(&self.root, &["pull", "--ff-only"])
     }
 
+    /// Blame a file in the background; the result arrives on the returned channel.
+    pub fn blame_async(&self, path: &Path) -> Option<Receiver<Vec<BlameLine>>> {
+        let rel = self.rel(path)?;
+        let root = self.root.clone();
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let out = git(&root, &["--no-optional-locks", "blame", "--porcelain", "--", &rel]).unwrap_or_default();
+            let _ = tx.send(parse_blame(&out));
+        });
+        Some(rx)
+    }
+
     /// Local branches, most recently committed first.
     pub fn branches(&self) -> Vec<String> {
         git(&self.root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads/"])
@@ -308,6 +396,22 @@ mod tests {
         assert!(h.contains(&(3, 4, LineChange::Added)));
         let h = diff_hunks(base, "a\nd\n");
         assert_eq!(h, vec![(1, 2, LineChange::Deleted)]);
+    }
+
+    #[test]
+    fn blame_parsing() {
+        let h1 = "a".repeat(40);
+        let h2 = "0".repeat(40);
+        let out = format!(
+            "{h1} 1 1 2\nauthor Ali\nauthor-time 1700000000\nsummary first commit\nfilename a.rs\n\tline one\n{h1} 2 2\n\tline two\n{h2} 3 3 1\nauthor Not Committed Yet\nauthor-time 1700000100\nsummary Version of a.rs from a.rs\n\tline three\n"
+        );
+        let b = parse_blame(&out);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0].author, "Ali");
+        assert_eq!(b[1].summary, "first commit");
+        assert!(b[2].is_uncommitted());
+        assert_eq!(relative_time(0, 3 * 86_400), "3 days ago");
+        assert_eq!(relative_time(0, 3600), "1 hour ago");
     }
 
     #[test]
