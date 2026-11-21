@@ -62,26 +62,73 @@ pub fn enclosing_header(buf: &Buffer, line: usize) -> Option<usize> {
         .find(|&l| indent_of(buf, l).is_some_and(|i| i < base) && fold_end(buf, l).is_some_and(|e| e >= line))
 }
 
-/// Mapping between document lines and visible rows.
+/// Mapping between document lines and visible rows (folding + soft wrap).
+///
+/// Each row is `(document line, first char column of the row)`. With no
+/// folds and no wrapping the map is the identity and stores nothing.
 #[derive(Debug, Default)]
 pub struct FoldMap {
-    /// Visible document lines in order. Empty = no folds (identity mapping).
-    rows: Vec<usize>,
+    rows: Vec<(usize, usize)>,
     total_lines: usize,
+    /// Soft-wrap width in visual columns (0 = off).
+    pub wrap_cols: usize,
+}
+
+/// Files with more lines than this are never soft-wrapped (keeps edits O(1)).
+pub const MAX_WRAP_LINES: usize = 50_000;
+
+/// Char columns where the rows of a wrapped line start (always begins with 0).
+/// Breaks after whitespace when possible, otherwise mid-word.
+pub fn wrap_points(chars: &[char], wrap_cols: usize, tab: usize) -> Vec<usize> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = vec![0];
+    if wrap_cols == 0 {
+        return out;
+    }
+    let mut row_start = 0;
+    let mut width = 0;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let w = if c == '\t' { tab - width % tab } else { c.width().unwrap_or(1).max(1) };
+        if width + w > wrap_cols && i > row_start {
+            // Break after the last space in this row, if any.
+            let brk = match last_space {
+                Some(sp) if sp + 1 > row_start && sp + 1 < i + 1 && sp + 1 > row_start => sp + 1,
+                _ => i,
+            };
+            out.push(brk);
+            row_start = brk;
+            last_space = None;
+            width = 0;
+            i = brk;
+            continue;
+        }
+        if c == ' ' || c == '\t' {
+            last_space = Some(i);
+        }
+        width += w;
+        i += 1;
+    }
+    out
 }
 
 impl FoldMap {
-    pub fn build(buf: &Buffer, folds: &BTreeSet<usize>) -> Self {
+    pub fn build(buf: &Buffer, folds: &BTreeSet<usize>, wrap_cols: usize) -> Self {
         let n = buf.len_lines();
-        if folds.is_empty() {
-            return Self { rows: vec![], total_lines: n };
+        let wrap_cols = if n > MAX_WRAP_LINES { 0 } else { wrap_cols };
+        if folds.is_empty() && wrap_cols == 0 {
+            return Self { rows: vec![], total_lines: n, wrap_cols };
         }
         let mut hidden: Vec<(usize, usize)> =
             folds.iter().filter(|&&h| h < n).filter_map(|&h| fold_end(buf, h).map(|e| (h + 1, e))).collect();
         hidden.sort_unstable();
+        let tab = buf.tab_size.max(1);
         let mut rows = Vec::with_capacity(n);
         let mut hi = 0;
         let mut line = 0;
+        let rope = buf.rope();
         while line < n {
             while hi < hidden.len() && hidden[hi].1 < line {
                 hi += 1;
@@ -90,10 +137,18 @@ impl FoldMap {
                 line = hidden[hi].1 + 1;
                 continue;
             }
-            rows.push(line);
+            let len = buf.line_len(line);
+            if wrap_cols > 0 && len > wrap_cols / 2 {
+                let chars: Vec<char> = rope.line(line).chars().take(len).collect();
+                for col in wrap_points(&chars, wrap_cols, tab) {
+                    rows.push((line, col));
+                }
+            } else {
+                rows.push((line, 0));
+            }
             line += 1;
         }
-        Self { rows, total_lines: n }
+        Self { rows, total_lines: n, wrap_cols }
     }
 
     pub fn is_identity(&self) -> bool {
@@ -113,23 +168,67 @@ impl FoldMap {
         if self.is_identity() {
             row.min(self.total_lines.saturating_sub(1))
         } else {
-            self.rows[row.min(self.rows.len().saturating_sub(1))]
+            self.rows[row.min(self.rows.len().saturating_sub(1))].0
         }
     }
 
-    /// Row showing `line`; hidden lines map to their fold header's row.
+    /// Char column range `[start, end)` of `row` within its line (`end` is
+    /// `usize::MAX` for the last row of a line).
+    pub fn row_cols(&self, row: usize) -> (usize, usize) {
+        if self.is_identity() || row >= self.rows.len() {
+            return (0, usize::MAX);
+        }
+        let (line, start) = self.rows[row];
+        let end = match self.rows.get(row + 1) {
+            Some(&(l, c)) if l == line => c,
+            _ => usize::MAX,
+        };
+        (start, end)
+    }
+
+    /// First row showing `line`; hidden lines map to their fold header's row.
     pub fn row_of(&self, line: usize) -> usize {
         if self.is_identity() {
             return line;
         }
-        match self.rows.binary_search(&line) {
-            Ok(r) => r,
-            Err(r) => r.saturating_sub(1),
+        let i = self.rows.partition_point(|&(l, _)| l < line);
+        match self.rows.get(i) {
+            Some(&(l, _)) if l == line => i,
+            _ => i.saturating_sub(1),
         }
     }
 
+    /// Row containing char column `col` of `line`.
+    pub fn row_of_pos(&self, line: usize, col: usize) -> usize {
+        if self.is_identity() {
+            return line;
+        }
+        let first = self.row_of(line);
+        let mut r = first;
+        while r + 1 < self.rows.len() && self.rows[r + 1].0 == line && self.rows[r + 1].1 <= col {
+            r += 1;
+        }
+        r
+    }
+
+    /// Last row showing `line`.
+    pub fn last_row_of(&self, line: usize) -> usize {
+        if self.is_identity() {
+            return line;
+        }
+        let mut r = self.row_of(line);
+        while r + 1 < self.rows.len() && self.rows[r + 1].0 == line {
+            r += 1;
+        }
+        r
+    }
+
     pub fn is_hidden(&self, line: usize) -> bool {
-        !self.is_identity() && self.rows.binary_search(&line).is_err()
+        if self.is_identity() {
+            return false;
+        }
+        let i = self.rows.partition_point(|&(l, _)| l < line);
+        !matches!(self.rows.get(i), Some(&(l, _)) if l == line)
     }
 }
 
@@ -153,17 +252,42 @@ mod tests {
     #[test]
     fn map_rows() {
         let b = Buffer::from_str(SRC);
-        let m = FoldMap::build(&b, &BTreeSet::from([0]));
+        let m = FoldMap::build(&b, &BTreeSet::from([0]), 0);
         // Lines 1..=5 hidden.
         assert_eq!(m.row_count(), b.len_lines() - 5);
         assert_eq!(m.line_at(1), 6);
         assert_eq!(m.row_of(3), 0);
         assert!(m.is_hidden(4));
         assert!(!m.is_hidden(6));
-        let nested = FoldMap::build(&b, &BTreeSet::from([0, 3]));
+        let nested = FoldMap::build(&b, &BTreeSet::from([0, 3]), 0);
         assert_eq!(nested.row_count(), m.row_count());
-        let id = FoldMap::build(&b, &BTreeSet::new());
+        let id = FoldMap::build(&b, &BTreeSet::new(), 0);
         assert!(id.is_identity());
         assert_eq!(id.row_of(4), 4);
+    }
+
+    #[test]
+    fn wrap_points_prefer_spaces() {
+        let c: Vec<char> = "hello world this is long".chars().collect();
+        assert_eq!(wrap_points(&c, 12, 4), vec![0, 12]); // "this is long" fits exactly
+        assert_eq!(wrap_points(&c, 10, 4), vec![0, 6, 12, 20]);
+        let c: Vec<char> = "abcdefghij".chars().collect();
+        assert_eq!(wrap_points(&c, 4, 4), vec![0, 4, 8]);
+        assert_eq!(wrap_points(&c, 0, 4), vec![0]);
+    }
+
+    #[test]
+    fn wrapped_rows() {
+        let b = Buffer::from_str("short\nhello world this is long\nend");
+        let m = FoldMap::build(&b, &BTreeSet::new(), 10);
+        assert_eq!(m.row_count(), 6);
+        assert_eq!(m.row_of(1), 1);
+        assert_eq!(m.last_row_of(1), 4);
+        assert_eq!(m.row_cols(2), (6, 12));
+        assert_eq!(m.row_cols(4), (20, usize::MAX));
+        assert_eq!(m.row_of_pos(1, 13), 3);
+        assert_eq!(m.row_of_pos(1, 12), 3);
+        assert_eq!(m.line_at(5), 2);
+        assert!(!m.is_hidden(1));
     }
 }

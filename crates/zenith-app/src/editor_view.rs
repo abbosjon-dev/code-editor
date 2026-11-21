@@ -132,8 +132,15 @@ pub fn editor_ui(
     if moved || doc.reveal_line.is_some() {
         doc.reveal_cursor_in_folds();
     }
+    // Soft wrap: columns that fit in the text area (no horizontal scrolling).
+    doc.wrap_cols = if s.word_wrap {
+        (((editor_rect.width() - gutter_w - TEXT_PAD - 18.0) / m.char_w).floor() as usize).max(20)
+    } else {
+        0
+    };
     let fm = doc.fold_map();
     let total_rows = fm.row_count();
+    let wrapping = fm.wrap_cols > 0;
     let mut cursor_screen: Option<Pos2> = None;
     let mut cursor_top: Option<Pos2> = None;
     // Parameter hints are only valid on the line where they were requested.
@@ -154,7 +161,7 @@ pub fn editor_ui(
         scroll = scroll.vertical_scroll_offset(y);
     }
 
-    let content_w = gutter_w + TEXT_PAD + (longest as f32 + 8.0) * m.char_w;
+    let content_w = if wrapping { 0.0 } else { gutter_w + TEXT_PAD + (longest as f32 + 8.0) * m.char_w };
     let content_h = total_rows as f32 * m.line_h + viewport_h * 0.6;
 
     let out = ui
@@ -170,13 +177,18 @@ pub fn editor_ui(
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let in_gutter = pos.x < clip.min.x + gutter_w;
                     let hit = |doc: &Document, pos: Pos2| -> usize {
-                        let row = ((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize;
-                        let line = fm.line_at(row.min(total_rows.saturating_sub(1)));
+                        let row = (((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize)
+                            .min(total_rows.saturating_sub(1));
+                        let line = fm.line_at(row);
                         let chars = line_chars(doc, line);
                         let vc = visual_cols(&chars, m.tab);
-                        let target = (pos.x - text_x) / m.char_w;
-                        let mut col = vc.len() - 1;
-                        for i in 0..vc.len() - 1 {
+                        let (seg_s, seg_e) = fm.row_cols(row);
+                        let seg_s = seg_s.min(chars.len());
+                        // On a wrapped row (not the last), stay before the break.
+                        let seg_e = if seg_e == usize::MAX { chars.len() } else { seg_e.saturating_sub(1).max(seg_s) };
+                        let target = (pos.x - text_x) / m.char_w + vc[seg_s] as f32;
+                        let mut col = seg_e;
+                        for i in seg_s..seg_e {
                             let mid = (vc[i] + vc[i + 1]) as f32 / 2.0;
                             if target < mid {
                                 col = i;
@@ -252,7 +264,8 @@ pub fn editor_ui(
                         if row < total_rows {
                             let chars = line_chars(doc, line);
                             let vc = visual_cols(&chars, m.tab);
-                            let target = ((pos.x - text_x) / m.char_w).floor() as isize;
+                            let seg_s = fm.row_cols(row).0.min(chars.len());
+                            let target = ((pos.x - text_x) / m.char_w).floor() as isize + vc[seg_s] as isize;
                             if let Some(col) =
                                 (0..chars.len()).find(|&c| vc[c] as isize <= target && (vc[c + 1] as isize) > target)
                             {
@@ -342,9 +355,6 @@ pub fn editor_ui(
                     doc.buffer.selections().iter().map(|s| s.range()).collect();
                 let bracket = matching_bracket(doc);
 
-                // First find-match index at or after the first visible char.
-                let first_char = doc.buffer.rope().line_to_char(first.min(total_lines.saturating_sub(1)));
-                let mut mi = doc.find.matches.partition_point(|r| r.end < first_char);
                 let mut prev_indent = 0usize;
 
                 for row in first_row..last_row {
@@ -352,9 +362,24 @@ pub fn editor_ui(
                     let y = rect.min.y + row as f32 * m.line_h;
                     let chars = line_chars(doc, line);
                     let vc = visual_cols(&chars, m.tab);
-                    let x_of = |col: usize| text_x + vc[col.min(vc.len() - 1)] as f32 * m.char_w;
+                    // The part of the line shown on this row (soft wrap).
+                    let (seg_s, seg_raw_e) = fm.row_cols(row);
+                    let seg_s = seg_s.min(chars.len());
+                    let seg_e = seg_raw_e.min(chars.len());
+                    let last_seg = seg_raw_e == usize::MAX;
+                    let x_of = |col: usize| text_x + (vc[col.clamp(seg_s, seg_e)] - vc[seg_s]) as f32 * m.char_w;
+                    // Clip a line-relative [a, b) range to this row.
+                    let in_seg = |a: usize, b: usize| -> Option<(usize, usize)> {
+                        let (a2, b2) = (a.max(seg_s), b.min(seg_e));
+                        if a2 > b2 || (a2 == b2 && a != b && !(last_seg && a2 == seg_e)) {
+                            None
+                        } else {
+                            Some((a2, b2))
+                        }
+                    };
                     let line_start = doc.buffer.rope().line_to_char(line);
                     let line_end = line_start + chars.len();
+                    let mut mi = doc.find.matches.partition_point(|r| r.end < line_start);
                     let row = Rect::from_min_size(egui::pos2(clip.min.x, y), egui::vec2(clip.width(), m.line_h));
 
                     if line == cursor.line && sel.is_empty() && !doc.buffer.has_multi() {
@@ -364,9 +389,8 @@ pub fn editor_ui(
                     // Find matches.
                     while mi < doc.find.matches.len() && doc.find.matches[mi].start <= line_end {
                         let r = doc.find.matches[mi].clone();
-                        if r.end >= line_start {
-                            let a = r.start.max(line_start) - line_start;
-                            let b = r.end.min(line_end) - line_start;
+                        let seg = in_seg(r.start.max(line_start) - line_start, r.end.min(line_end) - line_start);
+                        if let (true, Some((a, b))) = (r.end >= line_start, seg) {
                             let mr = Rect::from_min_max(
                                 egui::pos2(x_of(a), y + 1.0),
                                 egui::pos2(x_of(b), y + m.line_h - 1.0),
@@ -389,10 +413,14 @@ pub fn editor_ui(
                         if sel_range.is_empty() || sel_range.start > line_end || sel_range.end < line_start {
                             continue;
                         }
-                        let a = sel_range.start.max(line_start) - line_start;
-                        let b = sel_range.end.min(line_end) - line_start;
+                        let Some((a, b)) = in_seg(
+                            sel_range.start.max(line_start) - line_start,
+                            sel_range.end.min(line_end) - line_start,
+                        ) else {
+                            continue;
+                        };
                         let mut x1 = x_of(b);
-                        if sel_range.end > line_end {
+                        if sel_range.end > line_end && last_seg {
                             x1 += m.char_w * 0.6; // newline is selected
                         }
                         let sr = Rect::from_min_max(egui::pos2(x_of(a), y), egui::pos2(x1, y + m.line_h));
@@ -400,7 +428,7 @@ pub fn editor_ui(
                     }
 
                     // Indent guides.
-                    if s.show_indent_guides {
+                    if s.show_indent_guides && seg_s == 0 {
                         let lead = chars.iter().take_while(|c| **c == ' ' || **c == '\t').count();
                         let indent = if lead == chars.len() { prev_indent } else { vc[lead] };
                         prev_indent = indent;
@@ -417,6 +445,7 @@ pub fn editor_ui(
                         if a == b {
                             b = (a + 1).min(chars.len().max(a + 1));
                         }
+                        let Some((a, b)) = in_seg(a, b) else { continue };
                         let color = severity_color(p, d.severity);
                         let (x0, x1) = (x_of(a), x_of(b).max(x_of(a) + m.char_w));
                         let base = y + m.line_h - 3.0;
@@ -434,13 +463,14 @@ pub fn editor_ui(
                     }
 
                     // Text.
-                    if !chars.is_empty() {
-                        let job = layout_line(&chars, doc.highlight.line(line), &m, p);
+                    if seg_e > seg_s {
+                        let spans = doc.highlight.line(line).map(|sp| slice_spans(sp, seg_s, seg_e));
+                        let job = layout_line(&chars[seg_s..seg_e], spans.as_deref(), &m, p);
                         let galley = ui.fonts(|f| f.layout_job(job));
                         painter.galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
                     }
 
-                    if doc.folds.contains(&line) && !fm.is_identity() {
+                    if doc.folds.contains(&line) && !fm.is_identity() && last_seg {
                         let x = x_of(chars.len()) + m.char_w;
                         let pill =
                             Rect::from_min_size(egui::pos2(x, y + 3.0), egui::vec2(m.char_w * 3.0, m.line_h - 6.0));
@@ -457,7 +487,10 @@ pub fn editor_ui(
                     // Bracket match boxes.
                     if let Some((a, b)) = bracket {
                         for idx in [a, b] {
-                            if idx >= line_start && idx < line_end {
+                            if idx >= line_start
+                                && idx < line_end
+                                && in_seg(idx - line_start, idx - line_start + 1).is_some()
+                            {
                                 let c = idx - line_start;
                                 let br = Rect::from_min_max(
                                     egui::pos2(x_of(c), y + 1.0),
@@ -470,10 +503,16 @@ pub fn editor_ui(
                 }
 
                 // Cursor.
-                let cursor_chars = line_chars(doc, cursor.line);
-                let cvc = visual_cols(&cursor_chars, m.tab);
-                let cx = text_x + cvc[cursor.col.min(cvc.len() - 1)] as f32 * m.char_w;
-                let cy = y_of_line(cursor.line);
+                // Screen position of a caret, honoring soft wrap.
+                let caret_xy = |doc: &Document, line: usize, col: usize| -> (f32, f32) {
+                    let chars = line_chars(doc, line);
+                    let vc = visual_cols(&chars, m.tab);
+                    let col = col.min(chars.len());
+                    let row = fm.row_of_pos(line, col);
+                    let seg_s = fm.row_cols(row).0.min(col);
+                    (text_x + (vc[col] - vc[seg_s]) as f32 * m.char_w, rect.min.y + row as f32 * m.line_h)
+                };
+                let (cx, cy) = caret_xy(doc, cursor.line, cursor.col);
                 let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
                 cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
                 cursor_top = Some(egui::pos2(cx, cy));
@@ -487,13 +526,10 @@ pub fn editor_ui(
                             if ep.line < first || ep.line >= last {
                                 continue;
                             }
-                            let echars = line_chars(doc, ep.line);
-                            let evc = visual_cols(&echars, m.tab);
-                            let ex = text_x + evc[ep.col.min(evc.len() - 1)] as f32 * m.char_w;
                             if fm.is_hidden(ep.line) {
                                 continue;
                             }
-                            let ey = y_of_line(ep.line);
+                            let (ex, ey) = caret_xy(doc, ep.line, ep.col);
                             painter.rect_filled(
                                 Rect::from_min_size(egui::pos2(ex - 1.0, ey + 2.0), egui::vec2(2.0, m.line_h - 4.0)),
                                 1.0,
@@ -544,7 +580,7 @@ pub fn editor_ui(
                         ));
                     } else {
                         let y0 = y_of_line(a.max(first));
-                        let y1 = y_of_line(b.min(last).saturating_sub(1)) + m.line_h;
+                        let y1 = rect.min.y + (fm.last_row_of(b.min(last).saturating_sub(1)) + 1) as f32 * m.line_h;
                         painter.rect_filled(
                             Rect::from_min_max(egui::pos2(x, y0 + 1.0), egui::pos2(x + 3.0, y1 - 1.0)),
                             1.0,
@@ -576,6 +612,9 @@ pub fn editor_ui(
                 for row in first_row..last_row {
                     let line = fm.line_at(row);
                     let y = rect.min.y + row as f32 * m.line_h + m.line_h / 2.0;
+                    if fm.row_cols(row).0 != 0 {
+                        continue; // continuation of a wrapped line: no number
+                    }
                     let active = line == cursor.line;
                     let folded = doc.folds.contains(&line);
                     if folded || (gutter_hovered && crate::folding::is_foldable(&doc.buffer, line)) {
@@ -804,6 +843,15 @@ fn hover_popup(ui: &mut egui::Ui, p: &Palette, pos: Pos2, diags: &[String], info
                 }
             });
         });
+}
+
+/// Spans of `[start, end)` of a line, re-based to start at 0.
+fn slice_spans(spans: &[crate::highlight::Span], start: usize, end: usize) -> Vec<crate::highlight::Span> {
+    spans
+        .iter()
+        .filter(|sp| sp.end > start && sp.start < end)
+        .map(|sp| crate::highlight::Span { start: sp.start.max(start) - start, end: sp.end.min(end) - start, ..*sp })
+        .collect()
 }
 
 fn layout_line(chars: &[char], spans: Option<&[crate::highlight::Span]>, m: &Metrics, p: &Palette) -> LayoutJob {
@@ -1152,6 +1200,8 @@ fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: is
             let n = b.len_chars();
             b.set_cursor(n, shift)
         }
+        Key::ArrowUp if doc.wrap_cols > 0 => move_visual(doc, -1, shift),
+        Key::ArrowDown if doc.wrap_cols > 0 => move_visual(doc, 1, shift),
         Key::ArrowUp => {
             b.move_vertical(-1, shift);
             skip_folded(doc, -1, shift);
@@ -1238,6 +1288,34 @@ fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: is
         _ => return false,
     }
     true
+}
+
+/// Up/down by screen row when lines are soft-wrapped.
+fn move_visual(doc: &mut Document, dir: isize, shift: bool) {
+    let map = doc.fold_map();
+    let tab = doc.buffer.tab_size.max(1);
+    let pos = doc.buffer.cursor_pos();
+    let row = map.row_of_pos(pos.line, pos.col);
+    let target = row as isize + dir;
+    if target < 0 || target as usize >= map.row_count() {
+        let idx = if target < 0 { 0 } else { doc.buffer.len_chars() };
+        doc.buffer.set_cursor(idx, shift);
+        return;
+    }
+    let target = target as usize;
+    let (s0, _) = map.row_cols(row);
+    let cur_chars = line_chars(doc, pos.line);
+    let cvc = visual_cols(&cur_chars, tab);
+    let x = cvc[pos.col.min(cur_chars.len())] - cvc[s0.min(cur_chars.len())];
+    let line = map.line_at(target);
+    let chars = line_chars(doc, line);
+    let vc = visual_cols(&chars, tab);
+    let (ts, te) = map.row_cols(target);
+    let ts = ts.min(chars.len());
+    let te = if te == usize::MAX { chars.len() } else { te.saturating_sub(1).max(ts) };
+    let col = (ts..=te).find(|&c| vc[c] - vc[ts] >= x).unwrap_or(te);
+    let idx = doc.buffer.pos_to_char(Position::new(line, col));
+    doc.buffer.set_cursor(idx, shift);
 }
 
 /// Keep vertical movement out of folded regions.

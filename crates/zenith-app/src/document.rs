@@ -96,6 +96,8 @@ pub struct Document {
     /// Header lines of folded regions.
     pub folds: std::collections::BTreeSet<usize>,
     folds_gen: u64,
+    /// Soft-wrap width in columns, set by the editor view each frame (0 = off).
+    pub wrap_cols: usize,
     fold_cache: Option<(u64, u64, std::sync::Arc<crate::folding::FoldMap>)>,
     last_len_lines: usize,
 }
@@ -150,6 +152,7 @@ impl Document {
             review: None,
             folds: Default::default(),
             folds_gen: 0,
+            wrap_cols: 0,
             fold_cache: None,
             last_len_lines: 0,
         }
@@ -299,11 +302,18 @@ impl Document {
     pub fn fold_map(&mut self) -> std::sync::Arc<crate::folding::FoldMap> {
         let key = (self.buffer.version(), self.folds_gen);
         if let Some((v, g, m)) = &self.fold_cache {
-            if (*v, *g) == key {
+            if (*v, *g) == key
+                && m.wrap_cols
+                    == self.wrap_cols.min(if self.buffer.len_lines() > crate::folding::MAX_WRAP_LINES {
+                        0
+                    } else {
+                        usize::MAX
+                    })
+            {
                 return m.clone();
             }
         }
-        let m = std::sync::Arc::new(crate::folding::FoldMap::build(&self.buffer, &self.folds));
+        let m = std::sync::Arc::new(crate::folding::FoldMap::build(&self.buffer, &self.folds, self.wrap_cols));
         self.fold_cache = Some((key.0, key.1, m.clone()));
         m
     }

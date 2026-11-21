@@ -799,6 +799,10 @@ impl ZenithApp {
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
             }
+            Cmd::ToggleWordWrap => {
+                self.settings.word_wrap = !self.settings.word_wrap;
+                self.write_settings();
+            }
             Cmd::ToggleMinimap => {
                 self.settings.show_minimap = !self.settings.show_minimap;
                 self.write_settings();
@@ -1625,6 +1629,7 @@ impl ZenithApp {
             (cs, Key::E, Cmd::ShowExplorer, true),
             (cs, Key::G, Cmd::ShowSourceControl, true),
             (cs, Key::M, Cmd::ShowProblems, true),
+            (Modifiers::ALT, Key::Z, Cmd::ToggleWordWrap, false),
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
@@ -1670,6 +1675,11 @@ impl ZenithApp {
             }
             if i.consume_key(Modifiers::NONE, Key::F1) {
                 out.push(Cmd::CommandPalette);
+            }
+            // Some platforms also send the typed character for Alt/Ctrl
+            // combinations; it must not reach the editor once handled.
+            if !out.is_empty() {
+                i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
             }
         });
         out
@@ -1729,6 +1739,7 @@ impl ZenithApp {
                 item(ui, Cmd::ToggleTerminal, "Toggle Terminal");
                 item(ui, Cmd::ToggleAiPanel, "Toggle AI Panel");
                 item(ui, Cmd::ToggleMinimap, "Toggle Minimap");
+                item(ui, Cmd::ToggleWordWrap, "Toggle Word Wrap");
                 item(ui, Cmd::SplitEditor, "Split Editor");
                 ui.separator();
                 item(ui, Cmd::SelectTheme, "Color Theme…");

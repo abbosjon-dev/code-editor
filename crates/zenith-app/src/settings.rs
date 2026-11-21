@@ -20,6 +20,8 @@ pub struct Settings {
     pub insert_spaces: bool,
     pub show_indent_guides: bool,
     pub show_minimap: bool,
+    /// Soft-wrap long lines to the window width.
+    pub word_wrap: bool,
     pub cursor_blink: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
@@ -52,6 +54,7 @@ impl Default for Settings {
             insert_spaces: true,
             show_indent_guides: true,
             show_minimap: true,
+            word_wrap: false,
             cursor_blink: true,
             auto_save: false,
             format_trim_trailing_whitespace: false,
