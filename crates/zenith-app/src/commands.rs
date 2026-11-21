@@ -43,6 +43,8 @@ pub enum Cmd {
     GotoDefinition,
     NextProblem,
     RestartLanguageServers,
+    SplitEditor,
+    FocusOtherPane,
     About,
     Quit,
 }
@@ -92,6 +94,8 @@ impl Cmd {
             GotoDefinition,
             NextProblem,
             RestartLanguageServers,
+            SplitEditor,
+            FocusOtherPane,
             About,
             Quit,
         ]
@@ -101,6 +105,8 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            SplitEditor => "View: Split Editor (toggle)",
+            FocusOtherPane => "View: Focus Other Editor Pane",
             ShowSourceControl => "View: Show Source Control",
             GotoDefinition => "Go: Go to Definition",
             NextProblem => "Go: Next Problem",
@@ -186,6 +192,8 @@ impl Cmd {
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
             GotoDefinition => "F12",
+            SplitEditor => k!("⌘\\", "Ctrl+\\"),
+            FocusOtherPane => k!("⌃⌥\\", "Ctrl+Alt+\\"),
             ShowSourceControl => k!("⌃⇧G", "Ctrl+Shift+G"),
             NextProblem => "F8",
             _ => "",

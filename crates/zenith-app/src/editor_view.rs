@@ -63,6 +63,11 @@ fn line_chars(doc: &Document, line: usize) -> Vec<char> {
     rope.line(line).chars().take(n).collect()
 }
 
+/// Widget id of the editor for `doc` in `pane` (0 = left/main, 1 = right split).
+pub fn editor_id(ui: &egui::Ui, doc: u64, pane: usize) -> egui::Id {
+    ui.make_persistent_id(("zenith-editor", doc, pane))
+}
+
 const MINIMAP_W: f32 = 84.0;
 const TEXT_PAD: f32 = 10.0;
 
@@ -72,6 +77,7 @@ pub fn editor_ui(
     p: &Palette,
     s: &Settings,
     cursor_epoch: f64,
+    pane: usize,
 ) -> Vec<EditorAction> {
     let mut actions = vec![];
     doc.sync();
@@ -101,7 +107,7 @@ pub fn editor_ui(
         if show_minimap { Rect::from_min_max(full.min, egui::pos2(full.max.x - MINIMAP_W, full.max.y)) } else { full };
     let viewport_h = editor_rect.height();
 
-    let id = ui.make_persistent_id(("zenith-editor", doc.id));
+    let id = editor_id(ui, doc.id, pane);
     let has_focus = ui.memory(|mem| mem.has_focus(id));
 
     // --- keyboard ---

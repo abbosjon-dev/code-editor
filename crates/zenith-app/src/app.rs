@@ -15,7 +15,7 @@ use zenith_terminal::CommandSpec;
 
 use crate::commands::Cmd;
 use crate::document::Document;
-use crate::editor_view::{editor_ui, EditorAction};
+use crate::editor_view::{editor_id, editor_ui, EditorAction};
 use crate::file_tree::{FileTree, TreeAction};
 use crate::git::Git;
 use crate::highlight;
@@ -124,6 +124,12 @@ pub struct ZenithApp {
     last_session_save: Instant,
     style_dirty: bool,
     focus_editor: bool,
+    /// Split editor: two panes side by side.
+    split: bool,
+    /// Doc index shown in the pane that does NOT have focus.
+    other: usize,
+    /// Whether the right pane is the focused one (`active` belongs to it).
+    focus_right: bool,
 }
 
 impl ZenithApp {
@@ -185,6 +191,9 @@ impl ZenithApp {
             last_session_save: Instant::now(),
             style_dirty: false,
             focus_editor: false,
+            split: false,
+            other: 0,
+            focus_right: false,
         };
         app.load_plugins();
         if let Some(e) = settings_err {
@@ -416,11 +425,17 @@ impl ZenithApp {
         }
         let doc = self.docs.remove(idx);
         self.lsp.did_close(&doc);
-        if self.active >= self.docs.len() {
-            self.active = self.docs.len().saturating_sub(1);
-        } else if idx < self.active {
-            self.active -= 1;
-        }
+        let fix = |i: &mut usize, len: usize| {
+            if *i > idx {
+                *i -= 1;
+            }
+            if *i >= len {
+                *i = len.saturating_sub(1);
+            }
+        };
+        let len = self.docs.len();
+        fix(&mut self.active, len);
+        fix(&mut self.other, len);
     }
 
     fn active_doc(&mut self) -> Option<&mut Document> {
@@ -846,6 +861,24 @@ impl ZenithApp {
                     LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
                 self.lsp.restart(&mut self.docs);
                 self.toast("Language servers restarted", NotifyLevel::Info);
+            }
+            Cmd::SplitEditor => {
+                if self.split {
+                    self.split = false;
+                    self.focus_right = false;
+                } else if !self.docs.is_empty() {
+                    self.split = true;
+                    self.other = self.active;
+                    self.focus_right = true;
+                }
+                self.focus_editor = true;
+            }
+            Cmd::FocusOtherPane => {
+                if self.split {
+                    let r = !self.focus_right;
+                    self.focus_pane(r);
+                    self.focus_editor = true;
+                }
             }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -1278,6 +1311,8 @@ impl ZenithApp {
             (cmd, Key::F, Cmd::Find, false),
             (cmd, Key::H, Cmd::Replace, false),
             (cmd, Key::B, Cmd::ToggleSidebar, false),
+            (ctrl | Modifiers::ALT, Key::Backslash, Cmd::FocusOtherPane, true),
+            (cmd, Key::Backslash, Cmd::SplitEditor, true),
             (cmd, Key::Equals, Cmd::ZoomIn, true),
             (cmd, Key::Plus, Cmd::ZoomIn, true),
             (cmd, Key::Minus, Cmd::ZoomOut, true),
@@ -1360,6 +1395,7 @@ impl ZenithApp {
                 item(ui, Cmd::ToggleTerminal, "Toggle Terminal");
                 item(ui, Cmd::ToggleAiPanel, "Toggle AI Panel");
                 item(ui, Cmd::ToggleMinimap, "Toggle Minimap");
+                item(ui, Cmd::SplitEditor, "Split Editor");
                 ui.separator();
                 item(ui, Cmd::SelectTheme, "Color Theme…");
                 item(ui, Cmd::SelectSyntaxTheme, "Syntax Theme…");
@@ -1849,12 +1885,13 @@ impl ZenithApp {
         }
     }
 
-    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+    fn tab_bar(&mut self, ui: &mut egui::Ui, right: bool) {
+        let shown = self.pane_doc(right);
         let p = self.colors.clone();
         let mut activate = None;
         let mut close = None;
         egui::ScrollArea::horizontal()
-            .id_salt("tabs")
+            .id_salt(("tabs", right))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1862,7 +1899,7 @@ impl ZenithApp {
                     for (i, doc) in self.docs.iter().enumerate() {
                         let title = doc.title();
                         let dirty = doc.buffer.is_dirty();
-                        let active = i == self.active;
+                        let active = i == shown;
                         let font = FontId::proportional(13.0);
                         let tw = ui.fonts(|f| f.layout_no_wrap(title.clone(), font.clone(), p.text).size().x);
                         let w = tw + 64.0;
@@ -1902,7 +1939,8 @@ impl ZenithApp {
                             egui::pos2(rect.max.x - 18.0, rect.center().y),
                             egui::vec2(18.0, 18.0),
                         );
-                        let close_resp = ui.interact(close_rect, ui.id().with(("tab-close", doc.id)), Sense::click());
+                        let close_resp =
+                            ui.interact(close_rect, ui.id().with(("tab-close", doc.id, right)), Sense::click());
                         if close_resp.hovered() {
                             ui.painter().rect_filled(close_rect, 4.0, p.bg_active);
                         }
@@ -1930,11 +1968,91 @@ impl ZenithApp {
                 });
             });
         if let Some(i) = activate {
+            self.focus_pane(right);
             self.active = i;
             self.focus_editor = true;
         }
         if let Some(i) = close {
             self.close_doc(i, false);
+        }
+    }
+
+    fn pane_doc(&self, right: bool) -> usize {
+        if !self.split || right == self.focus_right {
+            self.active
+        } else {
+            self.other
+        }
+    }
+
+    /// Make a pane the focused one; `active` always refers to the focused pane.
+    fn focus_pane(&mut self, right: bool) {
+        if self.split && right != self.focus_right {
+            std::mem::swap(&mut self.active, &mut self.other);
+            self.focus_right = right;
+        }
+    }
+
+    fn editor_pane(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, right: bool) {
+        let p = self.colors.clone();
+        let shown = self.pane_doc(right);
+        egui::Frame::new().fill(p.bg_panel).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            self.tab_bar(ui, right);
+        });
+        // Breadcrumbs.
+        if let Some(path) = self.docs.get(shown).and_then(|d| d.path()).map(|p| self.rel_path(p)) {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                let crumbs = path.split('/').collect::<Vec<_>>().join("  ›  ");
+                ui.label(RichText::new(crumbs).size(12.0).color(p.text_dim));
+            });
+        }
+        let changed_on_disk = self.docs.get(shown).is_some_and(|d| !d.buffer.is_dirty() && d.changed_on_disk());
+        if changed_on_disk {
+            if let Some(doc) = self.docs.get_mut(shown) {
+                // Auto-reload clean buffers modified externally (e.g. by an AI agent).
+                let _ = doc.reload_from_disk();
+            }
+        }
+        let focused_pane = !self.split || right == self.focus_right;
+        let focus_editor = focused_pane && std::mem::take(&mut self.focus_editor);
+        let epoch = self.cursor_epoch;
+        let pane = right as usize;
+        let actions = if let Some(doc) = self.docs.get_mut(shown) {
+            let id = editor_id(ui, doc.id, pane);
+            if focus_editor {
+                ui.memory_mut(|m| m.request_focus(id));
+            }
+            let actions = editor_ui(ui, doc, &p, &self.settings, epoch, pane);
+            if !focused_pane && ui.memory(|m| m.has_focus(id)) {
+                self.focus_pane(right);
+            }
+            actions
+        } else {
+            vec![]
+        };
+        for a in actions {
+            match a {
+                EditorAction::AskAgent { question } => {
+                    let prompt = self.selection_prompt(&question);
+                    self.send_to_agent(prompt, true, None);
+                }
+                EditorAction::SendSelectionToAgent => self.run(ctx, Cmd::SendSelectionToAgent),
+                EditorAction::Complete { trigger } => {
+                    let root = self.workspace.clone();
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        self.lsp.request_completion(doc, root.as_deref(), trigger);
+                    }
+                }
+                EditorAction::Hover { idx } => {
+                    let root = self.workspace.clone();
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        self.lsp.request_hover(doc, root.as_deref(), idx);
+                    }
+                }
+                EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
+            }
         }
     }
 
@@ -2591,58 +2709,25 @@ impl eframe::App for ZenithApp {
                 self.welcome(ctx, ui);
                 return;
             }
-            egui::Frame::new().fill(p.bg_panel).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                self.tab_bar(ui);
-            });
-            // Breadcrumbs.
-            if let Some(path) = self.docs.get(self.active).and_then(|d| d.path()).map(|p| self.rel_path(p)) {
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    let crumbs = path.split('/').collect::<Vec<_>>().join("  ›  ");
-                    ui.label(RichText::new(crumbs).size(12.0).color(p.text_dim));
+            if self.split {
+                let w = ui.available_width();
+                let h = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for right in [false, true] {
+                        let pane_w = if right { ui.available_width() } else { (w / 2.0).floor() };
+                        ui.allocate_ui_with_layout(egui::vec2(pane_w, h), Layout::top_down(Align::Min), |ui| {
+                            ui.set_min_size(egui::vec2(pane_w, h));
+                            self.editor_pane(ctx, ui, right);
+                        });
+                        if !right {
+                            let x = ui.cursor().min.x;
+                            ui.painter().vline(x, ui.max_rect().y_range(), Stroke::new(1.0_f32, p.border));
+                        }
+                    }
                 });
-            }
-            let changed_on_disk =
-                self.docs.get(self.active).is_some_and(|d| !d.buffer.is_dirty() && d.changed_on_disk());
-            if changed_on_disk {
-                if let Some(doc) = self.docs.get_mut(self.active) {
-                    // Auto-reload clean buffers modified externally (e.g. by an AI agent).
-                    let _ = doc.reload_from_disk();
-                }
-            }
-            let focus_editor = std::mem::take(&mut self.focus_editor);
-            let epoch = self.cursor_epoch;
-            let actions = if let Some(doc) = self.docs.get_mut(self.active) {
-                if focus_editor {
-                    let id = ui.make_persistent_id(("zenith-editor", doc.id));
-                    ui.memory_mut(|m| m.request_focus(id));
-                }
-                editor_ui(ui, doc, &p, &self.settings, epoch)
             } else {
-                vec![]
-            };
-            for a in actions {
-                match a {
-                    EditorAction::AskAgent { question } => {
-                        let prompt = self.selection_prompt(&question);
-                        self.send_to_agent(prompt, true, None);
-                    }
-                    EditorAction::SendSelectionToAgent => self.run(ctx, Cmd::SendSelectionToAgent),
-                    EditorAction::Complete { trigger } => {
-                        let root = self.workspace.clone();
-                        if let Some(doc) = self.docs.get_mut(self.active) {
-                            self.lsp.request_completion(doc, root.as_deref(), trigger);
-                        }
-                    }
-                    EditorAction::Hover { idx } => {
-                        let root = self.workspace.clone();
-                        if let Some(doc) = self.docs.get_mut(self.active) {
-                            self.lsp.request_hover(doc, root.as_deref(), idx);
-                        }
-                    }
-                    EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
-                }
+                self.editor_pane(ctx, ui, false);
             }
         });
 
