@@ -59,7 +59,46 @@ pub struct SearchHit {
     pub path: PathBuf,
     pub rel: String,
     pub line: usize,
+    /// Line text (leading whitespace removed, truncated).
     pub text: String,
+    /// Char ranges of the matches within `text`.
+    pub matches: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOpts {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+/// Compile the search query into a regex (escaped unless `opts.regex`).
+pub fn build_regex(query: &str, opts: SearchOpts) -> Result<regex::Regex, String> {
+    let mut pat = if opts.regex { query.to_string() } else { regex::escape(query) };
+    if opts.whole_word {
+        pat = format!(r"\b(?:{pat})\b");
+    }
+    regex::RegexBuilder::new(&pat)
+        .case_insensitive(!opts.case_sensitive)
+        .multi_line(true)
+        .build()
+        .map_err(|e| e.to_string().lines().last().unwrap_or("invalid regex").trim().to_string())
+}
+
+/// Replace every match in `text`. In regex mode `$1`/`${name}` refer to
+/// capture groups; otherwise the replacement is literal. Returns the new text
+/// and the number of replacements.
+pub fn replace_in_text(text: &str, re: &regex::Regex, replacement: &str, opts: SearchOpts) -> (String, usize) {
+    let count = re.find_iter(text).count();
+    if count == 0 {
+        return (text.to_string(), 0);
+    }
+    let out = if opts.regex {
+        re.replace_all(text, replacement).into_owned()
+    } else {
+        re.replace_all(text, regex::NoExpand(replacement)).into_owned()
+    };
+    (out, count)
 }
 
 pub struct SearchJob {
@@ -69,13 +108,14 @@ pub struct SearchJob {
 }
 
 pub const MAX_HITS: usize = 5_000;
+const MAX_LINE_SHOWN: usize = 240;
 
 impl SearchJob {
-    pub fn start(root: &Path, query: &str, case_sensitive: bool) -> Self {
+    pub fn start(root: &Path, query: &str, opts: SearchOpts) -> Result<Self, String> {
+        let re = build_regex(query, opts)?;
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let root = root.to_path_buf();
-        let q = if case_sensitive { query.to_string() } else { query.to_lowercase() };
         let c2 = cancel.clone();
         thread::spawn(move || {
             let mut total = 0;
@@ -96,17 +136,17 @@ impl SearchJob {
                     continue; // binary
                 }
                 let text = String::from_utf8_lossy(&bytes);
+                let rel = e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
                 let mut hits = vec![];
                 for (i, line) in text.lines().enumerate() {
-                    let found = if case_sensitive { line.contains(&q) } else { line.to_lowercase().contains(&q) };
-                    if found {
-                        let rel = e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
-                        let trimmed: String = line.trim().chars().take(200).collect();
-                        hits.push(SearchHit { path: e.path().to_path_buf(), rel, line: i, text: trimmed });
-                        total += 1;
-                        if total >= MAX_HITS {
-                            break;
-                        }
+                    let found: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+                    if found.is_empty() {
+                        continue;
+                    }
+                    hits.push(make_hit(e.path(), &rel, i, line, &found));
+                    total += 1;
+                    if total >= MAX_HITS {
+                        break;
                     }
                 }
                 if !hits.is_empty() && tx.send(hits).is_err() {
@@ -114,7 +154,7 @@ impl SearchJob {
                 }
             }
         });
-        Self { rx, cancel, done: false }
+        Ok(Self { rx, cancel, done: false })
     }
 
     /// Collect new hits; sets `done` when the worker finished.
@@ -135,5 +175,61 @@ impl SearchJob {
 impl Drop for SearchJob {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Build a result row: trim leading whitespace, truncate, convert byte
+/// ranges to char ranges in the shown text.
+fn make_hit(path: &Path, rel: &str, line_no: usize, line: &str, found: &[(usize, usize)]) -> SearchHit {
+    let lead = line.len() - line.trim_start().len();
+    let shown = &line[lead..];
+    let to_char = |b: usize| shown[..b.min(shown.len())].chars().count();
+    let text: String = shown.chars().take(MAX_LINE_SHOWN).collect();
+    let n = text.chars().count();
+    let matches = found
+        .iter()
+        .filter(|(s, _)| *s >= lead)
+        .map(|&(s, e)| (to_char(s - lead).min(n), to_char(e - lead).min(n)))
+        .filter(|(s, e)| s < e)
+        .collect();
+    SearchHit { path: path.to_path_buf(), rel: rel.to_string(), line: line_no, text, matches }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regex_options() {
+        let o = |c, w, r| SearchOpts { case_sensitive: c, whole_word: w, regex: r };
+        let re = build_regex("foo", o(false, false, false)).unwrap();
+        assert_eq!(re.find_iter("Foo food foo").count(), 3);
+        let re = build_regex("foo", o(true, true, false)).unwrap();
+        assert_eq!(re.find_iter("Foo food foo").count(), 1);
+        let re = build_regex("a.c", o(true, false, false)).unwrap();
+        assert!(!re.is_match("abc") && re.is_match("a.c"));
+        let re = build_regex(r"(\w+)@(\w+)", o(true, false, true)).unwrap();
+        assert_eq!(
+            replace_in_text("ali@uz vali@com", &re, "$2:$1", o(true, false, true)),
+            ("uz:ali com:vali".into(), 2)
+        );
+        // Literal mode must not expand `$1`.
+        let re = build_regex("x", o(true, false, false)).unwrap();
+        assert_eq!(replace_in_text("x x", &re, "$1", o(true, false, false)).0, "$1 $1");
+        assert!(build_regex("(", o(true, false, true)).is_err());
+    }
+
+    #[test]
+    fn hit_ranges_are_chars_after_trim() {
+        let line = "    salom dunyo salom";
+        let re = build_regex("salom", SearchOpts::default()).unwrap();
+        let found: Vec<_> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+        let h = make_hit(Path::new("a"), "a", 0, line, &found);
+        assert_eq!(h.text, "salom dunyo salom");
+        assert_eq!(h.matches, vec![(0, 5), (12, 17)]);
+        let line = "ёж ёж";
+        let re = build_regex("ж", SearchOpts::default()).unwrap();
+        let found: Vec<_> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+        assert_eq!(make_hit(Path::new("a"), "a", 0, line, &found).matches, vec![(1, 2), (4, 5)]);
     }
 }

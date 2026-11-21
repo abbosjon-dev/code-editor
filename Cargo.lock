@@ -4645,6 +4645,7 @@ dependencies = [
  "ignore",
  "log",
  "nucleo-matcher",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

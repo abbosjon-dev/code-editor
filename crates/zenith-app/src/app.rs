@@ -24,7 +24,7 @@ use crate::palette::{command_items, CommandPalette, Item, Mode, PaletteAction};
 use crate::settings::{self, Session, Settings};
 use crate::terminal_view::{terminal_ui, TermEvent, TermKind, TermTab};
 use crate::theme::{self, Palette};
-use crate::workspace::{FileIndex, SearchHit, SearchJob};
+use crate::workspace::{build_regex, replace_in_text, FileIndex, SearchHit, SearchJob, SearchOpts};
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -69,6 +69,7 @@ enum Dialog {
     ConfirmDelete(PathBuf),
     UnsavedClose(u64),
     UnsavedQuit,
+    ConfirmReplace { files: usize, count: usize },
     AskAgent { question: String, focus: bool },
     About,
 }
@@ -95,10 +96,15 @@ struct PendingSend {
 #[derive(Default)]
 struct SearchPanel {
     query: String,
-    case_sensitive: bool,
+    replacement: String,
+    show_replace: bool,
+    opts: SearchOpts,
     results: Vec<SearchHit>,
     job: Option<SearchJob>,
     focus: bool,
+    error: Option<String>,
+    /// When the query/options last changed (search runs shortly after typing stops).
+    edited_at: Option<Instant>,
 }
 
 pub struct ZenithApp {
@@ -1516,12 +1522,15 @@ impl ZenithApp {
                     .and_then(|t| t.lines().nth(line).map(str::to_string))
                     .unwrap_or_default(),
             };
-            hits.push(SearchHit {
-                rel: self.rel_path(&canon),
-                path: canon,
-                line,
-                text: text.trim().chars().take(200).collect(),
-            });
+            let shown: String = text.trim().chars().take(200).collect();
+            let matches = shown
+                .match_indices(name.as_str())
+                .map(|(b, m)| {
+                    let s = shown[..b].chars().count();
+                    (s, s + m.chars().count())
+                })
+                .collect();
+            hits.push(SearchHit { rel: self.rel_path(&canon), path: canon, line, text: shown, matches });
         }
         hits.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
         self.toast(format!("{} reference(s) to `{name}`", hits.len()), NotifyLevel::Info);
@@ -1960,32 +1969,81 @@ impl ZenithApp {
             return;
         };
         let mut start = false;
+        let mut changed = false;
+        let mut replace_all = false;
         // Right-to-left so the text field takes exactly the remaining width
         // (otherwise the panel grows a little every frame).
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 28.0),
             Layout::right_to_left(Align::Center),
             |ui| {
-                if ui.toggle_value(&mut self.search.case_sensitive, "Aa").on_hover_text("Match case").changed() {
-                    start = true;
-                }
+                changed |= ui
+                    .toggle_value(&mut self.search.opts.regex, ".*")
+                    .on_hover_text("Use regular expression")
+                    .changed();
+                changed |= ui
+                    .toggle_value(&mut self.search.opts.whole_word, "ab|")
+                    .on_hover_text("Match whole word")
+                    .changed();
+                changed |=
+                    ui.toggle_value(&mut self.search.opts.case_sensitive, "Aa").on_hover_text("Match case").changed();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.search.query)
                         .hint_text("Search")
-                        .desired_width(ui.available_width()),
+                        .desired_width(ui.available_width() - 26.0),
                 );
                 if self.search.focus {
                     r.request_focus();
                     self.search.focus = false;
                 }
+                changed |= r.changed();
                 if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     start = true;
                 }
+                let arrow = if self.search.show_replace { "▾" } else { "▸" };
+                if ui.add(egui::Button::new(arrow).frame(false)).on_hover_text("Toggle replace").clicked() {
+                    self.search.show_replace = !self.search.show_replace;
+                }
             },
         );
-        if start && !self.search.query.is_empty() {
+        if self.search.show_replace {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 28.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    let can = !self.search.results.is_empty();
+                    if ui.add_enabled(can, egui::Button::new("↔ All")).on_hover_text("Replace in all files").clicked()
+                    {
+                        replace_all = true;
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search.replacement)
+                            .hint_text(if self.search.opts.regex { "Replace ($1 = group)" } else { "Replace" })
+                            .desired_width(ui.available_width()),
+                    );
+                },
+            );
+        }
+        if changed {
+            self.search.edited_at = Some(Instant::now());
+        }
+        // Search as you type, shortly after typing stops.
+        if self.search.edited_at.is_some_and(|t| t.elapsed() > Duration::from_millis(300)) {
+            self.search.edited_at = None;
+            start = true;
+        } else if self.search.edited_at.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        if start {
             self.search.results.clear();
-            self.search.job = Some(SearchJob::start(&root, &self.search.query, self.search.case_sensitive));
+            self.search.job = None;
+            self.search.error = None;
+            if !self.search.query.is_empty() {
+                match SearchJob::start(&root, &self.search.query, self.search.opts) {
+                    Ok(job) => self.search.job = Some(job),
+                    Err(e) => self.search.error = Some(e),
+                }
+            }
         }
         if let Some(job) = &mut self.search.job {
             job.poll(&mut self.search.results);
@@ -1993,14 +2051,17 @@ impl ZenithApp {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
         }
+        if let Some(e) = &self.search.error {
+            ui.label(RichText::new(e).small().color(p.error));
+        }
         let searching = self.search.job.as_ref().is_some_and(|j| !j.done);
-        let n = self.search.results.len();
+        let n: usize = self.search.results.iter().map(|h| h.matches.len().max(1)).sum();
+        let files = {
+            let mut v: Vec<&str> = self.search.results.iter().map(|h| h.rel.as_str()).collect();
+            v.dedup();
+            v.len()
+        };
         if n > 0 || searching {
-            let files = {
-                let mut v: Vec<&str> = self.search.results.iter().map(|h| h.rel.as_str()).collect();
-                v.dedup();
-                v.len()
-            };
             ui.label(
                 RichText::new(format!("{n} results in {files} files{}", if searching { " — searching…" } else { "" }))
                     .small()
@@ -2011,24 +2072,69 @@ impl ZenithApp {
         }
         ui.add_space(4.0);
         let mut open: Option<(PathBuf, usize)> = None;
+        let mut replace_file: Option<PathBuf> = None;
+        let show_rep = self.search.show_replace && !self.search.results.is_empty();
+        let replacement = self.search.replacement.clone();
+        let font = FontId::monospace(12.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut last_file = "";
             for hit in &self.search.results {
                 if hit.rel != last_file {
                     last_file = &hit.rel;
                     ui.add_space(4.0);
-                    let (icon, color) = theme::file_icon(&hit.rel);
+                    let (dir, name) = hit.rel.rsplit_once('/').unwrap_or(("", &hit.rel));
+                    let (icon, color) = theme::file_icon(name);
+                    let count: usize =
+                        self.search.results.iter().filter(|h| h.rel == hit.rel).map(|h| h.matches.len().max(1)).sum();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon).color(color));
-                        ui.label(RichText::new(&hit.rel).strong());
+                        ui.label(RichText::new(name).strong());
+                        ui.label(RichText::new(dir).small().color(p.text_dim));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if show_rep
+                                && ui
+                                    .add(egui::Button::new("↔").frame(false))
+                                    .on_hover_text("Replace in this file")
+                                    .clicked()
+                            {
+                                replace_file = Some(hit.path.clone());
+                            }
+                            ui.label(RichText::new(count.to_string()).small().color(p.text_faint));
+                        });
                     });
                 }
-                let text = format!("{:>5}  {}", hit.line + 1, hit.text);
-                let r = ui.add(
-                    egui::Label::new(RichText::new(text).monospace().size(12.0).color(p.text_dim))
-                        .truncate()
-                        .sense(Sense::click()),
-                );
+                // Line text with matches highlighted (and the replacement preview).
+                let mut job = egui::text::LayoutJob::default();
+                let fmt = |color: Color32, bg: Color32, strike: bool| egui::TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    background: bg,
+                    strikethrough: if strike { Stroke::new(1.0_f32, color) } else { Stroke::NONE },
+                    ..Default::default()
+                };
+                job.append(&format!("{:>5}  ", hit.line + 1), 0.0, fmt(p.text_faint, Color32::TRANSPARENT, false));
+                let chars: Vec<char> = hit.text.chars().collect();
+                let mut at = 0;
+                for &(a, b) in &hit.matches {
+                    job.append(
+                        &chars[at..a].iter().collect::<String>(),
+                        0.0,
+                        fmt(p.text_dim, Color32::TRANSPARENT, false),
+                    );
+                    let m: String = chars[a..b].iter().collect();
+                    if show_rep {
+                        job.append(&m, 0.0, fmt(p.error, p.error.gamma_multiply(0.15), true));
+                        job.append(&replacement, 0.0, fmt(p.success, p.success.gamma_multiply(0.15), false));
+                    } else {
+                        job.append(&m, 0.0, fmt(p.text, p.find_match.gamma_multiply(0.6), false));
+                    }
+                    at = b;
+                }
+                job.append(&chars[at..].iter().collect::<String>(), 0.0, fmt(p.text_dim, Color32::TRANSPARENT, false));
+                job.wrap.max_rows = 1;
+                job.wrap.max_width = ui.available_width();
+                job.wrap.break_anywhere = true;
+                let r = ui.add(egui::Label::new(job).sense(Sense::click()));
                 if r.hovered() {
                     ui.painter().rect_filled(r.rect.expand(1.0), 3.0, p.bg_hover.gamma_multiply(0.5));
                 }
@@ -2041,11 +2147,77 @@ impl ZenithApp {
             if self.open_file(&path) {
                 if let Some(doc) = self.docs.get_mut(self.active) {
                     doc.goto_line(line);
-                    doc.find.query = self.search.query.clone();
-                    doc.find.open = true;
+                    if !self.search.opts.regex {
+                        doc.find.query = self.search.query.clone();
+                        doc.find.opts.case_sensitive = self.search.opts.case_sensitive;
+                        doc.find.opts.whole_word = self.search.opts.whole_word;
+                        doc.find.open = true;
+                    }
                 }
             }
         }
+        if let Some(path) = replace_file {
+            self.replace_in_files(Some(path));
+        }
+        if replace_all {
+            let count = n;
+            self.dialog = Some(Dialog::ConfirmReplace { files, count });
+        }
+    }
+
+    /// Replace search matches in one file or in every file with results.
+    /// Open files are edited in their buffers (undoable, left unsaved); other
+    /// files are rewritten on disk.
+    fn replace_in_files(&mut self, only: Option<PathBuf>) {
+        let opts = self.search.opts;
+        let re = match build_regex(&self.search.query, opts) {
+            Ok(r) => r,
+            Err(e) => return self.toast(e, NotifyLevel::Error),
+        };
+        let mut paths: Vec<PathBuf> = self.search.results.iter().map(|h| h.path.clone()).collect();
+        paths.dedup();
+        if let Some(o) = &only {
+            paths.retain(|p| p == o);
+        }
+        let rep = self.search.replacement.clone();
+        let (mut total, mut files) = (0, 0);
+        for path in paths {
+            let canon = path.canonicalize().unwrap_or(path.clone());
+            let n = if let Some(doc) = self.docs.iter_mut().find(|d| d.path() == Some(canon.as_path())) {
+                let (new, n) = replace_in_text(&doc.buffer.text(), &re, &rep, opts);
+                if n > 0 {
+                    let sel = doc.buffer.sel;
+                    doc.buffer.set_text(&new);
+                    doc.buffer.sel = sel;
+                    doc.buffer.sel.clamp(doc.buffer.len_chars());
+                }
+                n
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let (new, n) = replace_in_text(&text, &re, &rep, opts);
+                        if n > 0 {
+                            if let Err(e) = std::fs::write(&path, new) {
+                                self.toast(format!("{}: {e}", path.display()), NotifyLevel::Error);
+                                continue;
+                            }
+                        }
+                        n
+                    }
+                    Err(e) => {
+                        self.toast(format!("{}: {e}", path.display()), NotifyLevel::Error);
+                        continue;
+                    }
+                }
+            };
+            if n > 0 {
+                total += n;
+                files += 1;
+            }
+        }
+        self.toast(format!("Replaced {total} occurrence(s) in {files} file(s)"), NotifyLevel::Info);
+        // Refresh the results.
+        self.search.edited_at = Some(Instant::now() - Duration::from_secs(1));
     }
 
     fn agents_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette) {
@@ -2916,6 +3088,40 @@ impl ZenithApp {
                 });
                 if keep {
                     next = Some(Dialog::UnsavedClose(id));
+                }
+            }
+            Dialog::ConfirmReplace { files, count } => {
+                let mut go = false;
+                window("Replace All").show(ctx, |ui| {
+                    ui.label(format!(
+                        "Replace {count} occurrence(s) across {files} file(s) with “{}”?",
+                        self.search.replacement
+                    ));
+                    ui.label(
+                        RichText::new("Open files are changed in the editor (undoable); others are written to disk.")
+                            .small()
+                            .color(self.colors.text_dim),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Replace").color(Color32::WHITE))
+                                    .fill(self.colors.accent),
+                            )
+                            .clicked()
+                        {
+                            go = true;
+                        }
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                });
+                if go {
+                    self.replace_in_files(None);
+                } else if keep {
+                    next = Some(Dialog::ConfirmReplace { files, count });
                 }
             }
             Dialog::UnsavedQuit => {
