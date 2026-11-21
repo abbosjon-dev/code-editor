@@ -45,7 +45,8 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [ ] Git: yonma-yon diff ko'rinishi, branch almashtirish, hunk'ni qaytarish (revert)
 
 **v0.3**
-- [ ] Tree-sitter asosida ranglash va kod katlamlari (folding)
+- [x] Kod bloklarini yig'ish (chekinish asosida, barcha tillar uchun)
+- [ ] Tree-sitter asosida ranglash va sintaktik folding
 - [ ] MCP serverlarini sozlash UI
 - [ ] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
 - [ ] Plugin UI kengaytmalari: status bar elementlari, yon panel ko'rinishlari

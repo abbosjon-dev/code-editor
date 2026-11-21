@@ -6,6 +6,7 @@ mod commands;
 mod document;
 mod editor_view;
 mod file_tree;
+mod folding;
 mod git;
 mod highlight;
 mod lsp;

@@ -933,6 +933,17 @@ impl ZenithApp {
                     }
                 }
             }
+            Cmd::Fold | Cmd::Unfold | Cmd::FoldAll | Cmd::UnfoldAll => {
+                if let Some(doc) = self.active_doc() {
+                    match cmd {
+                        Cmd::Fold => doc.fold_at_cursor(),
+                        Cmd::Unfold => doc.unfold_at_cursor(),
+                        Cmd::FoldAll => doc.fold_all(),
+                        _ => doc.unfold_all(),
+                    }
+                }
+                self.focus_editor = true;
+            }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }

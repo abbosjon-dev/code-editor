@@ -100,7 +100,7 @@ pub fn editor_ui(
 
     let total_lines = doc.buffer.len_lines();
     let digits = total_lines.to_string().len().max(3);
-    let gutter_w = digits as f32 * m.char_w + 28.0;
+    let gutter_w = digits as f32 * m.char_w + 40.0;
     let longest = doc.longest_line_chars();
 
     let full = ui.available_rect_before_wrap();
@@ -127,6 +127,11 @@ pub fn editor_ui(
         actions.extend(acts);
     }
     doc.refilter_completion();
+    if moved || doc.reveal_line.is_some() {
+        doc.reveal_cursor_in_folds();
+    }
+    let fm = doc.fold_map();
+    let total_rows = fm.row_count();
     let mut cursor_screen: Option<Pos2> = None;
     let mut hover_screen: Option<(Pos2, usize)> = None;
 
@@ -135,7 +140,7 @@ pub fn editor_ui(
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
     if let Some(line) = doc.reveal_line.take() {
-        let y = (line as f32 * m.line_h - viewport_h * 0.35).max(0.0);
+        let y = (fm.row_of(line) as f32 * m.line_h - viewport_h * 0.35).max(0.0);
         scroll = scroll.vertical_scroll_offset(y);
     }
     if let Some(y) = ui.data_mut(|d| d.remove_temp::<f32>(id.with("minimap-jump"))) {
@@ -143,7 +148,7 @@ pub fn editor_ui(
     }
 
     let content_w = gutter_w + TEXT_PAD + (longest as f32 + 8.0) * m.char_w;
-    let content_h = total_lines as f32 * m.line_h + viewport_h * 0.6;
+    let content_h = total_rows as f32 * m.line_h + viewport_h * 0.6;
 
     let out = ui
         .scope_builder(UiBuilder::new().max_rect(editor_rect), |ui| {
@@ -158,8 +163,8 @@ pub fn editor_ui(
                 if let Some(pos) = resp.interact_pointer_pos() {
                     let in_gutter = pos.x < clip.min.x + gutter_w;
                     let hit = |doc: &Document, pos: Pos2| -> usize {
-                        let line = (((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize)
-                            .min(doc.buffer.len_lines().saturating_sub(1));
+                        let row = ((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize;
+                        let line = fm.line_at(row.min(total_rows.saturating_sub(1)));
                         let chars = line_chars(doc, line);
                         let vc = visual_cols(&chars, m.tab);
                         let target = (pos.x - text_x) / m.char_w;
@@ -190,6 +195,10 @@ pub fn editor_ui(
                         } else if ui.input(|i| i.modifiers.command) && !in_gutter {
                             doc.buffer.set_cursor(idx, false);
                             actions.push(EditorAction::GotoDefinition { idx });
+                        } else if in_gutter && !shift && pos.x > clip.min.x + gutter_w - 20.0 {
+                            // Fold chevron column.
+                            let line = doc.buffer.char_to_pos(idx).line;
+                            doc.toggle_fold(line);
                         } else if in_gutter && !shift {
                             let line = doc.buffer.char_to_pos(idx).line;
                             doc.buffer.select_line(line);
@@ -222,8 +231,9 @@ pub fn editor_ui(
                 // Hover: after the pointer rests on text, ask for info.
                 if let Some(pos) = resp.hover_pos() {
                     if pos.x > clip.min.x + gutter_w && !resp.dragged() {
-                        let line = ((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize;
-                        if line < doc.buffer.len_lines() {
+                        let row = ((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize;
+                        let line = fm.line_at(row);
+                        if row < total_rows {
                             let chars = line_chars(doc, line);
                             let vc = visual_cols(&chars, m.tab);
                             let target = ((pos.x - text_x) / m.char_w).floor() as isize;
@@ -300,8 +310,12 @@ pub fn editor_ui(
 
                 // --- paint ---
                 let painter = ui.painter().clone();
-                let first = ((viewport.min.y / m.line_h).floor().max(0.0)) as usize;
-                let last = (((viewport.max.y / m.line_h).ceil()) as usize + 1).min(total_lines);
+                let first_row = ((viewport.min.y / m.line_h).floor().max(0.0)) as usize;
+                let last_row = (((viewport.max.y / m.line_h).ceil()) as usize + 1).min(total_rows);
+                // Document line bounds of what's on screen.
+                let first = fm.line_at(first_row);
+                let last = if last_row == 0 { 0 } else { (fm.line_at(last_row - 1) + 1).min(total_lines) };
+                let y_of_line = |line: usize| rect.min.y + fm.row_of(line) as f32 * m.line_h;
                 if !doc.highlight.ensure(&doc.buffer, last) {
                     ui.ctx().request_repaint();
                 }
@@ -317,8 +331,9 @@ pub fn editor_ui(
                 let mut mi = doc.find.matches.partition_point(|r| r.end < first_char);
                 let mut prev_indent = 0usize;
 
-                for line in first..last {
-                    let y = rect.min.y + line as f32 * m.line_h;
+                for row in first_row..last_row {
+                    let line = fm.line_at(row);
+                    let y = rect.min.y + row as f32 * m.line_h;
                     let chars = line_chars(doc, line);
                     let vc = visual_cols(&chars, m.tab);
                     let x_of = |col: usize| text_x + vc[col.min(vc.len() - 1)] as f32 * m.char_w;
@@ -409,6 +424,20 @@ pub fn editor_ui(
                         painter.galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
                     }
 
+                    if doc.folds.contains(&line) && !fm.is_identity() {
+                        let x = x_of(chars.len()) + m.char_w;
+                        let pill =
+                            Rect::from_min_size(egui::pos2(x, y + 3.0), egui::vec2(m.char_w * 3.0, m.line_h - 6.0));
+                        painter.rect_filled(pill, 4.0, p.bg_active);
+                        painter.text(
+                            pill.center(),
+                            Align2::CENTER_CENTER,
+                            "⋯",
+                            FontId::proportional(m.font.size * 0.9),
+                            p.text_dim,
+                        );
+                    }
+
                     // Bracket match boxes.
                     if let Some((a, b)) = bracket {
                         for idx in [a, b] {
@@ -428,7 +457,7 @@ pub fn editor_ui(
                 let cursor_chars = line_chars(doc, cursor.line);
                 let cvc = visual_cols(&cursor_chars, m.tab);
                 let cx = text_x + cvc[cursor.col.min(cvc.len() - 1)] as f32 * m.char_w;
-                let cy = rect.min.y + cursor.line as f32 * m.line_h;
+                let cy = y_of_line(cursor.line);
                 let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
                 cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
                 if has_focus {
@@ -444,7 +473,10 @@ pub fn editor_ui(
                             let echars = line_chars(doc, ep.line);
                             let evc = visual_cols(&echars, m.tab);
                             let ex = text_x + evc[ep.col.min(evc.len() - 1)] as f32 * m.char_w;
-                            let ey = rect.min.y + ep.line as f32 * m.line_h;
+                            if fm.is_hidden(ep.line) {
+                                continue;
+                            }
+                            let ey = y_of_line(ep.line);
                             painter.rect_filled(
                                 Rect::from_min_size(egui::pos2(ex - 1.0, ey + 2.0), egui::vec2(2.0, m.line_h - 4.0)),
                                 1.0,
@@ -477,25 +509,25 @@ pub fn editor_ui(
                 painter.rect_filled(gutter, 0.0, p.bg);
                 let num_font = FontId::monospace(s.editor_font_size * 0.86);
                 for &(a, b, kind) in &doc.git_hunks {
-                    if b <= first || a >= last {
+                    if b <= first || a >= last || (fm.is_hidden(a) && fm.is_hidden(b.saturating_sub(1))) {
                         continue;
                     }
-                    let x = clip.min.x + gutter_w - 6.0;
+                    let x = clip.min.x + gutter_w - 5.0;
                     let color = match kind {
                         crate::git::LineChange::Added => p.success,
                         crate::git::LineChange::Modified => p.accent,
                         crate::git::LineChange::Deleted => p.error,
                     };
                     if kind == crate::git::LineChange::Deleted {
-                        let y = rect.min.y + a as f32 * m.line_h;
+                        let y = y_of_line(a);
                         painter.add(egui::Shape::convex_polygon(
                             vec![egui::pos2(x - 1.0, y - 4.0), egui::pos2(x + 4.0, y), egui::pos2(x - 1.0, y + 4.0)],
                             color,
                             Stroke::NONE,
                         ));
                     } else {
-                        let y0 = rect.min.y + a.max(first) as f32 * m.line_h;
-                        let y1 = rect.min.y + b.min(last) as f32 * m.line_h;
+                        let y0 = y_of_line(a.max(first));
+                        let y1 = y_of_line(b.min(last).saturating_sub(1)) + m.line_h;
                         painter.rect_filled(
                             Rect::from_min_max(egui::pos2(x, y0 + 1.0), egui::pos2(x + 3.0, y1 - 1.0)),
                             1.0,
@@ -504,16 +536,28 @@ pub fn editor_ui(
                     }
                 }
                 for d in doc.diagnostics.iter().rev() {
-                    if d.line >= first && d.line < last && d.severity <= Severity::Warning {
-                        let y = rect.min.y + d.line as f32 * m.line_h + m.line_h / 2.0;
+                    if d.line >= first && d.line < last && d.severity <= Severity::Warning && !fm.is_hidden(d.line) {
+                        let y = y_of_line(d.line) + m.line_h / 2.0;
                         painter.circle_filled(egui::pos2(clip.min.x + 6.0, y), 3.0, severity_color(p, d.severity));
                     }
                 }
-                for line in first..last {
-                    let y = rect.min.y + line as f32 * m.line_h + m.line_h / 2.0;
+                let gutter_hovered = resp.hover_pos().is_some_and(|h| h.x < clip.min.x + gutter_w);
+                for row in first_row..last_row {
+                    let line = fm.line_at(row);
+                    let y = rect.min.y + row as f32 * m.line_h + m.line_h / 2.0;
                     let active = line == cursor.line;
+                    let folded = doc.folds.contains(&line);
+                    if folded || (gutter_hovered && crate::folding::is_foldable(&doc.buffer, line)) {
+                        painter.text(
+                            egui::pos2(clip.min.x + gutter_w - 13.0, y),
+                            Align2::CENTER_CENTER,
+                            if folded { "▸" } else { "▾" },
+                            FontId::proportional(m.font.size * 0.8),
+                            if folded { p.accent } else { p.text_faint },
+                        );
+                    }
                     painter.text(
-                        egui::pos2(clip.min.x + gutter_w - 14.0, y),
+                        egui::pos2(clip.min.x + gutter_w - 22.0, y),
                         Align2::RIGHT_CENTER,
                         (line + 1).to_string(),
                         num_font.clone(),
@@ -1016,8 +1060,14 @@ fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: is
             let n = b.len_chars();
             b.set_cursor(n, shift)
         }
-        Key::ArrowUp => b.move_vertical(-1, shift),
-        Key::ArrowDown => b.move_vertical(1, shift),
+        Key::ArrowUp => {
+            b.move_vertical(-1, shift);
+            skip_folded(doc, -1, shift);
+        }
+        Key::ArrowDown => {
+            b.move_vertical(1, shift);
+            skip_folded(doc, 1, shift);
+        }
         Key::Home if cmd => b.set_cursor(0, shift),
         Key::End if cmd => {
             let n = b.len_chars();
@@ -1083,11 +1133,32 @@ fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: is
         }
         Key::D if cmd && shift => b.duplicate_line(),
         Key::D if cmd => select_next_occurrence(doc),
+        Key::OpenBracket | Key::OpenCurlyBracket if cmd && (shift || key == Key::OpenCurlyBracket) => {
+            doc.fold_at_cursor();
+            return true;
+        }
+        Key::CloseBracket | Key::CloseCurlyBracket if cmd && (shift || key == Key::CloseCurlyBracket) => {
+            doc.unfold_at_cursor();
+            return true;
+        }
         Key::OpenBracket if cmd => b.indent_lines(false),
         Key::CloseBracket if cmd => b.indent_lines(true),
         _ => return false,
     }
     true
+}
+
+/// Keep vertical movement out of folded regions.
+fn skip_folded(doc: &mut Document, dir: isize, shift: bool) {
+    if doc.folds.is_empty() {
+        return;
+    }
+    let map = doc.fold_map();
+    let mut guard = 0;
+    while map.is_hidden(doc.buffer.cursor_pos().line) && guard < 1_000_000 {
+        doc.buffer.move_vertical(dir, shift);
+        guard += 1;
+    }
 }
 
 /// Ctrl/Cmd+D: select the word under the caret, then add the next match as another cursor.

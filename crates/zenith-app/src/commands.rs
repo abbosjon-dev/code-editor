@@ -48,6 +48,10 @@ pub enum Cmd {
     RenameSymbol,
     FindReferences,
     FormatDocument,
+    Fold,
+    Unfold,
+    FoldAll,
+    UnfoldAll,
     About,
     Quit,
 }
@@ -102,6 +106,10 @@ impl Cmd {
             RenameSymbol,
             FindReferences,
             FormatDocument,
+            Fold,
+            Unfold,
+            FoldAll,
+            UnfoldAll,
             About,
             Quit,
         ]
@@ -111,6 +119,10 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            Fold => "Editor: Fold",
+            Unfold => "Editor: Unfold",
+            FoldAll => "Editor: Fold All",
+            UnfoldAll => "Editor: Unfold All",
             RenameSymbol => "Edit: Rename Symbol",
             FindReferences => "Go: Find All References",
             FormatDocument => "Edit: Format Document",
@@ -201,6 +213,8 @@ impl Cmd {
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
             GotoDefinition => "F12",
+            Fold => k!("⌘⇧[", "Ctrl+Shift+["),
+            Unfold => k!("⌘⇧]", "Ctrl+Shift+]"),
             RenameSymbol => "F2",
             FindReferences => "Shift+F12",
             FormatDocument => k!("⇧⌥F", "Shift+Alt+F"),

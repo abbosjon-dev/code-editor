@@ -80,6 +80,12 @@ pub struct Document {
     git_hunks_version: Option<u64>,
     /// Pending review of a change made outside the editor (e.g. by an AI agent).
     pub review: Option<crate::review::Review>,
+    // --- folding ---
+    /// Header lines of folded regions.
+    pub folds: std::collections::BTreeSet<usize>,
+    folds_gen: u64,
+    fold_cache: Option<(u64, u64, std::sync::Arc<crate::folding::FoldMap>)>,
+    last_len_lines: usize,
 }
 
 impl Document {
@@ -127,6 +133,10 @@ impl Document {
             git_hunks: vec![],
             git_hunks_version: None,
             review: None,
+            folds: Default::default(),
+            folds_gen: 0,
+            fold_cache: None,
+            last_len_lines: 0,
         }
     }
 
@@ -217,9 +227,30 @@ impl Document {
 
     /// Sync caches after edits. Call once per frame before rendering.
     pub fn sync(&mut self) {
+        let n = self.buffer.len_lines();
         if let Some(line) = self.buffer.take_changed_line() {
             self.highlight.invalidate_from(line);
+            // Keep folds attached to their lines when lines are added/removed above.
+            let delta = n as isize - self.last_len_lines as isize;
+            if delta != 0 && !self.folds.is_empty() && self.last_len_lines > 0 {
+                let removed_end = if delta < 0 { line as isize - delta } else { line as isize };
+                self.folds = self
+                    .folds
+                    .iter()
+                    .filter_map(|&h| {
+                        if h <= line {
+                            Some(h)
+                        } else if (h as isize) <= removed_end {
+                            None
+                        } else {
+                            Some((h as isize + delta) as usize)
+                        }
+                    })
+                    .collect();
+                self.folds_gen += 1;
+            }
         }
+        self.last_len_lines = n;
         self.update_find();
     }
 
@@ -240,6 +271,95 @@ impl Document {
             Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
             _ => vec![],
         };
+    }
+
+    // ---------- folding ----------
+
+    pub fn fold_map(&mut self) -> std::sync::Arc<crate::folding::FoldMap> {
+        let key = (self.buffer.version(), self.folds_gen);
+        if let Some((v, g, m)) = &self.fold_cache {
+            if (*v, *g) == key {
+                return m.clone();
+            }
+        }
+        let m = std::sync::Arc::new(crate::folding::FoldMap::build(&self.buffer, &self.folds));
+        self.fold_cache = Some((key.0, key.1, m.clone()));
+        m
+    }
+
+    pub fn toggle_fold(&mut self, header: usize) {
+        if !self.folds.remove(&header) && crate::folding::is_foldable(&self.buffer, header) {
+            self.folds.insert(header);
+            self.move_cursor_out_of_folds();
+        }
+        self.folds_gen += 1;
+    }
+
+    pub fn fold_at_cursor(&mut self) {
+        let line = self.buffer.cursor_pos().line;
+        // Fold the innermost unfolded region around the caret.
+        let mut l = line;
+        loop {
+            match crate::folding::enclosing_header(&self.buffer, l) {
+                Some(h) if self.folds.contains(&h) && h > 0 => l = h - 1,
+                Some(h) if !self.folds.contains(&h) => {
+                    self.folds.insert(h);
+                    break;
+                }
+                _ => return,
+            }
+        }
+        self.folds_gen += 1;
+        self.move_cursor_out_of_folds();
+    }
+
+    pub fn unfold_at_cursor(&mut self) {
+        let line = self.buffer.cursor_pos().line;
+        let before = self.folds.len();
+        self.folds.remove(&line);
+        if let Some(h) = crate::folding::enclosing_header(&self.buffer, line) {
+            self.folds.remove(&h);
+        }
+        if self.folds.len() != before {
+            self.folds_gen += 1;
+        }
+    }
+
+    pub fn fold_all(&mut self) {
+        self.folds = (0..self.buffer.len_lines()).filter(|&l| crate::folding::is_foldable(&self.buffer, l)).collect();
+        self.folds_gen += 1;
+        self.move_cursor_out_of_folds();
+    }
+
+    pub fn unfold_all(&mut self) {
+        self.folds.clear();
+        self.folds_gen += 1;
+    }
+
+    /// Unfold any fold that hides the caret (after goto / search / typing).
+    pub fn reveal_cursor_in_folds(&mut self) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let line = self.buffer.cursor_pos().line;
+        let map = self.fold_map();
+        if !map.is_hidden(line) {
+            return;
+        }
+        let buf = &self.buffer;
+        self.folds.retain(|&h| !(h < line && crate::folding::fold_end(buf, h).is_some_and(|e| e >= line)));
+        self.folds_gen += 1;
+    }
+
+    fn move_cursor_out_of_folds(&mut self) {
+        let line = self.buffer.cursor_pos().line;
+        let map = self.fold_map();
+        if map.is_hidden(line) {
+            let header = map.line_at(map.row_of(line));
+            let idx = self.buffer.pos_to_char(zenith_core::Position::new(header, usize::MAX));
+            self.buffer.clear_extra();
+            self.buffer.set_cursor(idx, false);
+        }
     }
 
     pub fn longest_line_chars(&mut self) -> usize {
