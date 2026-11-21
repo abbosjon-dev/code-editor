@@ -28,6 +28,8 @@ impl LineEnding {
 pub struct Buffer {
     rope: Rope,
     pub sel: Selection,
+    /// Secondary cursors/selections (multi-cursor). The primary is `sel`.
+    pub extra: Vec<Selection>,
     /// Column the caret "wants" to be in during vertical movement.
     preferred_col: Option<usize>,
     history: History,
@@ -53,6 +55,7 @@ impl Buffer {
         Self {
             rope: Rope::from_str(&normalized),
             sel: Selection::default(),
+            extra: vec![],
             preferred_col: None,
             history: History::default(),
             path: None,
@@ -524,6 +527,7 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.extra.clear();
         let Some(t) = self.history.pop_undo() else { return false };
         for e in t.edits.iter().rev() {
             let end = e.pos + e.inserted.chars().count();
@@ -535,6 +539,7 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.extra.clear();
         let Some(t) = self.history.pop_redo() else { return false };
         for e in &t.edits {
             let end = e.pos + e.removed.chars().count();
@@ -631,6 +636,225 @@ impl Buffer {
 
     pub fn move_word_right(&mut self, extend: bool) {
         self.set_cursor(self.word_right(self.sel.head), extend);
+    }
+
+    // ---------- multi-cursor ----------
+
+    pub fn has_multi(&self) -> bool {
+        !self.extra.is_empty()
+    }
+
+    /// All selections, primary first.
+    pub fn selections(&self) -> Vec<Selection> {
+        let mut v = vec![self.sel];
+        v.extend(self.extra.iter().copied());
+        v
+    }
+
+    pub fn clear_extra(&mut self) {
+        self.extra.clear();
+    }
+
+    /// Add a selection and make it primary (Alt+click, Ctrl+D).
+    pub fn add_selection(&mut self, s: Selection) {
+        let len = self.len_chars();
+        let mut s = s;
+        s.clamp(len);
+        let old = self.sel;
+        self.extra.push(old);
+        self.sel = s;
+        self.normalize_selections();
+    }
+
+    /// Replace all selections (first becomes primary).
+    pub fn set_selections(&mut self, sels: Vec<Selection>) {
+        let mut it = sels.into_iter();
+        if let Some(first) = it.next() {
+            self.sel = first;
+            self.extra = it.collect();
+            self.normalize_selections();
+        }
+    }
+
+    /// Sort, clamp and merge overlapping selections, keeping the primary.
+    fn normalize_selections(&mut self) {
+        let len = self.len_chars();
+        self.sel.clamp(len);
+        for s in &mut self.extra {
+            s.clamp(len);
+        }
+        let primary = self.sel;
+        let mut all = self.selections();
+        all.sort_by_key(|s| (s.start(), s.end()));
+        let mut merged: Vec<Selection> = vec![];
+        for s in all {
+            if let Some(last) = merged.last_mut() {
+                let overlap = s.start() < last.end()
+                    || (s.start() == last.end() && (s.is_empty() || last.is_empty()) && s.start() == last.start());
+                if overlap || (s.start() == last.start() && s.end() == last.end()) {
+                    let (a, b) = (last.start().min(s.start()), last.end().max(s.end()));
+                    let forward = last.head >= last.anchor;
+                    *last = if forward { Selection::new(a, b) } else { Selection::new(b, a) };
+                    continue;
+                }
+            }
+            merged.push(s);
+        }
+        let pi = merged
+            .iter()
+            .position(|s| s.start() <= primary.head && primary.head <= s.end())
+            .unwrap_or(merged.len() - 1);
+        self.sel = merged.remove(pi);
+        self.extra = merged;
+    }
+
+    /// Run an editing operation at every cursor as a single undo step.
+    /// Cursors are processed from the end of the document backwards so earlier
+    /// edits don't invalidate later positions.
+    pub fn edit_each(&mut self, mut f: impl FnMut(&mut Buffer)) {
+        if self.extra.is_empty() {
+            f(self);
+            return;
+        }
+        self.normalize_selections();
+        let mut sels: Vec<(Selection, bool)> = vec![(self.sel, true)];
+        sels.extend(self.extra.iter().map(|s| (*s, false)));
+        sels.sort_by_key(|(s, _)| std::cmp::Reverse(s.start()));
+        self.extra.clear();
+        self.history.seal();
+        let before = self.history.undo_len();
+        let mut done: Vec<(Selection, bool)> = vec![];
+        for (s, primary) in sels {
+            let len_before = self.len_chars() as isize;
+            self.sel = s;
+            f(self);
+            let delta = self.len_chars() as isize - len_before;
+            for (d, _) in &mut done {
+                d.anchor = (d.anchor as isize + delta).max(0) as usize;
+                d.head = (d.head as isize + delta).max(0) as usize;
+            }
+            done.push((self.sel, primary));
+            self.history.seal();
+        }
+        let added = self.history.undo_len().saturating_sub(before);
+        self.history.merge_last(added);
+        let primary = done.iter().find(|(_, p)| *p).map(|(s, _)| *s).unwrap_or(self.sel);
+        self.sel = primary;
+        self.extra = done.into_iter().filter(|(_, p)| !p).map(|(s, _)| s).collect();
+        self.normalize_selections();
+        self.history.set_last_sel_after(self.sel);
+    }
+
+    /// Run a movement at every cursor.
+    pub fn move_each(&mut self, mut f: impl FnMut(&mut Buffer)) {
+        if self.extra.is_empty() {
+            f(self);
+            return;
+        }
+        let primary = self.sel;
+        let extras = std::mem::take(&mut self.extra);
+        let mut moved = vec![];
+        for s in extras {
+            self.sel = s;
+            self.preferred_col = None;
+            f(self);
+            moved.push(self.sel);
+        }
+        self.sel = primary;
+        self.preferred_col = None;
+        f(self);
+        self.extra = moved;
+        self.normalize_selections();
+    }
+
+    /// Paste: one line per cursor when the counts match, otherwise everything everywhere.
+    pub fn paste_multi(&mut self, text: &str) {
+        let n = self.extra.len() + 1;
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        if n > 1 && lines.len() == n {
+            // edit_each visits cursors back-to-front: hand out lines from the end.
+            let mut i = lines.len();
+            self.edit_each(|b| {
+                i -= 1;
+                b.insert(lines[i]);
+            });
+        } else {
+            self.edit_each(|b| b.insert(text));
+        }
+    }
+
+    /// Text of all selections joined by newlines (document order).
+    pub fn selected_texts(&self) -> Vec<String> {
+        let mut sels = self.selections();
+        sels.sort_by_key(|s| s.start());
+        sels.iter().map(|s| self.rope.slice(s.range()).to_string()).collect()
+    }
+
+    /// Add a cursor on the line above/below the primary (Ctrl+Alt+Up/Down).
+    pub fn add_cursor_vertical(&mut self, down: bool) {
+        let all = self.selections();
+        let edge = if down { all.iter().max_by_key(|s| s.head) } else { all.iter().min_by_key(|s| s.head) };
+        let Some(edge) = edge.copied() else { return };
+        let pos = self.char_to_pos(edge.head);
+        let target = if down {
+            pos.line + 1
+        } else {
+            match pos.line.checked_sub(1) {
+                Some(l) => l,
+                None => return,
+            }
+        };
+        if target >= self.len_lines() {
+            return;
+        }
+        let idx = self.pos_to_char(Position::new(target, pos.col));
+        self.add_selection(Selection::cursor(idx));
+    }
+
+    /// Ctrl+D: select the word under the caret, or add the next occurrence of the selection.
+    pub fn add_next_occurrence(&mut self) -> bool {
+        if self.sel.is_empty() {
+            if let Some(r) = self.word_under_cursor() {
+                self.sel = Selection::new(r.start, r.end);
+                return true;
+            }
+            return false;
+        }
+        let needle = self.selected_text();
+        let hits =
+            crate::find_all(&self.rope, &needle, crate::SearchOptions { case_sensitive: true, whole_word: false });
+        let taken: Vec<(usize, usize)> = self.selections().iter().map(|s| (s.start(), s.end())).collect();
+        let end = self.sel.end();
+        let next = hits
+            .iter()
+            .filter(|r| !taken.contains(&(r.start, r.end)))
+            .find(|r| r.start >= end)
+            .or_else(|| hits.iter().find(|r| !taken.contains(&(r.start, r.end))));
+        match next {
+            Some(r) => {
+                self.add_selection(Selection::new(r.start, r.end));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Select every occurrence of the selection / word under the caret.
+    pub fn select_all_occurrences(&mut self) {
+        if self.sel.is_empty() {
+            if let Some(r) = self.word_under_cursor() {
+                self.sel = Selection::new(r.start, r.end);
+            } else {
+                return;
+            }
+        }
+        let needle = self.selected_text();
+        let hits =
+            crate::find_all(&self.rope, &needle, crate::SearchOptions { case_sensitive: true, whole_word: false });
+        let primary = self.sel;
+        let mut sels: Vec<Selection> = vec![primary];
+        sels.extend(hits.iter().filter(|r| r.start != primary.start()).map(|r| Selection::new(r.start, r.end)));
+        self.set_selections(sels);
     }
 
     pub fn select_all(&mut self) {
@@ -801,6 +1025,60 @@ mod tests {
         assert_eq!(b.cursor_pos(), Position::new(1, 2));
         b.move_vertical(1, false);
         assert_eq!(b.cursor_pos(), Position::new(2, 5));
+    }
+
+    #[test]
+    fn multi_cursor_typing_and_undo() {
+        let mut b = Buffer::from_str("a\nb\nc");
+        b.set_cursor(0, false);
+        b.add_cursor_vertical(true);
+        b.add_cursor_vertical(true);
+        assert_eq!(b.selections().len(), 3);
+        b.edit_each(|b| b.type_char('-'));
+        assert_eq!(b.text(), "-a\n-b\n-c");
+        b.edit_each(|b| b.backspace());
+        assert_eq!(b.text(), "a\nb\nc");
+        b.edit_each(|b| b.insert("xy"));
+        assert_eq!(b.text(), "xya\nxyb\nxyc");
+        b.undo();
+        assert_eq!(b.text(), "a\nb\nc");
+        assert!(!b.has_multi());
+    }
+
+    #[test]
+    fn ctrl_d_and_select_all_occurrences() {
+        let mut b = Buffer::from_str("foo bar foo baz foo");
+        b.set_cursor(1, false);
+        assert!(b.add_next_occurrence()); // selects word
+        assert!(b.add_next_occurrence());
+        assert_eq!(b.selections().len(), 2);
+        b.edit_each(|b| b.insert("qux"));
+        assert_eq!(b.text(), "qux bar qux baz foo");
+        let mut b = Buffer::from_str("x = x + x");
+        b.select_all_occurrences();
+        assert_eq!(b.selections().len(), 3);
+        b.edit_each(|b| b.insert("y"));
+        assert_eq!(b.text(), "y = y + y");
+    }
+
+    #[test]
+    fn multi_paste_distributes_lines() {
+        let mut b = Buffer::from_str("a\nb");
+        b.set_cursor(1, false);
+        b.add_selection(Selection::cursor(3));
+        b.paste_multi("1\n2");
+        assert_eq!(b.text(), "a1\nb2");
+    }
+
+    #[test]
+    fn move_each_and_merge() {
+        let mut b = Buffer::from_str("abc\nabc");
+        b.set_cursor(1, false);
+        b.add_selection(Selection::cursor(5));
+        b.move_each(|b| b.move_home(false));
+        assert_eq!(b.selections().len(), 2);
+        b.move_each(|b| b.set_cursor(0, false));
+        assert_eq!(b.selections().len(), 1);
     }
 
     #[test]

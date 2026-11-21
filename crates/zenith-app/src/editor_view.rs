@@ -166,22 +166,27 @@ pub fn editor_ui(
                         doc.buffer.pos_to_char(Position::new(line, col))
                     };
                     let shift = ui.input(|i| i.modifiers.shift);
-                    if resp.triple_clicked() {
+                    let alt_held = ui.input(|i| i.modifiers.alt);
+                    if resp.triple_clicked() && !alt_held {
                         let line = doc.buffer.cursor_pos().line;
                         doc.buffer.select_line(line);
-                    } else if resp.double_clicked() {
+                    } else if resp.double_clicked() && !alt_held {
                         let idx = hit(doc, pos);
                         doc.buffer.select_word_at(idx);
                     } else if ui.input(|i| i.pointer.primary_pressed()) && resp.hovered() {
                         let idx = hit(doc, pos);
                         doc.completion = None;
-                        if ui.input(|i| i.modifiers.command) && !in_gutter {
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        if alt && !in_gutter {
+                            doc.buffer.add_selection(Selection::cursor(idx));
+                        } else if ui.input(|i| i.modifiers.command) && !in_gutter {
                             doc.buffer.set_cursor(idx, false);
                             actions.push(EditorAction::GotoDefinition { idx });
                         } else if in_gutter && !shift {
                             let line = doc.buffer.char_to_pos(idx).line;
                             doc.buffer.select_line(line);
                         } else {
+                            doc.buffer.clear_extra();
                             doc.buffer.set_cursor(idx, shift);
                         }
                         ui.memory_mut(|mem| mem.request_focus(id));
@@ -280,7 +285,8 @@ pub fn editor_ui(
 
                 let sel = doc.buffer.sel;
                 let cursor = doc.buffer.cursor_pos();
-                let sel_range = sel.range();
+                let all_ranges: Vec<std::ops::Range<usize>> =
+                    doc.buffer.selections().iter().map(|s| s.range()).collect();
                 let bracket = matching_bracket(doc);
 
                 // First find-match index at or after the first visible char.
@@ -297,7 +303,7 @@ pub fn editor_ui(
                     let line_end = line_start + chars.len();
                     let row = Rect::from_min_size(egui::pos2(clip.min.x, y), egui::vec2(clip.width(), m.line_h));
 
-                    if line == cursor.line && sel.is_empty() {
+                    if line == cursor.line && sel.is_empty() && !doc.buffer.has_multi() {
                         painter.rect_filled(row, 0.0, p.current_line);
                     }
 
@@ -324,8 +330,11 @@ pub fn editor_ui(
                         mi += 1;
                     }
 
-                    // Selection.
-                    if !sel.is_empty() && sel_range.start <= line_end && sel_range.end >= line_start {
+                    // Selections (all cursors).
+                    for sel_range in &all_ranges {
+                        if sel_range.is_empty() || sel_range.start > line_end || sel_range.end < line_start {
+                            continue;
+                        }
                         let a = sel_range.start.max(line_start) - line_start;
                         let b = sel_range.end.min(line_end) - line_start;
                         let mut x1 = x_of(b);
@@ -404,6 +413,21 @@ pub fn editor_ui(
                     let visible = !s.cursor_blink || (t % 1.1) < 0.65;
                     if visible {
                         painter.rect_filled(cursor_rect, 1.0, p.cursor);
+                        for extra in &doc.buffer.extra {
+                            let ep = doc.buffer.char_to_pos(extra.head);
+                            if ep.line < first || ep.line >= last {
+                                continue;
+                            }
+                            let echars = line_chars(doc, ep.line);
+                            let evc = visual_cols(&echars, m.tab);
+                            let ex = text_x + evc[ep.col.min(evc.len() - 1)] as f32 * m.char_w;
+                            let ey = rect.min.y + ep.line as f32 * m.line_h;
+                            painter.rect_filled(
+                                Rect::from_min_size(egui::pos2(ex - 1.0, ey + 2.0), egui::vec2(2.0, m.line_h - 4.0)),
+                                1.0,
+                                p.cursor.gamma_multiply(0.8),
+                            );
+                        }
                     }
                     if s.cursor_blink {
                         let next = 0.55 - (t % 0.55);
@@ -842,8 +866,8 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
             Event::Text(t) => {
                 for c in t.chars() {
                     if !c.is_control() {
-                        doc.buffer.type_char(c);
-                        if !doc.lsp_active {
+                        doc.buffer.edit_each(|b| b.type_char(c));
+                        if !doc.lsp_active || doc.buffer.has_multi() {
                             continue;
                         }
                         let ident = c.is_alphanumeric() || c == '_';
@@ -860,13 +884,26 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
                 moved = true;
             }
             Event::Paste(t) => {
-                doc.buffer.insert(&t);
+                if doc.buffer.has_multi() {
+                    doc.buffer.paste_multi(&t);
+                } else {
+                    doc.buffer.insert(&t);
+                }
                 doc.buffer.seal_history();
                 moved = true;
             }
             Event::Copy | Event::Cut => {
                 let cut = matches!(ev, Event::Cut);
-                if doc.buffer.sel.is_empty() {
+                if doc.buffer.has_multi() {
+                    ui.ctx().copy_text(doc.buffer.selected_texts().join("\n"));
+                    if cut {
+                        doc.buffer.edit_each(|b| {
+                            if !b.sel.is_empty() {
+                                b.backspace()
+                            }
+                        });
+                    }
+                } else if doc.buffer.sel.is_empty() {
                     // VS Code: copy/cut the whole line when nothing is selected.
                     let line = doc.buffer.cursor_pos().line;
                     doc.buffer.select_line(line);
@@ -891,7 +928,7 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
                 moved = true;
             }
             Event::Ime(egui::ImeEvent::Commit(t)) => {
-                doc.buffer.insert(&t);
+                doc.buffer.edit_each(|b| b.insert(&t));
                 moved = true;
             }
             Event::Key { key: Key::Space, pressed: true, modifiers, .. } if modifiers.ctrl => {
@@ -917,7 +954,26 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
 }
 
 fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: isize) -> bool {
+    if let Some(r) = multi_key(doc, key, mods, mac) {
+        return r;
+    }
     let b = &mut doc.buffer;
+    // Multi-cursor creation.
+    match key {
+        Key::ArrowUp if mods.command && mods.alt => {
+            b.add_cursor_vertical(false);
+            return true;
+        }
+        Key::ArrowDown if mods.command && mods.alt => {
+            b.add_cursor_vertical(true);
+            return true;
+        }
+        Key::F2 if mods.command => {
+            b.select_all_occurrences();
+            return true;
+        }
+        _ => {}
+    }
     let shift = mods.shift;
     let cmd = mods.command;
     let word = if mac { mods.alt } else { mods.ctrl };
@@ -1011,26 +1067,45 @@ fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: is
     true
 }
 
-/// Ctrl/Cmd+D: select the word under the caret, then jump to the next match.
+/// Ctrl/Cmd+D: select the word under the caret, then add the next match as another cursor.
 fn select_next_occurrence(doc: &mut Document) {
+    if doc.buffer.add_next_occurrence() {
+        doc.reveal_line = Some(doc.buffer.cursor_pos().line);
+    }
+}
+
+/// Keys handled specially when several cursors are active. Returns None to
+/// fall through to single-cursor handling.
+fn multi_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool) -> Option<bool> {
     let b = &mut doc.buffer;
-    if b.sel.is_empty() {
-        if let Some(r) = b.word_under_cursor() {
-            b.sel = Selection::new(r.start, r.end);
-        }
-        return;
+    if !b.has_multi() {
+        return None;
     }
-    let needle = b.selected_text();
-    let hits = zenith_core::find_all(
-        b.rope(),
-        &needle,
-        zenith_core::SearchOptions { case_sensitive: true, whole_word: false },
-    );
-    let end = b.sel.end();
-    if let Some(next) = hits.iter().find(|r| r.start >= end).or(hits.first()) {
-        b.sel = Selection::new(next.start, next.end);
-        doc.reveal_line = Some(doc.buffer.char_to_pos(next.start).line);
+    let shift = mods.shift;
+    let word = if mac { mods.alt } else { mods.ctrl };
+    let line_mod = mac && mods.mac_cmd;
+    match key {
+        Key::Escape => b.clear_extra(),
+        Key::ArrowLeft if line_mod => b.move_each(|b| b.move_home(shift)),
+        Key::ArrowRight if line_mod => b.move_each(|b| b.move_end(shift)),
+        Key::ArrowLeft if word => b.move_each(|b| b.move_word_left(shift)),
+        Key::ArrowRight if word => b.move_each(|b| b.move_word_right(shift)),
+        Key::ArrowLeft if !mods.alt => b.move_each(|b| b.move_left(shift)),
+        Key::ArrowRight if !mods.alt => b.move_each(|b| b.move_right(shift)),
+        Key::ArrowUp if !mods.alt && !mods.command => b.move_each(|b| b.move_vertical(-1, shift)),
+        Key::ArrowDown if !mods.alt && !mods.command => b.move_each(|b| b.move_vertical(1, shift)),
+        Key::Home => b.move_each(|b| b.move_home(shift)),
+        Key::End => b.move_each(|b| b.move_end(shift)),
+        Key::Backspace if word => b.edit_each(|b| b.delete_word_left()),
+        Key::Backspace => b.edit_each(|b| b.backspace()),
+        Key::Delete if word => b.edit_each(|b| b.delete_word_right()),
+        Key::Delete => b.edit_each(|b| b.delete()),
+        Key::Enter if !mods.command => b.edit_each(|b| b.newline()),
+        Key::Tab if shift => b.edit_each(|b| b.indent_lines(false)),
+        Key::Tab => b.edit_each(|b| b.tab()),
+        _ => return None,
     }
+    Some(true)
 }
 
 fn find_bar(ui: &mut egui::Ui, doc: &mut Document, p: &Palette) {

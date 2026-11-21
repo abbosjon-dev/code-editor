@@ -988,6 +988,7 @@ impl ZenithApp {
                     if self.open_file(&path) {
                         if let Some(doc) = self.docs.get_mut(self.active) {
                             let idx = doc.lsp_to_char(zenith_lsp::LspPos { line, character });
+                            doc.buffer.clear_extra();
                             doc.buffer.set_cursor(idx, false);
                             doc.reveal_line = Some(line as usize);
                         }
@@ -2049,6 +2050,11 @@ impl ZenithApp {
                     let indent =
                         if doc.buffer.use_spaces { format!("Spaces: {}", doc.buffer.tab_size) } else { "Tabs".into() };
                     ui.label(small(indent));
+                    if doc.buffer.has_multi() {
+                        ui.label(
+                            RichText::new(format!("{} cursors", doc.buffer.extra.len() + 1)).size(12.0).color(p.accent),
+                        );
+                    }
                     let sel_len = doc.buffer.sel.range().len();
                     let sel = if sel_len > 0 { format!(" ({sel_len} selected)") } else { String::new() };
                     if ui

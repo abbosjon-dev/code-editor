@@ -271,6 +271,7 @@ impl Document {
     fn select_match(&mut self, idx: usize) {
         if let Some(m) = self.find.matches.get(idx).cloned() {
             self.find.current = idx;
+            self.buffer.clear_extra();
             self.buffer.sel = zenith_core::Selection::new(m.start, m.end);
             self.reveal_line = Some(self.buffer.char_to_pos(m.start).line);
         }
@@ -362,6 +363,7 @@ impl Document {
             return None;
         }
         let head = self.buffer.sel.head;
+        self.buffer.clear_extra();
         let d = self.diagnostics.iter().find(|d| d.start > head).unwrap_or(&self.diagnostics[0]).clone();
         self.buffer.set_cursor(d.start.min(self.buffer.len_chars()), false);
         self.reveal_line = Some(d.line);
@@ -456,6 +458,7 @@ impl Document {
     pub fn goto_line(&mut self, line: usize) {
         let line = line.min(self.buffer.len_lines().saturating_sub(1));
         let idx = self.buffer.pos_to_char(zenith_core::Position::new(line, 0));
+        self.buffer.clear_extra();
         self.buffer.set_cursor(idx, false);
         self.reveal_line = Some(line);
     }

@@ -106,6 +106,10 @@ impl History {
         }
     }
 
+    pub(crate) fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
