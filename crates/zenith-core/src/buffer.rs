@@ -638,6 +638,38 @@ impl Buffer {
         self.set_cursor(self.word_right(self.sel.head), extend);
     }
 
+    /// Apply several (start, end, text) char-range edits — all relative to the
+    /// current text — as one undo step (rename, formatting, plugin edits).
+    pub fn apply_edits(&mut self, mut edits: Vec<(usize, usize, String)>) {
+        if edits.is_empty() {
+            return;
+        }
+        edits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        self.history.seal();
+        let before = self.history.undo_len();
+        let sel_before = self.sel;
+        let head = self.sel.head;
+        let mut new_head = head as isize;
+        self.extra.clear();
+        for (s, e, t) in edits {
+            let len = self.len_chars();
+            let (s, e) = (s.min(len), e.min(len).max(s.min(len)));
+            if e <= head {
+                new_head += t.chars().count() as isize - (e - s) as isize;
+            } else if s < head {
+                new_head = (s + t.chars().count()) as isize;
+            }
+            let edit = self.raw_replace(s, e, &t);
+            self.history.record(edit, sel_before, sel_before, GroupKind::Other);
+        }
+        let added = self.history.undo_len().saturating_sub(before);
+        self.history.merge_last(added);
+        self.sel = Selection::cursor((new_head.max(0) as usize).min(self.len_chars()));
+        self.preferred_col = None;
+        self.history.set_last_sel_after(self.sel);
+        self.history.seal();
+    }
+
     // ---------- multi-cursor ----------
 
     pub fn has_multi(&self) -> bool {
@@ -1079,6 +1111,17 @@ mod tests {
         assert_eq!(b.selections().len(), 2);
         b.move_each(|b| b.set_cursor(0, false));
         assert_eq!(b.selections().len(), 1);
+    }
+
+    #[test]
+    fn apply_edits_single_undo_keeps_cursor() {
+        let mut b = Buffer::from_str("foo + foo + foo");
+        b.set_cursor(14, false); // inside last foo
+        b.apply_edits(vec![(0, 3, "barbaz".into()), (6, 9, "barbaz".into()), (12, 15, "barbaz".into())]);
+        assert_eq!(b.text(), "barbaz + barbaz + barbaz");
+        assert_eq!(b.sel.head, 24);
+        b.undo();
+        assert_eq!(b.text(), "foo + foo + foo");
     }
 
     #[test]

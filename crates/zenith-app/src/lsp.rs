@@ -26,6 +26,9 @@ pub struct LspManager {
 pub enum LspOutcome {
     GotoLocation { path: PathBuf, line: u32, character: u32 },
     Message(String),
+    References { request: u64, locations: Vec<zenith_lsp::Location> },
+    WorkspaceEdit { request: u64, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>, error: Option<String> },
+    Formatting { request: u64, edits: Vec<zenith_lsp::TextEdit> },
 }
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -168,6 +171,27 @@ impl LspManager {
         Some(c.definition(&path, pos))
     }
 
+    pub fn request_references(&mut self, doc: &mut Document, root: Option<&Path>, idx: usize) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        let pos = doc.to_lsp(idx);
+        Some(self.client_for(doc, root)?.references(&path, pos))
+    }
+
+    pub fn request_rename(&mut self, doc: &mut Document, root: Option<&Path>, idx: usize, name: &str) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        let pos = doc.to_lsp(idx);
+        Some(self.client_for(doc, root)?.rename(&path, pos, name))
+    }
+
+    pub fn request_formatting(&mut self, doc: &mut Document, root: Option<&Path>) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        let (tab, spaces) = (doc.buffer.tab_size, doc.buffer.use_spaces);
+        Some(self.client_for(doc, root)?.formatting(&path, tab, spaces))
+    }
+
     /// Route server events into documents.
     pub fn poll(&mut self, docs: &mut [Document], pending_definition: &mut Option<u64>) -> Vec<LspOutcome> {
         let mut out = vec![];
@@ -209,6 +233,11 @@ impl LspManager {
                         }
                     }
                 }
+                LspEvent::References { request, locations } => out.push(LspOutcome::References { request, locations }),
+                LspEvent::WorkspaceEdit { request, edits, error } => {
+                    out.push(LspOutcome::WorkspaceEdit { request, edits, error })
+                }
+                LspEvent::Formatting { request, edits } => out.push(LspOutcome::Formatting { request, edits }),
                 LspEvent::Progress { server, message } => match message {
                     Some(m) => {
                         self.progress.insert(server, m);

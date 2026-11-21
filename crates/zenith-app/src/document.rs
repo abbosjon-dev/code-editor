@@ -349,6 +349,18 @@ impl Document {
         (self.lsp_to_char(r.start), self.lsp_to_char(r.end))
     }
 
+    /// Apply LSP text edits (positions relative to the current text) as one undo step.
+    pub fn apply_lsp_edits(&mut self, edits: &[zenith_lsp::TextEdit]) {
+        let converted: Vec<(usize, usize, String)> = edits
+            .iter()
+            .map(|e| {
+                let (a, b) = self.range_from_lsp(e.range);
+                (a, b, e.new_text.replace("\r\n", "\n"))
+            })
+            .collect();
+        self.buffer.apply_edits(converted);
+    }
+
     pub fn set_diagnostics(&mut self, diags: Vec<zenith_lsp::Diagnostic>) {
         let mut out: Vec<DocDiagnostic> = diags
             .into_iter()
@@ -384,6 +396,25 @@ impl Document {
         self.buffer.set_cursor(d.start.min(self.buffer.len_chars()), false);
         self.reveal_line = Some(d.line);
         Some(d.message)
+    }
+
+    /// Identifier around a char index.
+    pub fn word_range_at(&self, idx: usize) -> Option<std::ops::Range<usize>> {
+        let rope = self.buffer.rope();
+        let len = rope.len_chars();
+        let is_w = |i: usize| i < len && (rope.char(i).is_alphanumeric() || rope.char(i) == '_');
+        if !is_w(idx) && !(idx > 0 && is_w(idx - 1)) {
+            return None;
+        }
+        let mut s = idx;
+        while s > 0 && is_w(s - 1) {
+            s -= 1;
+        }
+        let mut e = idx;
+        while is_w(e) {
+            e += 1;
+        }
+        Some(s..e)
     }
 
     /// Start of the identifier ending at the caret.

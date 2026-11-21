@@ -157,6 +157,12 @@ impl CompletionItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TextEdit {
+    pub range: LspRange,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Location {
     pub path: PathBuf,
     pub range: LspRange,
@@ -164,14 +170,52 @@ pub struct Location {
 
 #[derive(Debug, Clone)]
 pub enum LspEvent {
-    Diagnostics { server: String, path: PathBuf, diagnostics: Vec<Diagnostic> },
-    Completion { request: u64, items: Vec<CompletionItem> },
-    Hover { request: u64, text: String },
-    Definition { request: u64, locations: Vec<Location> },
-    Progress { server: String, message: Option<String> },
-    Ready { server: String },
-    Exited { server: String },
-    Log { server: String, message: String },
+    Diagnostics {
+        server: String,
+        path: PathBuf,
+        diagnostics: Vec<Diagnostic>,
+    },
+    Completion {
+        request: u64,
+        items: Vec<CompletionItem>,
+    },
+    Hover {
+        request: u64,
+        text: String,
+    },
+    Definition {
+        request: u64,
+        locations: Vec<Location>,
+    },
+    References {
+        request: u64,
+        locations: Vec<Location>,
+    },
+    /// Edits grouped per file (rename).
+    WorkspaceEdit {
+        request: u64,
+        edits: Vec<(PathBuf, Vec<TextEdit>)>,
+        error: Option<String>,
+    },
+    /// Edits for the requested document (formatting).
+    Formatting {
+        request: u64,
+        edits: Vec<TextEdit>,
+    },
+    Progress {
+        server: String,
+        message: Option<String>,
+    },
+    Ready {
+        server: String,
+    },
+    Exited {
+        server: String,
+    },
+    Log {
+        server: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -180,6 +224,9 @@ enum Pending {
     Completion,
     Hover,
     Definition,
+    References,
+    Rename,
+    Formatting,
     Other,
 }
 
@@ -277,7 +324,10 @@ impl LspClient {
                             "contextSupport": true
                         },
                         "hover": { "contentFormat": ["plaintext", "markdown"] },
-                        "definition": { "linkSupport": true }
+                        "definition": { "linkSupport": true },
+                        "references": {},
+                        "rename": { "prepareSupport": false },
+                        "formatting": {}
                     }
                 }
             }
@@ -366,6 +416,26 @@ impl LspClient {
 
     pub fn definition(&mut self, path: &Path, pos: LspPos) -> u64 {
         self.request("textDocument/definition", Self::doc_pos(path, pos), Pending::Definition)
+    }
+
+    pub fn references(&mut self, path: &Path, pos: LspPos) -> u64 {
+        let mut params = Self::doc_pos(path, pos);
+        params["context"] = json!({ "includeDeclaration": true });
+        self.request("textDocument/references", params, Pending::References)
+    }
+
+    pub fn rename(&mut self, path: &Path, pos: LspPos, new_name: &str) -> u64 {
+        let mut params = Self::doc_pos(path, pos);
+        params["newName"] = json!(new_name);
+        self.request("textDocument/rename", params, Pending::Rename)
+    }
+
+    pub fn formatting(&mut self, path: &Path, tab_size: usize, insert_spaces: bool) -> u64 {
+        let params = json!({
+            "textDocument": { "uri": text::path_to_uri(path) },
+            "options": { "tabSize": tab_size, "insertSpaces": insert_spaces, "trimTrailingWhitespace": true, "insertFinalNewline": true }
+        });
+        self.request("textDocument/formatting", params, Pending::Formatting)
     }
 
     pub fn shutdown(&mut self) {
@@ -473,6 +543,16 @@ fn handle_message(
                 Some(Pending::Definition) => {
                     out.push(LspEvent::Definition { request: id, locations: parse_locations(&result) });
                 }
+                Some(Pending::References) => {
+                    out.push(LspEvent::References { request: id, locations: parse_locations(&result) });
+                }
+                Some(Pending::Rename) => {
+                    let error = msg.get("error").and_then(|e| e["message"].as_str()).map(str::to_string);
+                    out.push(LspEvent::WorkspaceEdit { request: id, edits: parse_workspace_edit(&result), error });
+                }
+                Some(Pending::Formatting) => {
+                    out.push(LspEvent::Formatting { request: id, edits: parse_text_edits(&result) });
+                }
                 Some(Pending::Other) | None => {}
             }
         }
@@ -563,9 +643,100 @@ pub(crate) fn parse_locations(result: &Value) -> Vec<Location> {
         .collect()
 }
 
+pub(crate) fn parse_text_edits(v: &Value) -> Vec<TextEdit> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    Some(TextEdit { range: parse_range(&e["range"])?, new_text: e["newText"].as_str()?.to_string() })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a WorkspaceEdit (`changes` map or `documentChanges` list).
+pub(crate) fn parse_workspace_edit(v: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
+    let mut out = vec![];
+    if let Some(changes) = v["changes"].as_object() {
+        for (uri, edits) in changes {
+            if let Some(p) = text::uri_to_path(uri) {
+                out.push((p, parse_text_edits(edits)));
+            }
+        }
+    }
+    if let Some(dc) = v["documentChanges"].as_array() {
+        for d in dc {
+            if let Some(p) = d["textDocument"]["uri"].as_str().and_then(text::uri_to_path) {
+                out.push((p, parse_text_edits(&d["edits"])));
+            }
+        }
+    }
+    out
+}
+
+/// Apply LSP text edits (UTF-16 positions) to a string.
+pub fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
+    // Byte offset of each line start.
+    let mut line_starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let offset = |p: LspPos| -> usize {
+        let Some(&start) = line_starts.get(p.line as usize) else { return text.len() };
+        let end = line_starts.get(p.line as usize + 1).copied().unwrap_or(text.len());
+        let line = &text[start..end];
+        let mut units = 0u32;
+        for (i, c) in line.char_indices() {
+            if units >= p.character || c == '\n' {
+                return start + i;
+            }
+            units += c.len_utf16() as u32;
+        }
+        end
+    };
+    let mut resolved: Vec<(usize, usize, &str)> =
+        edits.iter().map(|e| (offset(e.range.start), offset(e.range.end), e.new_text.as_str())).collect();
+    resolved.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let mut out = text.to_string();
+    for (s, e, t) in resolved {
+        if s <= e && e <= out.len() {
+            out.replace_range(s..e, t);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applies_edits_with_utf16() {
+        let text = "let 😀x = 1;\nx + x\n";
+        let pos = |l, c| LspPos { line: l, character: c };
+        let edits = vec![
+            TextEdit { range: LspRange { start: pos(0, 6), end: pos(0, 7) }, new_text: "y".into() },
+            TextEdit { range: LspRange { start: pos(1, 0), end: pos(1, 1) }, new_text: "y".into() },
+            TextEdit { range: LspRange { start: pos(1, 4), end: pos(1, 5) }, new_text: "y".into() },
+        ];
+        assert_eq!(apply_text_edits(text, &edits), "let 😀y = 1;\ny + y\n");
+    }
+
+    #[test]
+    fn parses_workspace_edit_forms() {
+        let uri = text::path_to_uri(&std::env::temp_dir().join("w.rs"));
+        let e =
+            json!({ "range": { "start": {"line":0,"character":0}, "end": {"line":0,"character":1} }, "newText": "z" });
+        let a = parse_workspace_edit(&json!({ "changes": { uri.clone(): [e.clone()] } }));
+        let b = parse_workspace_edit(
+            &json!({ "documentChanges": [{ "textDocument": { "uri": uri, "version": 1 }, "edits": [e] }] }),
+        );
+        assert_eq!(a, b);
+        assert_eq!(a[0].1[0].new_text, "z");
+    }
 
     #[test]
     fn parses_completion_list_with_snippets() {

@@ -45,6 +45,9 @@ pub enum Cmd {
     RestartLanguageServers,
     SplitEditor,
     FocusOtherPane,
+    RenameSymbol,
+    FindReferences,
+    FormatDocument,
     About,
     Quit,
 }
@@ -96,6 +99,9 @@ impl Cmd {
             RestartLanguageServers,
             SplitEditor,
             FocusOtherPane,
+            RenameSymbol,
+            FindReferences,
+            FormatDocument,
             About,
             Quit,
         ]
@@ -105,6 +111,9 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            RenameSymbol => "Edit: Rename Symbol",
+            FindReferences => "Go: Find All References",
+            FormatDocument => "Edit: Format Document",
             SplitEditor => "View: Split Editor (toggle)",
             FocusOtherPane => "View: Focus Other Editor Pane",
             ShowSourceControl => "View: Show Source Control",
@@ -192,6 +201,9 @@ impl Cmd {
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
             GotoDefinition => "F12",
+            RenameSymbol => "F2",
+            FindReferences => "Shift+F12",
+            FormatDocument => k!("⇧⌥F", "Shift+Alt+F"),
             SplitEditor => k!("⌘\\", "Ctrl+\\"),
             FocusOtherPane => k!("⌃⌥\\", "Ctrl+Alt+\\"),
             ShowSourceControl => k!("⌃⇧G", "Ctrl+Shift+G"),

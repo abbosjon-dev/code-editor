@@ -47,6 +47,8 @@ enum InputKind {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
+    /// Rename the symbol at this char index (LSP).
+    RenameSymbol(usize),
 }
 
 enum Dialog {
@@ -121,6 +123,12 @@ pub struct ZenithApp {
     pending_sends: Vec<PendingSend>,
     lsp: LspManager,
     pending_definition: Option<u64>,
+    pending_references: Option<(u64, String)>,
+    pending_rename: Option<u64>,
+    /// formatting request -> (document id, save afterwards)
+    pending_format: HashMap<u64, (u64, bool)>,
+    /// Set while saving the result of format-on-save (avoids a loop).
+    saving_formatted: bool,
     last_session_save: Instant,
     style_dirty: bool,
     focus_editor: bool,
@@ -188,6 +196,10 @@ impl ZenithApp {
             pending_sends: vec![],
             lsp: LspManager::new(&settings_lsp.0, settings_lsp.1, waker_lsp),
             pending_definition: None,
+            pending_references: None,
+            pending_rename: None,
+            pending_format: HashMap::new(),
+            saving_formatted: false,
             last_session_save: Instant::now(),
             style_dirty: false,
             focus_editor: false,
@@ -359,6 +371,12 @@ impl ZenithApp {
                     if let Some(doc) = self.docs.get_mut(idx) {
                         self.lsp.sync(doc, root.as_deref(), true);
                         self.lsp.did_save(doc, root.as_deref());
+                        if self.settings.format_on_save && !self.saving_formatted && doc.lsp_active {
+                            let id = doc.id;
+                            if let Some(req) = self.lsp.request_formatting(doc, root.as_deref()) {
+                                self.pending_format.insert(req, (id, true));
+                            }
+                        }
                     }
                 }
                 true
@@ -880,6 +898,41 @@ impl ZenithApp {
                     self.focus_editor = true;
                 }
             }
+            Cmd::RenameSymbol | Cmd::FindReferences | Cmd::FormatDocument => {
+                let root = self.workspace.clone();
+                let Some(doc) = self.docs.get_mut(self.active) else { return };
+                if !doc.lsp_active {
+                    self.toast("No language server for this file", NotifyLevel::Info);
+                    return;
+                }
+                let idx = doc.buffer.sel.head;
+                let word = doc.word_range_at(idx).map(|r| doc.buffer.rope().slice(r).to_string()).unwrap_or_default();
+                match cmd {
+                    Cmd::RenameSymbol => {
+                        if word.is_empty() {
+                            self.toast("Place the cursor on a symbol to rename", NotifyLevel::Info);
+                        } else {
+                            self.dialog = Some(Dialog::Input {
+                                title: format!("Rename `{word}`"),
+                                value: word,
+                                kind: InputKind::RenameSymbol(idx),
+                                focus: true,
+                            });
+                        }
+                    }
+                    Cmd::FindReferences => {
+                        if let Some(r) = self.lsp.request_references(doc, root.as_deref(), idx) {
+                            self.pending_references = Some((r, word));
+                        }
+                    }
+                    _ => {
+                        let id = doc.id;
+                        if let Some(r) = self.lsp.request_formatting(doc, root.as_deref()) {
+                            self.pending_format.insert(r, (id, false));
+                        }
+                    }
+                }
+            }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -1029,6 +1082,34 @@ impl ZenithApp {
                     }
                 }
                 LspOutcome::Message(m) => self.toast(m, NotifyLevel::Info),
+                LspOutcome::References { request, locations } => {
+                    if self.pending_references.as_ref().is_some_and(|(r, _)| *r == request) {
+                        let (_, name) = self.pending_references.take().unwrap();
+                        self.show_references(name, locations);
+                    }
+                }
+                LspOutcome::WorkspaceEdit { request, edits, error } => {
+                    if self.pending_rename == Some(request) {
+                        self.pending_rename = None;
+                        match error {
+                            Some(e) => self.toast(format!("Rename failed: {e}"), NotifyLevel::Error),
+                            None => self.apply_workspace_edit(edits),
+                        }
+                    }
+                }
+                LspOutcome::Formatting { request, edits } => {
+                    if let Some((doc_id, save)) = self.pending_format.remove(&request) {
+                        if let Some(i) = self.docs.iter().position(|d| d.id == doc_id) {
+                            let changed = !edits.is_empty();
+                            self.docs[i].apply_lsp_edits(&edits);
+                            if save && changed {
+                                self.saving_formatted = true;
+                                self.save_doc(i, false);
+                                self.saving_formatted = false;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1263,6 +1344,64 @@ impl ZenithApp {
         let _ = ctx;
     }
 
+    /// Apply a rename: open documents are edited in their buffers (undoable),
+    /// other files are rewritten on disk.
+    fn apply_workspace_edit(&mut self, edits: Vec<(PathBuf, Vec<zenith_lsp::TextEdit>)>) {
+        let mut files = 0;
+        let mut total = 0;
+        for (path, file_edits) in edits {
+            if file_edits.is_empty() {
+                continue;
+            }
+            files += 1;
+            total += file_edits.len();
+            let canon = path.canonicalize().unwrap_or(path.clone());
+            if let Some(doc) = self.docs.iter_mut().find(|d| d.path() == Some(canon.as_path())) {
+                doc.apply_lsp_edits(&file_edits);
+            } else {
+                let res = std::fs::read_to_string(&path)
+                    .and_then(|t| std::fs::write(&path, zenith_lsp::apply_text_edits(&t, &file_edits)));
+                if let Err(e) = res {
+                    self.toast(format!("{}: {e}", path.display()), NotifyLevel::Error);
+                }
+            }
+        }
+        if total == 0 {
+            self.toast("Nothing to rename here", NotifyLevel::Info);
+        } else {
+            self.toast(format!("Renamed {total} occurrence(s) in {files} file(s)"), NotifyLevel::Info);
+        }
+    }
+
+    /// Show reference locations in the Search panel.
+    fn show_references(&mut self, name: String, locations: Vec<zenith_lsp::Location>) {
+        let mut hits = vec![];
+        for l in &locations {
+            let line = l.range.start.line as usize;
+            let canon = l.path.canonicalize().unwrap_or(l.path.clone());
+            let text = match self.docs.iter().find(|d| d.path() == Some(canon.as_path())) {
+                Some(d) => d.buffer.line_text(line),
+                None => std::fs::read_to_string(&l.path)
+                    .ok()
+                    .and_then(|t| t.lines().nth(line).map(str::to_string))
+                    .unwrap_or_default(),
+            };
+            hits.push(SearchHit {
+                rel: self.rel_path(&canon),
+                path: canon,
+                line,
+                text: text.trim().chars().take(200).collect(),
+            });
+        }
+        hits.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
+        self.toast(format!("{} reference(s) to `{name}`", hits.len()), NotifyLevel::Info);
+        self.search.job = None;
+        self.search.query = name;
+        self.search.results = hits;
+        self.sidebar = SidebarView::Search;
+        self.show_sidebar = true;
+    }
+
     fn goto_definition(&mut self, idx: usize) {
         let root = self.workspace.clone();
         let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -1297,6 +1436,9 @@ impl ZenithApp {
             (cs, Key::I, Cmd::AskAgent, true),
             (cs, Key::E, Cmd::ShowExplorer, true),
             (cs, Key::G, Cmd::ShowSourceControl, true),
+            (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
+            (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
+            (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
             (cs, Key::Backtick, Cmd::NewTerminal, true),
             (ctrl | Modifiers::SHIFT, Key::Tab, Cmd::PrevTab, false),
             (ctrl, Key::Tab, Cmd::NextTab, false),
@@ -1613,23 +1755,29 @@ impl ZenithApp {
             return;
         };
         let mut start = false;
-        ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.search.query)
-                    .hint_text("Search")
-                    .desired_width(ui.available_width() - 40.0),
-            );
-            if self.search.focus {
-                r.request_focus();
-                self.search.focus = false;
-            }
-            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                start = true;
-            }
-            if ui.toggle_value(&mut self.search.case_sensitive, "Aa").on_hover_text("Match case").changed() {
-                start = true;
-            }
-        });
+        // Right-to-left so the text field takes exactly the remaining width
+        // (otherwise the panel grows a little every frame).
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 28.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                if ui.toggle_value(&mut self.search.case_sensitive, "Aa").on_hover_text("Match case").changed() {
+                    start = true;
+                }
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.search.query)
+                        .hint_text("Search")
+                        .desired_width(ui.available_width()),
+                );
+                if self.search.focus {
+                    r.request_focus();
+                    self.search.focus = false;
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    start = true;
+                }
+            },
+        );
         if start && !self.search.query.is_empty() {
             self.search.results.clear();
             self.search.job = Some(SearchJob::start(&root, &self.search.query, self.search.case_sensitive));
@@ -2081,6 +2229,7 @@ impl ZenithApp {
                     }
                 }
                 EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
+                EditorAction::Run(cmd) => self.run(ctx, cmd),
             }
         }
     }
@@ -2570,6 +2719,13 @@ impl ZenithApp {
                 })
             }
             InputKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(&name)),
+            InputKind::RenameSymbol(idx) => {
+                let root = self.workspace.clone();
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    self.pending_rename = self.lsp.request_rename(doc, root.as_deref(), *idx, &name);
+                }
+                return;
+            }
             InputKind::Rename(path) => {
                 let target = path.with_file_name(&name);
                 std::fs::rename(path, &target).map(|_| {

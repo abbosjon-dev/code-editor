@@ -33,6 +33,8 @@ pub struct Settings {
     pub lsp_enabled: bool,
     /// Keep the previous version when a file changes on disk (e.g. edited by an AI agent) so it can be reviewed and reverted.
     pub review_external_changes: bool,
+    /// Format files with the language server when saving.
+    pub format_on_save: bool,
     /// Extra / overridden language servers (same `name` overrides a built-in).
     pub language_servers: Vec<zenith_lsp::ServerConfig>,
 }
@@ -58,6 +60,7 @@ impl Default for Settings {
             agents: vec![],
             lsp_enabled: true,
             review_external_changes: true,
+            format_on_save: false,
             language_servers: vec![],
         }
     }

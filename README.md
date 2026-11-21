@@ -15,7 +15,7 @@ macOS, Windows va Linux'da ishlaydi.
 | 🧩 **Pluginlar** | Plugin — istalgan tildagi dastur (Python, JS, Go, Rust…). Alohida jarayonda ishlaydi, shuning uchun plugin xatosi editorni hech qachon qotirmaydi yoki buzmaydi. [Qo'llanma →](docs/PLUGINS.md) |
 | ⌨ **Terminal** | To'liq terminal emulyatori (PTY: Unix'da openpty, Windows'da ConPTY), 256/truecolor, scrollback, sichqoncha, nusxa olish, bir nechta tab. |
 | 📝 **Muharrir** | **Multi-cursor** (Ctrl+D, Alt+bosish, Ctrl+Alt+↑↓), **split editor** (`Ctrl+\`), sintaksis ranglash (~200 til), avtomatik qavs yopish, aqlli indent, bir nechta tab, undo/redo, qidirish va almashtirish, minimap, indent chiziqlari, qavs juftini ko'rsatish, qatorni ko'chirish/nusxalash, izoh qo'yish. |
-| 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`). O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
+| 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`), havolalarni topish (`Shift+F12`), nomni hamma joyda o'zgartirish (`F2`), formatlash (`Shift+Alt+F`, ixtiyoriy saqlashda formatlash). O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
 | ⎇ **Git** | Gutter'da o'zgarish belgilari (qo'shilgan / o'zgargan / o'chirilgan), Source Control paneli (`Ctrl+Shift+G`): stage/unstage, commit (`Ctrl+Enter`), push/pull, fayl daraxtida rangli holat. **✳ Commit with AI** — agent diff'ni ko'rib, commit'ni o'zi yozadi. |
 | 🔍 **Navigatsiya** | Buyruqlar palitrasi (`Ctrl+Shift+P`), fuzzy fayl qidirish (`Ctrl+P`), fayllar ichida qidirish (`Ctrl+Shift+F`, `.gitignore`'ni hisobga oladi), qatorga o'tish. |
 | 🎨 **Chiroyli UI** | Zenith Midnight (qorong'i) va Daylight (yorug') temalari, 30+ sintaksis temasi, JetBrains Mono + Inter shriftlari. |
@@ -85,6 +85,8 @@ Holatni **Plugins** panelidagi *Language servers* bo'limida ko'rasiz (o'rnatilma
 | Go | gopls | `go install golang.org/x/tools/gopls@latest` |
 | C / C++ | clangd | paket menejeri orqali |
 
+Saqlashda avtomatik formatlash: `settings.toml` da `format_on_save = true`.
+
 Boshqa server qo'shish (`settings.toml`):
 
 ```toml
@@ -119,6 +121,9 @@ shuning uchun terminal yoki AI agent bilan bir vaqtda ishlaganda `index.lock` to
 | Avtomatik to'ldirish | `Ctrl+Space` | `⌃Space` |
 | Ta'rifga o'tish | `F12` / `Ctrl+bosish` | `F12` / `⌘+bosish` |
 | Keyingi xato | `F8` | `F8` |
+| Havolalarni topish | `Shift+F12` | `⇧F12` |
+| Nomni o'zgartirish (rename) | `F2` | `F2` |
+| Formatlash | `Shift+Alt+F` | `⇧⌥F` |
 | Izoh qo'yish/olib tashlash | `Ctrl+/` | `⌘/` |
 | Qatorni ko'chirish / nusxalash | `Alt+↑↓` / `Alt+Shift+↑↓` | `⌥↑↓` / `⌥⇧↑↓` |
 | Keyingi moslikka kursor qo'shish | `Ctrl+D` | `⌘D` |

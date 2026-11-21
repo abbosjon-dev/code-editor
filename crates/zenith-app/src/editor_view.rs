@@ -31,6 +31,8 @@ pub enum EditorAction {
     GotoDefinition {
         idx: usize,
     },
+    /// Run an app command (from the context menu).
+    Run(crate::commands::Cmd),
 }
 
 struct Metrics {
@@ -259,6 +261,21 @@ pub fn editor_ui(
                         let t = doc.comment_token();
                         doc.buffer.toggle_comment(t);
                         ui.close_menu();
+                    }
+                    if doc.lsp_active {
+                        ui.separator();
+                        use crate::commands::Cmd;
+                        for (label, cmd) in [
+                            ("Go to Definition", Cmd::GotoDefinition),
+                            ("Find All References", Cmd::FindReferences),
+                            ("Rename Symbol", Cmd::RenameSymbol),
+                            ("Format Document", Cmd::FormatDocument),
+                        ] {
+                            if ui.add(egui::Button::new(label).shortcut_text(cmd.shortcut())).clicked() {
+                                actions.push(EditorAction::Run(cmd));
+                                ui.close_menu();
+                            }
+                        }
                     }
                     ui.separator();
                     if ui.button("✳ Send Selection to AI Agent").clicked() {

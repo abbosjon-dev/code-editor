@@ -40,7 +40,8 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 
 **v0.2**
 - [ ] Ustun bo'yicha (blok) belgilash: Shift+Alt+sudrash
-- [ ] LSP: rename, find references, format on save, signature help, code actions
+- [x] LSP: rename, find references, formatting / format on save
+- [ ] LSP: signature help, code actions (quick fix), inlay hints
 - [ ] Git: yonma-yon diff ko'rinishi, branch almashtirish, hunk'ni qaytarish (revert)
 
 **v0.3**
