@@ -73,6 +73,11 @@ pub struct Document {
     /// Characters that trigger completion for this language.
     pub lsp_triggers: Vec<char>,
     pub lsp_active: bool,
+    // --- git ---
+    /// File content at HEAD (None = untracked or not in a repo).
+    pub git_base: Option<String>,
+    pub git_hunks: crate::git::Hunks,
+    git_hunks_version: Option<u64>,
 }
 
 impl Document {
@@ -116,6 +121,9 @@ impl Document {
             lsp_sent_at: None,
             lsp_triggers: vec![],
             lsp_active: false,
+            git_base: None,
+            git_hunks: vec![],
+            git_hunks_version: None,
         }
     }
 
@@ -197,6 +205,25 @@ impl Document {
             self.highlight.invalidate_from(line);
         }
         self.update_find();
+    }
+
+    pub fn set_git_base(&mut self, base: Option<String>) {
+        self.git_base = base.map(|b| b.replace("\r\n", "\n"));
+        self.git_hunks_version = None;
+        self.git_hunks.clear();
+    }
+
+    /// Recompute gutter change markers when the text changed (debounced by the caller's frame rate).
+    pub fn update_git_hunks(&mut self) {
+        let v = self.buffer.version();
+        if self.git_hunks_version == Some(v) {
+            return;
+        }
+        self.git_hunks_version = Some(v);
+        self.git_hunks = match &self.git_base {
+            Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
+            _ => vec![],
+        };
     }
 
     pub fn longest_line_chars(&mut self) -> usize {

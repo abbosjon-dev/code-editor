@@ -429,6 +429,33 @@ pub fn editor_ui(
                 );
                 painter.rect_filled(gutter, 0.0, p.bg);
                 let num_font = FontId::monospace(s.editor_font_size * 0.86);
+                for &(a, b, kind) in &doc.git_hunks {
+                    if b <= first || a >= last {
+                        continue;
+                    }
+                    let x = clip.min.x + gutter_w - 6.0;
+                    let color = match kind {
+                        crate::git::LineChange::Added => p.success,
+                        crate::git::LineChange::Modified => p.accent,
+                        crate::git::LineChange::Deleted => p.error,
+                    };
+                    if kind == crate::git::LineChange::Deleted {
+                        let y = rect.min.y + a as f32 * m.line_h;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![egui::pos2(x - 1.0, y - 4.0), egui::pos2(x + 4.0, y), egui::pos2(x - 1.0, y + 4.0)],
+                            color,
+                            Stroke::NONE,
+                        ));
+                    } else {
+                        let y0 = rect.min.y + a.max(first) as f32 * m.line_h;
+                        let y1 = rect.min.y + b.min(last) as f32 * m.line_h;
+                        painter.rect_filled(
+                            Rect::from_min_max(egui::pos2(x, y0 + 1.0), egui::pos2(x + 3.0, y1 - 1.0)),
+                            1.0,
+                            color,
+                        );
+                    }
+                }
                 for d in doc.diagnostics.iter().rev() {
                     if d.line >= first && d.line < last && d.severity <= Severity::Warning {
                         let y = rect.min.y + d.line as f32 * m.line_h + m.line_h / 2.0;

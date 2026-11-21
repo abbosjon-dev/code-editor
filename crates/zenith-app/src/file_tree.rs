@@ -29,6 +29,10 @@ pub struct FileTree {
     expanded: HashSet<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
     pub selected: Option<PathBuf>,
+    /// Git status letter per changed file ('M', 'U', 'A', 'D', ...).
+    pub git: HashMap<PathBuf, char>,
+    /// Folders that contain changed files.
+    git_dirs: HashSet<PathBuf>,
 }
 
 const HIDDEN: &[&str] = &[".git", ".DS_Store", "Thumbs.db"];
@@ -37,7 +41,21 @@ impl FileTree {
     pub fn new(root: PathBuf) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
-        Self { root, expanded, cache: HashMap::new(), selected: None }
+        Self { root, expanded, cache: HashMap::new(), selected: None, git: HashMap::new(), git_dirs: HashSet::new() }
+    }
+
+    pub fn set_git_status(&mut self, status: HashMap<PathBuf, char>) {
+        self.git_dirs.clear();
+        for path in status.keys() {
+            let mut cur = path.parent();
+            while let Some(d) = cur {
+                if !self.git_dirs.insert(d.to_path_buf()) || !d.starts_with(&self.root) {
+                    break;
+                }
+                cur = d.parent();
+            }
+        }
+        self.git = status;
     }
 
     pub fn refresh(&mut self) {
@@ -164,19 +182,38 @@ impl FileTree {
                     color,
                 );
             }
-            let text_rect = Rect::from_min_max(egui::pos2(x + 32.0, rect.min.y), rect.max);
+            let git = self.git.get(&entry.path).copied();
+            let git_color = |c: char| match c {
+                'U' | 'A' => p.success,
+                'D' => p.error,
+                _ => p.warning,
+            };
+            let mut text_rect = Rect::from_min_max(egui::pos2(x + 32.0, rect.min.y), rect.max);
+            if let Some(letter) = git {
+                ui.painter().text(
+                    egui::pos2(rect.max.x - 10.0, cy),
+                    Align2::RIGHT_CENTER,
+                    letter.to_string(),
+                    FontId::monospace(11.0),
+                    git_color(letter),
+                );
+                text_rect.max.x -= 22.0;
+            }
+            let name_color = if let Some(letter) = git {
+                git_color(letter)
+            } else if entry.is_dir && self.git_dirs.contains(&entry.path) {
+                p.warning.gamma_multiply(0.85)
+            } else if entry.name.starts_with('.') {
+                p.text_dim
+            } else {
+                p.text
+            };
             ui.painter().with_clip_rect(text_rect).text(
                 egui::pos2(text_rect.min.x, cy),
                 Align2::LEFT_CENTER,
                 &entry.name,
                 font,
-                if is_active {
-                    p.text
-                } else if entry.name.starts_with('.') {
-                    p.text_dim
-                } else {
-                    p.text
-                },
+                name_color,
             );
 
             if resp.clicked() {

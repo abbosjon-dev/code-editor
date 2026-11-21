@@ -137,13 +137,3 @@ impl Drop for SearchJob {
         self.cancel.store(true, Ordering::Relaxed);
     }
 }
-
-/// Current git branch, read straight from `.git/HEAD` (no git binary needed).
-pub fn git_branch(root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
-    let head = head.trim();
-    Some(match head.strip_prefix("ref: refs/heads/") {
-        Some(b) => b.to_string(),
-        None => head.chars().take(7).collect(),
-    })
-}

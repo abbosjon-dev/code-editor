@@ -38,6 +38,7 @@ pub enum Cmd {
     ShowPlugins,
     ShowExplorer,
     ShowAgents,
+    ShowSourceControl,
     ReloadFile,
     GotoDefinition,
     NextProblem,
@@ -86,6 +87,7 @@ impl Cmd {
             ShowPlugins,
             ShowExplorer,
             ShowAgents,
+            ShowSourceControl,
             ReloadFile,
             GotoDefinition,
             NextProblem,
@@ -99,6 +101,7 @@ impl Cmd {
         use Cmd::*;
         match self {
             NewFile => "File: New File",
+            ShowSourceControl => "View: Show Source Control",
             GotoDefinition => "Go: Go to Definition",
             NextProblem => "Go: Next Problem",
             RestartLanguageServers => "Language Servers: Restart",
@@ -183,6 +186,7 @@ impl Cmd {
             SendSelectionToAgent => k!("⌘⇧L", "Ctrl+Shift+L"),
             Quit => k!("⌘Q", "Ctrl+Q"),
             GotoDefinition => "F12",
+            ShowSourceControl => k!("⌃⇧G", "Ctrl+Shift+G"),
             NextProblem => "F8",
             _ => "",
         }

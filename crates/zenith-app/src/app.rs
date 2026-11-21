@@ -17,13 +17,14 @@ use crate::commands::Cmd;
 use crate::document::Document;
 use crate::editor_view::{editor_ui, EditorAction};
 use crate::file_tree::{FileTree, TreeAction};
+use crate::git::Git;
 use crate::highlight;
 use crate::lsp::{LspManager, LspOutcome};
 use crate::palette::{command_items, CommandPalette, Item, Mode, PaletteAction};
 use crate::settings::{self, Session, Settings};
 use crate::terminal_view::{terminal_ui, TermEvent, TermKind, TermTab};
 use crate::theme::{self, Palette};
-use crate::workspace::{git_branch, FileIndex, SearchHit, SearchJob};
+use crate::workspace::{FileIndex, SearchHit, SearchJob};
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -31,6 +32,7 @@ type Waker = Arc<dyn Fn() + Send + Sync>;
 enum SidebarView {
     Explorer,
     Search,
+    Git,
     Agents,
     Plugins,
 }
@@ -92,7 +94,8 @@ pub struct ZenithApp {
     workspace: Option<PathBuf>,
     tree: Option<FileTree>,
     index: FileIndex,
-    branch: Option<String>,
+    git: Option<Git>,
+    commit_message: String,
     docs: Vec<Document>,
     active: usize,
     next_id: u64,
@@ -152,7 +155,8 @@ impl ZenithApp {
             workspace: None,
             tree: None,
             index: FileIndex::empty(),
-            branch: None,
+            git: None,
+            commit_message: String::new(),
             docs: vec![],
             active: 0,
             next_id: 1,
@@ -229,7 +233,7 @@ impl ZenithApp {
     fn open_workspace(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
         self.index = FileIndex::build(&path);
-        self.branch = git_branch(&path);
+        self.git = Git::open(&path);
         self.tree = Some(FileTree::new(path.clone()));
         self.session.recent_workspaces.retain(|p| p != &path);
         self.session.recent_workspaces.insert(0, path.clone());
@@ -282,6 +286,9 @@ impl ZenithApp {
                     && self.docs[0].buffer.len_chars() == 0
                 {
                     self.docs.clear();
+                }
+                if let Some(g) = &self.git {
+                    doc.set_git_base(g.head_text(&path));
                 }
                 self.docs.push(doc);
                 self.active = self.docs.len() - 1;
@@ -806,6 +813,13 @@ impl ZenithApp {
                 self.sidebar = SidebarView::Explorer;
                 self.show_sidebar = true;
             }
+            Cmd::ShowSourceControl => {
+                self.sidebar = SidebarView::Git;
+                self.show_sidebar = true;
+                if let Some(g) = &mut self.git {
+                    g.refresh();
+                }
+            }
             Cmd::ShowAgents => {
                 self.sidebar = SidebarView::Agents;
                 self.show_sidebar = true;
@@ -985,6 +999,236 @@ impl ZenithApp {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Git
+    // ------------------------------------------------------------------
+
+    fn handle_git(&mut self) {
+        let Some(g) = &mut self.git else { return };
+        if g.poll() {
+            let map = g.status.iter().map(|e| (e.path.clone(), e.letter())).collect();
+            if let Some(t) = &mut self.tree {
+                t.set_git_status(map);
+            }
+        }
+        if let Some(doc) = self.docs.get_mut(self.active) {
+            doc.update_git_hunks();
+        }
+    }
+
+    /// Re-read HEAD contents for open files (after commit / checkout).
+    fn reload_git_bases(&mut self) {
+        let Some(g) = &self.git else { return };
+        for d in &mut self.docs {
+            if let Some(p) = d.path().map(Path::to_path_buf) {
+                d.set_git_base(g.head_text(&p));
+            }
+        }
+    }
+
+    fn git_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, "SOURCE CONTROL");
+            if let Some(g) = &mut self.git {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                        g.refresh();
+                    }
+                });
+            }
+        });
+        let Some(g) = &mut self.git else {
+            ui.label(RichText::new("This folder is not a Git repository.").color(p.text_dim));
+            if self.workspace.is_some() && ui.button("Initialize Repository").clicked() {
+                if let Some(ws) = self.workspace.clone() {
+                    match crate::git::init(&ws) {
+                        Ok(()) => self.git = Git::open(&ws),
+                        Err(e) => self.toast(e, NotifyLevel::Error),
+                    }
+                }
+            }
+            return;
+        };
+        if let Some(b) = &g.branch {
+            ui.label(RichText::new(format!("⎇ {b}")).color(p.accent));
+        }
+        ui.add_space(4.0);
+        let staged_n = g.status.iter().filter(|e| e.is_staged()).count();
+        let msg = ui.add(
+            egui::TextEdit::multiline(&mut self.commit_message)
+                .hint_text(if staged_n > 0 {
+                    "Message (Ctrl+Enter to commit staged)"
+                } else {
+                    "Message (Ctrl+Enter to commit all)"
+                })
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        let ctrl_enter = msg.has_focus()
+            && ui.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.command))
+            });
+        let mut commit = ctrl_enter;
+        let mut ai_commit = false;
+        let mut result: Option<Result<String, String>> = None;
+        ui.horizontal(|ui| {
+            let w = ui.available_width();
+            let can = !self.commit_message.trim().is_empty() && !g.status.is_empty();
+            if ui
+                .add_enabled(
+                    can,
+                    egui::Button::new(RichText::new("✓ Commit").color(Color32::WHITE))
+                        .fill(p.accent)
+                        .min_size(egui::vec2(w * 0.5, 26.0)),
+                )
+                .clicked()
+            {
+                commit = true;
+            }
+            if ui
+                .add_enabled(
+                    !g.status.is_empty(),
+                    egui::Button::new("✳ Commit with AI").min_size(egui::vec2(ui.available_width(), 26.0)),
+                )
+                .on_hover_text("Ask your AI agent to review the diff and write the commit")
+                .clicked()
+            {
+                ai_commit = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("⬆ Push").clicked() {
+                result = Some(g.push());
+            }
+            if ui.small_button("⬇ Pull").clicked() {
+                result = Some(g.pull());
+                g.refresh();
+            }
+            if ui.small_button("+ Stage all").clicked() {
+                result = Some(g.stage_all().map(|_| String::new()));
+            }
+        });
+        if commit && !self.commit_message.trim().is_empty() {
+            let r = g.commit(self.commit_message.trim());
+            if r.is_ok() {
+                self.commit_message.clear();
+            }
+            result = Some(r);
+        }
+        ui.add_space(6.0);
+
+        let mut open = None;
+        let mut action: Option<(bool, String)> = None; // (stage?, rel)
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for (title, staged) in [("STAGED CHANGES", true), ("CHANGES", false)] {
+                let list: Vec<_> =
+                    g.status.iter().filter(|e| if staged { e.is_staged() } else { e.is_unstaged() }).collect();
+                if list.is_empty() {
+                    continue;
+                }
+                ui.label(RichText::new(format!("{title}  {}", list.len())).size(11.0).color(p.text_dim).strong());
+                for e in list {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, 4.0, p.bg_hover);
+                    }
+                    let letter = e.letter();
+                    let color = match letter {
+                        'U' | 'A' => p.success,
+                        'D' => p.error,
+                        _ => p.warning,
+                    };
+                    let (dir, name) = e.rel.rsplit_once('/').unwrap_or(("", &e.rel));
+                    let (icon, icolor) = theme::file_icon(name);
+                    ui.painter().text(
+                        egui::pos2(rect.min.x + 10.0, rect.center().y),
+                        Align2::CENTER_CENTER,
+                        icon,
+                        FontId::proportional(11.0),
+                        icolor,
+                    );
+                    let r = ui.painter().text(
+                        egui::pos2(rect.min.x + 22.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        name,
+                        FontId::proportional(13.0),
+                        p.text,
+                    );
+                    ui.painter()
+                        .with_clip_rect(egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - 44.0, rect.max.y)))
+                        .text(
+                            egui::pos2(r.max.x + 6.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            dir,
+                            FontId::proportional(11.5),
+                            p.text_dim,
+                        );
+                    ui.painter().text(
+                        rect.right_center() - egui::vec2(8.0, 0.0),
+                        Align2::RIGHT_CENTER,
+                        letter.to_string(),
+                        FontId::monospace(12.0),
+                        color,
+                    );
+                    let btn = egui::Rect::from_center_size(
+                        rect.right_center() - egui::vec2(30.0, 0.0),
+                        egui::vec2(18.0, 18.0),
+                    );
+                    let b = ui.interact(btn, ui.id().with((&e.rel, staged)), Sense::click());
+                    if resp.hovered() || b.hovered() {
+                        ui.painter().rect_filled(btn, 4.0, if b.hovered() { p.bg_active } else { p.bg_hover });
+                        ui.painter().text(
+                            btn.center(),
+                            Align2::CENTER_CENTER,
+                            if staged { "−" } else { "+" },
+                            FontId::monospace(13.0),
+                            p.text,
+                        );
+                    }
+                    if b.on_hover_text(if staged { "Unstage" } else { "Stage" }).clicked() {
+                        action = Some((!staged, e.rel.clone()));
+                    } else if resp.clicked() {
+                        open = Some(e.path.clone());
+                    }
+                }
+                ui.add_space(8.0);
+            }
+            if g.status.is_empty() {
+                ui.label(RichText::new("No changes.").color(p.text_dim));
+            }
+        });
+        if let Some((stage, rel)) = action {
+            result = Some(if stage { g.stage(&rel) } else { g.unstage(&rel) }.map(|_| String::new()));
+        }
+        let committed = commit && matches!(result, Some(Ok(_)));
+        if let Some(r) = result {
+            match r {
+                Ok(m) if !m.trim().is_empty() => self.toast(m.trim().to_string(), NotifyLevel::Info),
+                Ok(_) => {}
+                Err(e) => self.toast(e, NotifyLevel::Error),
+            }
+        }
+        if committed {
+            self.reload_git_bases();
+        }
+        if let Some(path) = open {
+            self.open_file(&path);
+        }
+        if ai_commit {
+            let msg = if self.commit_message.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" Use this as a hint for the message: \"{}\".", self.commit_message.trim())
+            };
+            self.send_to_agent(
+                format!("Review my uncommitted changes (git status / git diff), then stage them and create a git commit with a clear, concise message.{msg}"),
+                true,
+                None,
+            );
+        }
+        let _ = ctx;
+    }
+
     fn goto_definition(&mut self, idx: usize) {
         let root = self.workspace.clone();
         let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -1018,6 +1262,7 @@ impl ZenithApp {
             (cs, Key::L, Cmd::SendSelectionToAgent, false),
             (cs, Key::I, Cmd::AskAgent, true),
             (cs, Key::E, Cmd::ShowExplorer, true),
+            (cs, Key::G, Cmd::ShowSourceControl, true),
             (cs, Key::Backtick, Cmd::NewTerminal, true),
             (ctrl | Modifiers::SHIFT, Key::Tab, Cmd::PrevTab, false),
             (ctrl, Key::Tab, Cmd::NextTab, false),
@@ -1218,6 +1463,7 @@ impl ZenithApp {
             for (view, glyph, tip) in [
                 (SidebarView::Explorer, "🗐", "Explorer (Ctrl+Shift+E)"),
                 (SidebarView::Search, "🔍", "Search (Ctrl+Shift+F)"),
+                (SidebarView::Git, "⎇", "Source Control (Ctrl+Shift+G)"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
             ] {
@@ -1319,6 +1565,7 @@ impl ZenithApp {
             SidebarView::Search => self.search_ui(ui, &p),
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
+            SidebarView::Git => self.git_ui(ctx, ui, &p),
         }
     }
 
@@ -1761,7 +2008,7 @@ impl ZenithApp {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let small = |t: String| RichText::new(t).size(12.0).color(p.text_dim);
-            if let Some(b) = &self.branch {
+            if let Some(b) = self.git.as_ref().and_then(|g| g.branch.as_ref()) {
                 ui.label(small(format!("⎇ {b}")));
             }
             if self.index.indexing {
@@ -2247,6 +2494,7 @@ impl eframe::App for ZenithApp {
         self.handle_plugin_events();
         self.flush_pending_sends();
         self.handle_lsp();
+        self.handle_git();
 
         // Keystrokes reset the caret blink so it stays visible while typing.
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)))) {

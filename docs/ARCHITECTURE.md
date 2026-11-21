@@ -36,12 +36,12 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 
 **v0.1** — muharrir, terminal, AI agent panel, pluginlar, qidiruv, temalar, CI (3 OS).
 
-**v0.2 (hozirgi)** — ✅ LSP: avtomatik to'ldirish, diagnostika, hover, ta'rifga o'tish.
+**v0.2 (hozirgi)** — ✅ LSP: avtomatik to'ldirish, diagnostika, hover, ta'rifga o'tish. ✅ Git: gutter belgilari, Source Control paneli, AI commit.
 
 **v0.2**
 - [ ] Ko'p kursor (multi-cursor) va ustun bo'yicha belgilash
 - [ ] LSP: rename, find references, format on save, signature help, code actions
-- [ ] Git integratsiyasi: o'zgarishlar gutter'da, diff ko'rinishi, commit paneli
+- [ ] Git: yonma-yon diff ko'rinishi, branch almashtirish, hunk'ni qaytarish (revert)
 - [ ] Faylni tashqaridan o'zgarganda konflikt dialogi (hozir: toza bufer avtomatik qayta yuklanadi)
 - [ ] Split editor (yonma-yon)
 
