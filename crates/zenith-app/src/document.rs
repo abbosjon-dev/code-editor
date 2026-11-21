@@ -72,6 +72,8 @@ pub struct Document {
     pub reveal_line: Option<usize>,
     pub disk_mtime: Option<SystemTime>,
     longest_line: (u64, usize),
+    longest_dirty: Option<(usize, usize)>,
+    longest_full_at: Option<std::time::Instant>,
     // --- language server state ---
     pub diagnostics: Vec<DocDiagnostic>,
     pub completion: Option<Completion>,
@@ -132,6 +134,8 @@ impl Document {
             reveal_line: None,
             disk_mtime: None,
             longest_line: (u64::MAX, 0),
+            longest_dirty: None,
+            longest_full_at: None,
             diagnostics: vec![],
             completion: None,
             hover: None,
@@ -231,7 +235,7 @@ impl Document {
         };
         self.reload_from_disk()?;
         if self.buffer.text() != base {
-            self.review = Some(crate::review::Review { base, show: false });
+            self.review = Some(crate::review::Review::new(base));
         }
         Ok(())
     }
@@ -239,8 +243,14 @@ impl Document {
     /// Sync caches after edits. Call once per frame before rendering.
     pub fn sync(&mut self) {
         let n = self.buffer.len_lines();
-        if let Some(line) = self.buffer.take_changed_line() {
-            self.highlight.invalidate_from(line);
+        if let Some((line, last)) = self.buffer.take_changed_lines() {
+            let delta_lines = n as isize - self.last_len_lines as isize;
+            if self.last_len_lines == 0 {
+                self.highlight.invalidate_from(line);
+            } else {
+                self.highlight.edited(line, last, delta_lines);
+            }
+            self.longest_dirty = Some(self.longest_dirty.map_or((line, last), |(a, b)| (a.min(line), b.max(last))));
             // Keep folds attached to their lines when lines are added/removed above.
             let delta = n as isize - self.last_len_lines as isize;
             if delta != 0 && !self.folds.is_empty() && self.last_len_lines > 0 {
@@ -375,11 +385,24 @@ impl Document {
 
     pub fn longest_line_chars(&mut self) -> usize {
         let v = self.buffer.version();
-        if self.longest_line.0 != v {
-            let n = (0..self.buffer.len_lines()).map(|l| self.buffer.line_len(l)).max().unwrap_or(0);
-            self.longest_line = (v, n);
+        if self.longest_line.0 == v {
+            return self.longest_line.1;
         }
-        self.longest_line.1
+        // Full scans are O(lines): do them at most twice a second; in between,
+        // only grow the width from the edited lines (shrinking can wait).
+        let full_due = self.longest_full_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500));
+        let n = match (self.longest_dirty.take(), full_due) {
+            (Some((a, b)), false) if self.longest_line.0 != u64::MAX => {
+                let b = b.min(self.buffer.len_lines().saturating_sub(1));
+                (a..=b).map(|l| self.buffer.line_len(l)).max().unwrap_or(0).max(self.longest_line.1)
+            }
+            _ => {
+                self.longest_full_at = Some(std::time::Instant::now());
+                (0..self.buffer.len_lines()).map(|l| self.buffer.line_len(l)).max().unwrap_or(0)
+            }
+        };
+        self.longest_line = (v, n);
+        n
     }
 
     pub fn update_find(&mut self) {
@@ -646,4 +669,75 @@ impl Document {
 fn is_subsequence(needle: &str, hay: &str) -> bool {
     let mut it = hay.chars();
     needle.chars().all(|c| it.any(|h| h == c))
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use std::time::Instant;
+
+    /// Per-keystroke work on a large file. Run with:
+    /// `cargo test --release -p zenith-app perf -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn keystroke_cost_on_large_file() {
+        let line = "    let value = compute(alpha, beta, gamma) + other_function(delta); // comment\n";
+        let text: String = line.repeat(100_000);
+        let dir = std::env::temp_dir().join("zenith-perf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.rs");
+        std::fs::write(&path, &text).unwrap();
+        let t = Instant::now();
+        let mut doc = Document::open(1, &path, highlight::load_theme("OneHalfDark"), 4).unwrap();
+        doc.set_git_base(Some(text.clone()));
+        println!("open: {:?}", t.elapsed());
+        // Caret in the middle; warm caches like the first frames would.
+        doc.goto_line(50_000);
+        doc.sync();
+        doc.longest_line_chars();
+        doc.update_git_hunks();
+        let t = Instant::now();
+        doc.highlight.ensure(&doc.buffer, 50_000, 50_060);
+        let jump = t.elapsed();
+        assert!(doc.highlight.line(50_030).is_some_and(|l| l.len() > 1), "visible window not highlighted");
+        println!("first frame after jumping to line 50k: {jump:?}");
+        assert!(jump.as_millis() < 50, "jump too slow: {jump:?}");
+        let t = Instant::now();
+        while !doc.highlight.ensure(&doc.buffer, 0, 50_060) {}
+        println!("highlight to line 50k: {:?}", t.elapsed());
+
+        let n = 50;
+        let mut parts = [std::time::Duration::ZERO; 5];
+        for i in 0..n {
+            let t = Instant::now();
+            doc.buffer.type_char(if i % 2 == 0 { 'x' } else { 'y' });
+            parts[0] += t.elapsed();
+            let t = Instant::now();
+            doc.sync();
+            parts[1] += t.elapsed();
+            let t = Instant::now();
+            doc.longest_line_chars();
+            parts[2] += t.elapsed();
+            let t = Instant::now();
+            doc.update_git_hunks();
+            doc.fold_map();
+            parts[3] += t.elapsed();
+            let t = Instant::now();
+            doc.highlight.ensure(&doc.buffer, 50_000, 50_060);
+            parts[4] += t.elapsed();
+        }
+        println!("type/sync/longest/git+fold/highlight: {:?}", parts.map(|d| d / n));
+        let t = Instant::now();
+        for i in 0..n {
+            doc.buffer.type_char(if i % 2 == 0 { 'x' } else { 'y' });
+            doc.sync();
+            doc.longest_line_chars();
+            doc.update_git_hunks();
+            doc.fold_map();
+            doc.highlight.ensure(&doc.buffer, 50_000, 50_060);
+        }
+        let per = t.elapsed() / n;
+        println!("per keystroke: {per:?}");
+        assert!(per.as_millis() < 16, "keystroke too slow: {per:?}");
+    }
 }

@@ -332,7 +332,7 @@ pub fn editor_ui(
                 let first = fm.line_at(first_row);
                 let last = if last_row == 0 { 0 } else { (fm.line_at(last_row - 1) + 1).min(total_lines) };
                 let y_of_line = |line: usize| rect.min.y + fm.row_of(line) as f32 * m.line_h;
-                if !doc.highlight.ensure(&doc.buffer, last) {
+                if !doc.highlight.ensure(&doc.buffer, first, last) {
                     ui.ctx().request_repaint();
                 }
 

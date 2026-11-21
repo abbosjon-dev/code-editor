@@ -37,6 +37,8 @@ pub struct Buffer {
     version: u64,
     saved_version: u64,
     changed_from_line: Option<usize>,
+    /// Last line (in current coordinates) touched since the last take.
+    changed_to_line: usize,
     pub line_ending: LineEnding,
     pub tab_size: usize,
     pub use_spaces: bool,
@@ -62,6 +64,7 @@ impl Buffer {
             version: 0,
             saved_version: 0,
             changed_from_line: Some(0),
+            changed_to_line: usize::MAX,
             line_ending: le,
             tab_size: 4,
             use_spaces: true,
@@ -191,7 +194,15 @@ impl Buffer {
 
     /// Returns the first line changed since the last call (for highlight caches).
     pub fn take_changed_line(&mut self) -> Option<usize> {
-        self.changed_from_line.take()
+        self.take_changed_lines().map(|(a, _)| a)
+    }
+
+    /// First and last line touched since the last call (current coordinates;
+    /// the last line is clamped to the document).
+    pub fn take_changed_lines(&mut self) -> Option<(usize, usize)> {
+        let first = self.changed_from_line.take()?;
+        let last = std::mem::replace(&mut self.changed_to_line, 0).min(self.len_lines().saturating_sub(1));
+        Some((first, last.max(first)))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -210,6 +221,19 @@ impl Buffer {
         self.rope.remove(start..end);
         self.rope.insert(start, text);
         self.version += 1;
+        // Track the touched line range in post-edit coordinates.
+        let added = text.matches('\n').count() as isize;
+        let delta = added - removed.matches('\n').count() as isize;
+        let end_line = line + added as usize;
+        self.changed_to_line = match self.changed_from_line {
+            None => end_line,
+            Some(_) if self.changed_to_line == usize::MAX => usize::MAX,
+            Some(_) => {
+                let prev = self.changed_to_line as isize;
+                let shifted = if prev > line as isize { (prev + delta).max(line as isize) } else { prev };
+                (shifted as usize).max(end_line)
+            }
+        };
         self.changed_from_line = Some(self.changed_from_line.map_or(line, |l| l.min(line)));
         Edit { pos: start, removed, inserted: text.to_string() }
     }
@@ -1122,6 +1146,24 @@ mod tests {
         assert_eq!(b.sel.head, 24);
         b.undo();
         assert_eq!(b.text(), "foo + foo + foo");
+    }
+
+    #[test]
+    fn changed_line_range() {
+        let mut b = Buffer::from_str("a\nb\nc\nd\ne");
+        b.take_changed_lines();
+        b.set_cursor(b.pos_to_char(Position::new(1, 1)), false);
+        b.insert("X");
+        assert_eq!(b.take_changed_lines(), Some((1, 1)));
+        b.insert("\nY\nZ");
+        assert_eq!(b.take_changed_lines(), Some((1, 3)));
+        // Two edits: one high, one low; range covers both after shifting.
+        b.set_cursor(b.pos_to_char(Position::new(5, 0)), false);
+        b.insert("1");
+        b.set_cursor(0, false);
+        b.insert("\n");
+        assert_eq!(b.take_changed_lines(), Some((0, 6)));
+        assert_eq!(b.take_changed_lines(), None);
     }
 
     #[test]

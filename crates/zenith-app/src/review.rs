@@ -14,6 +14,26 @@ pub struct Review {
     pub base: String,
     /// Show the diff view instead of the editor.
     pub show: bool,
+    /// Hunks for a buffer version (diffing every frame is too slow for big files).
+    cache: std::cell::RefCell<Option<(u64, std::rc::Rc<Vec<Hunk>>)>>,
+}
+
+impl Review {
+    pub fn new(base: String) -> Self {
+        Self { base, show: false, cache: Default::default() }
+    }
+
+    pub fn hunks(&self, doc_version: u64, current: impl FnOnce() -> String) -> std::rc::Rc<Vec<Hunk>> {
+        let mut c = self.cache.borrow_mut();
+        if let Some((v, h)) = c.as_ref() {
+            if *v == doc_version {
+                return h.clone();
+            }
+        }
+        let h = std::rc::Rc::new(hunks(&self.base, &current()));
+        *c = Some((doc_version, h.clone()));
+        h
+    }
 }
 
 /// A changed region: lines `old` in the base were replaced by lines `new`.
@@ -90,7 +110,7 @@ pub enum ReviewAction {
 /// Banner shown above the editor. Returns the user's choice.
 pub fn banner(ui: &mut egui::Ui, doc: &Document, p: &Palette, conflict: bool) -> Option<ReviewAction> {
     let mut action = None;
-    let n = doc.review.as_ref().map(|r| hunks(&r.base, &doc.buffer.text()).len()).unwrap_or(0);
+    let n = doc.review.as_ref().map(|r| r.hunks(doc.buffer.version(), || doc.buffer.text()).len()).unwrap_or(0);
     if !conflict && n == 0 {
         return None;
     }
@@ -139,7 +159,7 @@ pub fn banner(ui: &mut egui::Ui, doc: &Document, p: &Palette, conflict: bool) ->
 pub fn diff_view(ui: &mut egui::Ui, doc: &Document, p: &Palette, font_size: f32) -> Option<ReviewAction> {
     let review = doc.review.as_ref()?;
     let current = doc.buffer.text();
-    let hs = hunks(&review.base, &current);
+    let hs = review.hunks(doc.buffer.version(), || current.clone());
     let new_lines = split_lines(&current);
     let mut action = None;
     let font = FontId::monospace(font_size);

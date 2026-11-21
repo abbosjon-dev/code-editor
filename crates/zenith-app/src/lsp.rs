@@ -20,6 +20,8 @@ pub struct LspManager {
     waker: Arc<dyn Fn() + Send + Sync>,
     pub progress: HashMap<String, String>,
     pub enabled: bool,
+    /// A delayed repaint is already scheduled for this moment.
+    wake_at: Option<Instant>,
 }
 
 /// What the app should do with an event that isn't tied to a document.
@@ -56,6 +58,7 @@ impl LspManager {
             waker,
             progress: HashMap::new(),
             enabled,
+            wake_at: None,
         }
     }
 
@@ -108,8 +111,20 @@ impl LspManager {
         if doc.lsp_version == Some(version) {
             return;
         }
-        if !force && doc.lsp_sent_at.is_some_and(|t| t.elapsed() < CHANGE_DEBOUNCE) {
-            (self.waker)();
+        // Full-text sync costs O(file size): wait longer between syncs for big files.
+        let debounce = CHANGE_DEBOUNCE + Duration::from_millis((doc.buffer.len_chars() / 10_000).min(2_000) as u64);
+        if !force && doc.lsp_sent_at.is_some_and(|t| t.elapsed() < debounce) {
+            // Wake the UI once when the debounce window ends (not every frame).
+            let due = doc.lsp_sent_at.unwrap() + debounce;
+            if self.wake_at.is_none_or(|w| w < Instant::now() || w > due) {
+                self.wake_at = Some(due);
+                let waker = self.waker.clone();
+                let wait = due.saturating_duration_since(Instant::now());
+                std::thread::spawn(move || {
+                    std::thread::sleep(wait + Duration::from_millis(5));
+                    waker();
+                });
+            }
             return;
         }
         let Some(lang) = language_id(doc.language()) else { return };
