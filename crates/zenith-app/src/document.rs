@@ -94,6 +94,8 @@ pub struct Document {
     pub review: Option<crate::review::Review>,
     /// Show the side-by-side diff against HEAD instead of the editor.
     pub show_git_diff: bool,
+    /// Markdown: show the rendered preview beside the editor.
+    pub md_preview: bool,
     pub git_diff: crate::diff_view::DiffState,
     // --- folding ---
     /// Header lines of folded regions.
@@ -154,6 +156,7 @@ impl Document {
             git_hunks_version: None,
             review: None,
             show_git_diff: false,
+            md_preview: false,
             git_diff: Default::default(),
             folds: Default::default(),
             folds_gen: 0,

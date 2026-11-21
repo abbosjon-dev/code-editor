@@ -483,7 +483,11 @@ pub fn editor_ui(
                             let extra = if doc.folds.contains(&line) { 4.0 } else { 0.0 };
                             let x = x_of(chars.len()) + m.char_w * (3.0 + extra);
                             let galley = ui.fonts(|f| {
-                                f.layout_no_wrap(format!("● {msg}"), FontId::proportional(m.font.size * 0.85), color.gamma_multiply(0.85))
+                                f.layout_no_wrap(
+                                    format!("● {msg}"),
+                                    FontId::proportional(m.font.size * 0.85),
+                                    color.gamma_multiply(0.85),
+                                )
                             });
                             let r = Rect::from_min_size(
                                 egui::pos2(x - 6.0, y + 2.0),

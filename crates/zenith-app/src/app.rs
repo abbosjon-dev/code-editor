@@ -157,6 +157,7 @@ pub struct ZenithApp {
     last_session_save: Instant,
     style_dirty: bool,
     focus_editor: bool,
+    md_cache: egui_commonmark::CommonMarkCache,
     show_settings: bool,
     settings_section: crate::settings_ui::Section,
     /// Split editor: two panes side by side.
@@ -170,6 +171,7 @@ pub struct ZenithApp {
 impl ZenithApp {
     pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<String>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let (settings, settings_err) = Settings::load();
         let colors = Palette::by_name(&settings.theme);
         theme::apply_style(&cc.egui_ctx, &colors, settings.ui_font_size);
@@ -234,6 +236,7 @@ impl ZenithApp {
             last_session_save: Instant::now(),
             style_dirty: false,
             focus_editor: false,
+            md_cache: Default::default(),
             show_settings: false,
             settings_section: Default::default(),
             split: false,
@@ -986,6 +989,13 @@ impl ZenithApp {
             Cmd::ShowExplorer => {
                 self.sidebar = SidebarView::Explorer;
                 self.show_sidebar = true;
+            }
+            Cmd::MarkdownPreview => {
+                if let Some(doc) = self.active_doc() {
+                    if doc.language().starts_with("Markdown") {
+                        doc.md_preview = !doc.md_preview;
+                    }
+                }
             }
             Cmd::GitOpenChanges => {
                 if let Some(doc) = self.active_doc() {
@@ -1806,6 +1816,7 @@ impl ZenithApp {
             (cs, Key::E, Cmd::ShowExplorer, true),
             (cs, Key::G, Cmd::ShowSourceControl, true),
             (cs, Key::M, Cmd::ShowProblems, true),
+            (ca, Key::P, Cmd::MarkdownPreview, false),
             (Modifiers::ALT, Key::Z, Cmd::ToggleWordWrap, false),
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
@@ -2837,11 +2848,30 @@ impl ZenithApp {
             self.tab_bar(ui, right);
         });
         // Breadcrumbs.
+        let is_md = self.docs.get(shown).is_some_and(|d| d.language().starts_with("Markdown"));
         if let Some(path) = self.docs.get(shown).and_then(|d| d.path()).map(|p| self.rel_path(p)) {
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
                 let crumbs = path.split('/').collect::<Vec<_>>().join("  ›  ");
                 ui.label(RichText::new(crumbs).size(12.0).color(p.text_dim));
+                if is_md {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        let on = self.docs.get(shown).is_some_and(|d| d.md_preview);
+                        let label = RichText::new(if on { "◧ Hide preview" } else { "◧ Preview" })
+                            .size(12.0)
+                            .color(if on { p.accent } else { p.text_dim });
+                        if ui
+                            .add(egui::Button::new(label).frame(false))
+                            .on_hover_text("Markdown preview (Ctrl+Alt+P)")
+                            .clicked()
+                        {
+                            if let Some(d) = self.docs.get_mut(shown) {
+                                d.md_preview = !on;
+                            }
+                        }
+                    });
+                }
             });
         }
         let review = self.settings.review_external_changes;
@@ -2899,7 +2929,44 @@ impl ZenithApp {
             if focus_editor {
                 ui.memory_mut(|m| m.request_focus(id));
             }
-            let actions = editor_ui(ui, doc, &p, &self.settings, epoch, pane);
+            let actions = if doc.md_preview && is_md {
+                // Editor on the left, live rendered Markdown on the right.
+                let full = ui.available_rect_before_wrap();
+                let half = (full.width() / 2.0).floor();
+                let left = egui::Rect::from_min_size(full.min, egui::vec2(half, full.height()));
+                let right_r = egui::Rect::from_min_max(egui::pos2(full.min.x + half, full.min.y), full.max);
+                let acts = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+                        editor_ui(ui, doc, &p, &self.settings, epoch, pane)
+                    })
+                    .inner;
+                ui.painter().vline(right_r.min.x, right_r.y_range(), Stroke::new(1.0_f32, p.border));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(right_r.shrink2(egui::vec2(1.0, 0.0))), |ui| {
+                    egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(24, 12)).show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("md-preview", doc.id, pane))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_max_width(760.0);
+                                let text = doc.buffer.text();
+                                // Relative image paths resolve next to the Markdown file.
+                                let base = doc
+                                    .path()
+                                    .and_then(|p| p.parent())
+                                    .map(|d| format!("file://{}/", d.display()))
+                                    .unwrap_or_default();
+                                egui_commonmark::CommonMarkViewer::new()
+                                    .default_implicit_uri_scheme(&base)
+                                    .max_image_width(Some(ui.available_width() as usize))
+                                    .show(ui, &mut self.md_cache, &text);
+                            });
+                    });
+                });
+                ui.allocate_rect(full, Sense::hover());
+                acts
+            } else {
+                editor_ui(ui, doc, &p, &self.settings, epoch, pane)
+            };
             if !focused_pane && ui.memory(|m| m.has_focus(id)) {
                 self.focus_pane(right);
             }
