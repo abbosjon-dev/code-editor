@@ -89,11 +89,15 @@ enum Dialog {
 struct TermPanel {
     tabs: Vec<TermTab>,
     active: usize,
+    /// Tab shown on the right half (split view).
+    split: Option<u64>,
 }
 
 impl TermPanel {
-    fn active_mut(&mut self) -> Option<&mut TermTab> {
-        self.tabs.get_mut(self.active)
+    /// Index of the split tab, if it exists and isn't the active one.
+    fn split_index(&self) -> Option<usize> {
+        let id = self.split?;
+        self.tabs.iter().position(|t| t.id == id).filter(|&i| i != self.active)
     }
 }
 
@@ -1152,6 +1156,23 @@ impl ZenithApp {
                 };
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
+            }
+            Cmd::SplitTerminal => {
+                if self.bottom.split_index().is_some() {
+                    self.bottom.split = None;
+                } else if self.bottom.tabs.is_empty() {
+                    self.new_terminal(None);
+                    let keep = self.bottom.active;
+                    let id = self.new_terminal(None);
+                    self.bottom.split = Some(id);
+                    self.bottom.active = keep;
+                } else {
+                    let keep = self.bottom.active;
+                    let id = self.new_terminal(None);
+                    self.bottom.split = Some(id);
+                    self.bottom.active = keep;
+                }
+                self.show_terminal = true;
             }
             Cmd::OpenKeybindings => {
                 let p = crate::keymap::path();
@@ -3800,12 +3821,15 @@ impl ZenithApp {
         let panel = if ai { &mut self.ai } else { &mut self.bottom };
 
         let mut close = None;
+        let mut split_new = false;
+        let split_idx = panel.split_index();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.label(RichText::new(if ai { "AI AGENTS" } else { "TERMINAL" }).size(11.0).strong().color(p.text_dim));
             ui.add_space(8.0);
+            let mut clicked = None;
             for (i, t) in panel.tabs.iter().enumerate() {
-                let active = i == panel.active;
+                let active = i == panel.active || Some(i) == split_idx;
                 let mut title = t.title();
                 if !t.is_alive() {
                     title.push_str(" (exited)");
@@ -3816,11 +3840,18 @@ impl ZenithApp {
                     .corner_radius(5);
                 let r = ui.add(b);
                 if r.clicked() {
-                    panel.active = i;
+                    clicked = Some(i);
                 }
                 if r.middle_clicked() {
                     close = Some(i);
                 }
+            }
+            if let Some(i) = clicked {
+                if Some(i) == split_idx {
+                    // Swap the two sides.
+                    panel.split = panel.tabs.get(panel.active).map(|t| t.id);
+                }
+                panel.active = i;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Hide panel").clicked() {
@@ -3843,27 +3874,66 @@ impl ZenithApp {
                 } else if ui.add(egui::Button::new("+").frame(false)).on_hover_text("New terminal").clicked() {
                     new_shell = true;
                 }
+                let tip = if split_idx.is_some() { "Unsplit" } else { "Split: show two side by side" };
+                if !panel.tabs.is_empty() && ui.add(egui::Button::new("‖").frame(false)).on_hover_text(tip).clicked()
+                {
+                    if split_idx.is_some() {
+                        panel.split = None;
+                    } else if ai {
+                        // Pair the active agent with the next one.
+                        let n = panel.tabs.len();
+                        if n > 1 {
+                            panel.split = Some(panel.tabs[(panel.active + 1) % n].id);
+                        }
+                    } else {
+                        split_new = true;
+                    }
+                }
             });
         });
         ui.add_space(2.0);
         if let Some(i) = close {
+            if panel.split == Some(panel.tabs[i].id) {
+                panel.split = None;
+            }
             panel.tabs.remove(i);
             if panel.active >= panel.tabs.len() {
                 panel.active = panel.tabs.len().saturating_sub(1);
             }
         }
         let mut focused = false;
-        if let Some(tab) = panel.active_mut() {
-            let want_focus = focus_req == Some(tab.id);
-            match terminal_ui(ui, tab, &p, font_size, want_focus) {
-                Some(TermEvent::Restart) => tab.restart(waker),
-                Some(TermEvent::OpenLink(link)) => open_link = Some((link, tab.spec.cwd.clone())),
-                None => {}
+        if !panel.tabs.is_empty() {
+            let active = panel.active.min(panel.tabs.len() - 1);
+            let split = panel.split_index();
+            let full = ui.available_rect_before_wrap();
+            let mut panes = vec![(active, full)];
+            if let Some(si) = split {
+                let mid = (full.center().x).round();
+                panes = vec![
+                    (active, egui::Rect::from_min_max(full.min, egui::pos2(mid - 1.0, full.max.y))),
+                    (si, egui::Rect::from_min_max(egui::pos2(mid + 1.0, full.min.y), full.max)),
+                ];
+                ui.painter().vline(mid, full.y_range(), Stroke::new(1.0_f32, p.border));
             }
-            focused = ui.memory(|m| m.has_focus(ui.make_persistent_id(("zenith-term", tab.id))));
-            if want_focus {
-                self.focus_terminal = None;
+            for (i, rect) in panes {
+                let tab = &mut panel.tabs[i];
+                let want_focus = focus_req == Some(tab.id);
+                let ev = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        terminal_ui(ui, tab, &p, font_size, want_focus)
+                    })
+                    .inner;
+                match ev {
+                    Some(TermEvent::Restart) => tab.restart(waker.clone()),
+                    Some(TermEvent::OpenLink(link)) => open_link = Some((link, tab.spec.cwd.clone())),
+                    None => {}
+                }
+                focused |= ui.memory(|m| m.has_focus(ui.make_persistent_id(("zenith-term", tab.id))));
+                if want_focus {
+                    self.focus_terminal = None;
+                }
             }
+            ui.allocate_rect(full, Sense::hover());
         } else {
             ui.centered_and_justified(|ui| {
                 if ai {
@@ -3886,6 +3956,12 @@ impl ZenithApp {
         }
         if new_shell {
             self.new_terminal(None);
+        }
+        if split_new {
+            let keep = self.bottom.active;
+            let id = self.new_terminal(None);
+            self.bottom.split = Some(id);
+            self.bottom.active = keep;
         }
         if let Some(id) = launch {
             self.launch_agent(&id);
