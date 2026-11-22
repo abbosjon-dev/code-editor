@@ -112,6 +112,9 @@ pub enum Job {
     Changes(Receiver<Result<Vec<Change>, String>>),
 }
 
+/// (rel, blob, aligned rows, old text, new text).
+pub type CachedDiff = (String, String, std::rc::Rc<Vec<crate::git::DiffRow>>, String, String);
+
 /// Review state for one workspace.
 #[derive(Default)]
 pub struct ChangeSet {
@@ -125,7 +128,7 @@ pub struct ChangeSet {
     pub error: Option<String>,
     job: Option<Job>,
     /// Cached diff of the selected file: (rel, blob, rows, old, new).
-    pub diff: Option<(String, String, std::rc::Rc<Vec<crate::git::DiffRow>>, String, String)>,
+    pub diff: Option<CachedDiff>,
 }
 
 impl ChangeSet {
