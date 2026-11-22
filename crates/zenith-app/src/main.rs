@@ -12,6 +12,7 @@ mod folding;
 mod git;
 mod highlight;
 mod lsp;
+mod mention;
 mod palette;
 mod review;
 mod sample_plugin;

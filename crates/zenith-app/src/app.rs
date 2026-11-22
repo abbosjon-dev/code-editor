@@ -71,7 +71,7 @@ enum Dialog {
     UnsavedClose(u64),
     UnsavedQuit,
     ConfirmReplace { files: usize, count: usize },
-    AskAgent { question: String, focus: bool },
+    AskAgent { question: String, focus: bool, caret: usize, pick: usize },
     About,
 }
 
@@ -122,6 +122,8 @@ pub struct ZenithApp {
     git: Option<Git>,
     /// Repositories of the added workspace folders (None = not a repo / same as another).
     extra_gits: Vec<Option<Git>>,
+    /// Last `@` mention query and its matches (Ask AI dialog).
+    mention_cache: Option<(String, Vec<crate::mention::Candidate>)>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
     commit_message: String,
@@ -209,6 +211,7 @@ impl ZenithApp {
             index: FileIndex::empty(),
             git: None,
             extra_gits: vec![],
+            mention_cache: None,
             scm_repo: 0,
             commit_message: String::new(),
             docs: vec![],
@@ -836,6 +839,48 @@ impl ZenithApp {
         self.pending_sends.push(PendingSend { tab_id, text, submit, created: Instant::now() });
     }
 
+    /// Files offered for an `@` mention: open files first, then the index.
+    fn mention_candidates(&mut self, query: &str) -> Vec<crate::mention::Candidate> {
+        use crate::mention::Candidate;
+        if let Some((q, found)) = &self.mention_cache {
+            if q == query {
+                return found.clone();
+            }
+        }
+        let ws = self.workspace.clone();
+        let insert_for = |p: &Path| match ws.as_ref().and_then(|w| p.strip_prefix(w).ok()) {
+            Some(r) => r.to_string_lossy().replace('\\', "/"),
+            None => p.to_string_lossy().into_owned(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut all = vec![];
+        for d in &self.docs {
+            if let Some(p) = d.path() {
+                let label = self.rel_path(p);
+                if seen.insert(label.clone()) {
+                    all.push(Candidate { label, insert: insert_for(p) });
+                }
+            }
+        }
+        for f in &self.index.files {
+            if !seen.contains(f) {
+                all.push(Candidate { label: f.clone(), insert: f.clone() });
+            }
+        }
+        for (t, idx) in self.extra_trees.iter().zip(&self.extra_index) {
+            let name = t.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            for f in &idx.files {
+                let label = format!("{name}/{f}");
+                if !seen.contains(&label) {
+                    all.push(Candidate { insert: insert_for(&t.root.join(f)), label });
+                }
+            }
+        }
+        let found = crate::mention::rank(&all, query, 8);
+        self.mention_cache = Some((query.to_string(), found.clone()));
+        found
+    }
+
     fn selection_prompt(&self, question: &str) -> String {
         let Some(doc) = self.docs.get(self.active) else { return question.to_string() };
         let rel = doc.path().map(|p| self.rel_path(p));
@@ -1131,7 +1176,10 @@ impl ZenithApp {
                 self.load_plugins();
                 self.toast(format!("{} plugin(s) loaded", self.plugins.plugins.len()), NotifyLevel::Info);
             }
-            Cmd::AskAgent => self.dialog = Some(Dialog::AskAgent { question: String::new(), focus: true }),
+            Cmd::AskAgent => {
+                self.mention_cache = None;
+                self.dialog = Some(Dialog::AskAgent { question: String::new(), focus: true, caret: 0, pick: 0 });
+            }
             Cmd::SendSelectionToAgent => {
                 let prompt = self.selection_prompt("");
                 self.send_to_agent(prompt, false, None);
@@ -3787,7 +3835,7 @@ impl ZenithApp {
                     next = Some(Dialog::UnsavedQuit);
                 }
             }
-            Dialog::AskAgent { mut question, focus } => {
+            Dialog::AskAgent { mut question, focus, mut caret, mut pick } => {
                 let mut submit = false;
                 let has_sel = self.docs.get(self.active).is_some_and(|d| !d.buffer.sel.is_empty());
                 let agent_name = self
@@ -3806,16 +3854,86 @@ impl ZenithApp {
                         .small()
                         .color(self.colors.text_dim),
                     );
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut question)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("e.g. Why does this panic on empty input?"),
-                    );
+                    // `@file` suggestions for the token under the caret.
+                    let mention = crate::mention::mention_at(&question, caret);
+                    let found = match &mention {
+                        Some((_, q)) => self.mention_candidates(q),
+                        None => vec![],
+                    };
+                    pick = pick.min(found.len().saturating_sub(1));
+                    let mut accept: Option<String> = None;
+                    if !found.is_empty() {
+                        // Keys go to the list, not the text box.
+                        ui.input_mut(|i| {
+                            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                                pick = (pick + 1) % found.len();
+                            }
+                            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                                pick = (pick + found.len() - 1) % found.len();
+                            }
+                            if i.consume_key(Modifiers::NONE, Key::Tab) || i.consume_key(Modifiers::NONE, Key::Enter) {
+                                accept = Some(found[pick].insert.clone());
+                            }
+                        });
+                    }
+                    let te_id = egui::Id::new("ask-agent-question");
+                    let out = egui::TextEdit::multiline(&mut question)
+                        .id(te_id)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. Why does this panic on empty input?  (@ to mention a file)")
+                        .show(ui);
+                    let r = out.response;
+                    if let Some(cr) = out.cursor_range {
+                        caret = cr.primary.ccursor.index;
+                    }
                     if focus {
                         r.request_focus();
                     }
-                    let enter = r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+                    if !found.is_empty() {
+                        egui::Frame::new()
+                            .fill(self.colors.bg_elevated)
+                            .stroke(Stroke::new(1.0_f32, self.colors.border))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                for (i, c) in found.iter().enumerate() {
+                                    let (dir, name) = c.label.rsplit_once('/').unwrap_or(("", &c.label));
+                                    let (icon, icolor) = theme::file_icon(name);
+                                    let mut job = egui::text::LayoutJob::default();
+                                    let fmt = |size: f32, color: Color32| egui::TextFormat {
+                                        font_id: FontId::proportional(size),
+                                        color,
+                                        ..Default::default()
+                                    };
+                                    job.append(icon, 0.0, fmt(11.0, icolor));
+                                    job.append(name, 6.0, fmt(13.0, self.colors.text));
+                                    job.append(dir, 8.0, fmt(11.5, self.colors.text_dim));
+                                    if ui.selectable_label(i == pick, job).clicked() {
+                                        accept = Some(c.insert.clone());
+                                    }
+                                }
+                                ui.label(
+                                    RichText::new("↑↓ choose · Tab/Enter insert").small().color(self.colors.text_faint),
+                                );
+                            });
+                    }
+                    if let (Some(insert), Some((at, _))) = (accept, &mention) {
+                        let (text, new_caret) = crate::mention::apply(&question, *at, caret, &insert);
+                        question = text;
+                        caret = new_caret;
+                        pick = 0;
+                        if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), te_id) {
+                            let cc = egui::text::CCursor::new(new_caret);
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cc)));
+                            st.store(ui.ctx(), te_id);
+                        }
+                        r.request_focus();
+                    }
+                    let enter = found.is_empty()
+                        && r.has_focus()
+                        && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                     if enter {
                         question = question.trim_end_matches('\n').to_string();
                         submit = true;
@@ -3841,7 +3959,7 @@ impl ZenithApp {
                     let prompt = self.selection_prompt(question.trim());
                     self.send_to_agent(prompt, true, None);
                 } else if keep {
-                    next = Some(Dialog::AskAgent { question, focus: false });
+                    next = Some(Dialog::AskAgent { question, focus: false, caret, pick });
                 }
             }
             Dialog::About => {
