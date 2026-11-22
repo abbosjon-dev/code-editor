@@ -1028,8 +1028,10 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert_eq!((h[0].line, h[0].label.as_str(), h[0].padding_right), (1, "x:", true));
         assert_eq!((h[1].character, h[1].kind), (9, 1));
+        // A real absolute path for this OS (Windows needs a drive letter).
+        let uri = text::path_to_uri(&std::env::temp_dir().join("a.rs"));
         let s = parse_workspace_symbols(&json!([
-            {"name": "main", "kind": 12, "containerName": "app", "location": {"uri": "file:///tmp/a.rs", "range": {"start": {"line": 4, "character": 3}, "end": {"line": 4, "character": 7}}}}
+            {"name": "main", "kind": 12, "containerName": "app", "location": {"uri": uri, "range": {"start": {"line": 4, "character": 3}, "end": {"line": 4, "character": 7}}}}
         ]));
         assert_eq!((s[0].name.as_str(), s[0].line), ("main", 4));
         assert!(s[0].path.as_ref().is_some_and(|p| p.ends_with("a.rs")));
