@@ -265,7 +265,7 @@ impl CommandPalette {
 pub fn command_items(extra: Vec<Item>) -> Vec<Item> {
     let mut v: Vec<Item> = Cmd::all()
         .iter()
-        .map(|c| Item { label: c.title().into(), detail: c.shortcut().into(), action: PaletteAction::Command(*c) })
+        .map(|c| Item { label: c.title().into(), detail: c.shortcut(), action: PaletteAction::Command(*c) })
         .collect();
     v.extend(extra);
     v
