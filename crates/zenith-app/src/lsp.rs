@@ -22,6 +22,8 @@ pub struct LspManager {
     pub enabled: bool,
     /// A delayed repaint is already scheduled for this moment.
     wake_at: Option<Instant>,
+    /// Workspace folder of each running client.
+    client_roots: HashMap<String, PathBuf>,
 }
 
 /// What the app should do with an event that isn't tied to a document.
@@ -86,6 +88,7 @@ impl LspManager {
             progress: HashMap::new(),
             enabled,
             wake_at: None,
+            client_roots: HashMap::new(),
         }
     }
 
@@ -111,24 +114,38 @@ impl LspManager {
         if self.failed.contains(&cfg.name) {
             return None;
         }
-        if !self.clients.contains_key(&cfg.name) {
+        // One server per (language server, workspace folder): `name · folder`.
+        let root = root.map(Path::to_path_buf).or_else(|| doc.path()?.parent().map(Path::to_path_buf))?;
+        let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut key = format!("{} · {folder}", cfg.name);
+        let mut n = 2;
+        while self.client_roots.get(&key).is_some_and(|r| *r != root) {
+            key = format!("{} · {folder} ({n})", cfg.name);
+            n += 1;
+        }
+        if self.failed.contains(&key) {
+            return None;
+        }
+        if !self.clients.contains_key(&key) {
             if !cfg.is_installed() {
                 self.failed.insert(cfg.name.clone());
                 return None;
             }
-            let root = root.map(Path::to_path_buf).or_else(|| doc.path()?.parent().map(Path::to_path_buf))?;
-            match LspClient::start(cfg.clone(), &root, self.tx.clone(), self.waker.clone()) {
+            let mut cfg = cfg.clone();
+            cfg.name = key.clone(); // events are tagged with this name
+            match LspClient::start(cfg, &root, self.tx.clone(), self.waker.clone()) {
                 Ok(c) => {
-                    self.clients.insert(cfg.name.clone(), c);
+                    self.clients.insert(key.clone(), c);
+                    self.client_roots.insert(key.clone(), root);
                 }
                 Err(e) => {
                     log::warn!("{e:#}");
-                    self.failed.insert(cfg.name.clone());
+                    self.failed.insert(key);
                     return None;
                 }
             }
         }
-        self.clients.get_mut(&cfg.name)
+        self.clients.get_mut(&key)
     }
 
     /// Send didOpen/didChange when the buffer changed. `force` skips the debounce.
@@ -357,6 +374,7 @@ impl LspManager {
                 LspEvent::Ready { server } => log::info!("language server {server} ready"),
                 LspEvent::Exited { server } => {
                     self.clients.remove(&server);
+                    self.client_roots.remove(&server);
                     self.progress.remove(&server);
                     self.failed.insert(server.clone());
                     for d in docs.iter_mut() {
@@ -383,6 +401,7 @@ impl LspManager {
     }
 
     pub fn shutdown(&mut self) {
+        self.client_roots.clear();
         for (_, mut c) in self.clients.drain() {
             c.shutdown();
         }

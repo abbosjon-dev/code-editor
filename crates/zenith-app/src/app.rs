@@ -120,6 +120,10 @@ pub struct ZenithApp {
     extra_index: Vec<FileIndex>,
     index: FileIndex,
     git: Option<Git>,
+    /// Repositories of the added workspace folders (None = not a repo / same as another).
+    extra_gits: Vec<Option<Git>>,
+    /// Repository shown in Source Control (0 = main folder).
+    scm_repo: usize,
     commit_message: String,
     docs: Vec<Document>,
     active: usize,
@@ -204,6 +208,8 @@ impl ZenithApp {
             extra_index: vec![],
             index: FileIndex::empty(),
             git: None,
+            extra_gits: vec![],
+            scm_repo: 0,
             commit_message: String::new(),
             docs: vec![],
             active: 0,
@@ -306,6 +312,8 @@ impl ZenithApp {
         self.tree = Some(FileTree::new(path.clone()));
         self.extra_trees.clear();
         self.extra_index.clear();
+        self.extra_gits.clear();
+        self.scm_repo = 0;
         self.session.recent_workspaces.retain(|p| p != &path);
         self.session.recent_workspaces.insert(0, path.clone());
         self.session.recent_workspaces.truncate(10);
@@ -329,6 +337,74 @@ impl ZenithApp {
         }
     }
 
+    /// Workspace folder a file belongs to (an added folder, else the main one).
+    fn root_of(&self, path: Option<&Path>) -> Option<PathBuf> {
+        if let Some(p) = path {
+            if let Some(t) = self.extra_trees.iter().find(|t| p.starts_with(&t.root)) {
+                return Some(t.root.clone());
+            }
+        }
+        self.workspace.clone()
+    }
+
+    fn active_root(&self) -> Option<PathBuf> {
+        self.root_of(self.docs.get(self.active).and_then(|d| d.path()))
+    }
+
+    fn all_gits(&self) -> impl Iterator<Item = &Git> {
+        self.git.iter().chain(self.extra_gits.iter().flatten())
+    }
+
+    /// Repository slot (0 = main, i+1 = extra folder i) owning `path`: the
+    /// deepest repository root containing it.
+    fn repo_index(&self, path: Option<&Path>) -> usize {
+        let Some(path) = path else { return 0 };
+        let slots = std::iter::once(self.git.as_ref()).chain(self.extra_gits.iter().map(Option::as_ref));
+        slots
+            .enumerate()
+            .filter_map(|(i, g)| g.filter(|g| path.starts_with(&g.root)).map(|g| (i, g.root.components().count())))
+            .max_by_key(|&(_, depth)| depth)
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn git_for(&self, path: &Path) -> Option<&Git> {
+        self.repo_slot(self.repo_index(Some(path))).as_ref().filter(|g| path.starts_with(&g.root))
+    }
+
+    fn repo_slot(&self, i: usize) -> &Option<Git> {
+        if i == 0 {
+            &self.git
+        } else {
+            self.extra_gits.get(i - 1).unwrap_or(&self.git)
+        }
+    }
+
+    /// Run `f` with repository slot `i` temporarily in `self.git`, so the
+    /// single-repo code paths work on any folder's repository.
+    fn with_repo<R>(&mut self, i: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        if i == 0 || i > self.extra_gits.len() {
+            return f(self);
+        }
+        std::mem::swap(&mut self.git, &mut self.extra_gits[i - 1]);
+        let r = f(self);
+        std::mem::swap(&mut self.git, &mut self.extra_gits[i - 1]);
+        r
+    }
+
+    fn active_repo(&self) -> usize {
+        self.repo_index(self.docs.get(self.active).and_then(|d| d.path()))
+    }
+
+    /// Push the combined status of every repository to the file trees.
+    fn update_tree_git_status(&mut self) {
+        let map: HashMap<PathBuf, char> =
+            self.all_gits().flat_map(|g| g.status.iter().map(|e| (e.path.clone(), e.letter()))).collect();
+        for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
+            let mine = map.iter().filter(|(p, _)| p.starts_with(&t.root)).map(|(p, c)| (p.clone(), *c)).collect();
+            t.set_git_status(mine);
+        }
+    }
+
     /// All workspace folders, primary first.
     fn roots(&self) -> Vec<PathBuf> {
         self.workspace.iter().cloned().chain(self.extra_trees.iter().map(|t| t.root.clone())).collect()
@@ -344,6 +420,8 @@ impl ZenithApp {
             return;
         }
         self.extra_index.push(FileIndex::build(&path));
+        let git = Git::open(&path).filter(|g| !self.all_gits().any(|o| o.root == g.root));
+        self.extra_gits.push(git);
         self.extra_trees.push(FileTree::new(path));
         self.save_session();
     }
@@ -352,6 +430,9 @@ impl ZenithApp {
         if i < self.extra_trees.len() {
             self.extra_trees.remove(i);
             self.extra_index.remove(i);
+            self.extra_gits.remove(i);
+            self.scm_repo = 0;
+            self.update_tree_git_status();
             self.save_session();
         }
     }
@@ -399,7 +480,7 @@ impl ZenithApp {
                 {
                     self.docs.clear();
                 }
-                if let Some(g) = &self.git {
+                if let Some(g) = self.git_for(&path) {
                     doc.set_git_base(g.head_text(&path));
                     doc.blame_rx = g.blame_async(&path);
                 }
@@ -457,10 +538,11 @@ impl ZenithApp {
                         self.reload_settings();
                     }
                     self.plugins.emit("file_saved", serde_json::json!({ "path": p }));
-                    if let (Some(g), Some(doc)) = (&self.git, self.docs.get_mut(idx)) {
-                        doc.blame_rx = g.blame_async(p);
+                    let rx = self.git_for(p).and_then(|g| g.blame_async(p));
+                    if let Some(doc) = self.docs.get_mut(idx) {
+                        doc.blame_rx = rx;
                     }
-                    let root = self.workspace.clone();
+                    let root = self.root_of(self.docs.get(idx).and_then(|d| d.path()));
                     if let Some(doc) = self.docs.get_mut(idx) {
                         self.lsp.sync(doc, root.as_deref(), true);
                         self.lsp.did_save(doc, root.as_deref());
@@ -1080,7 +1162,7 @@ impl ZenithApp {
                 }
             }
             Cmd::GitSwitchBranch => {
-                let Some(g) = &self.git else {
+                let Some(g) = self.repo_slot(self.active_repo()) else {
                     self.toast("This folder is not a Git repository", NotifyLevel::Info);
                     return;
                 };
@@ -1107,8 +1189,9 @@ impl ZenithApp {
             }
             Cmd::ShowSourceControl => {
                 self.sidebar = SidebarView::Git;
+                self.scm_repo = self.active_repo();
                 self.show_sidebar = true;
-                if let Some(g) = &mut self.git {
+                for g in self.git.iter_mut().chain(self.extra_gits.iter_mut().flatten()) {
                     g.refresh();
                 }
             }
@@ -1158,7 +1241,7 @@ impl ZenithApp {
                 }
             }
             Cmd::CodeActions | Cmd::GotoSymbol | Cmd::TriggerParameterHints => {
-                let root = self.workspace.clone();
+                let root = self.active_root();
                 let Some(doc) = self.docs.get_mut(self.active) else { return };
                 if !doc.lsp_active {
                     self.toast("No language server for this file", NotifyLevel::Info);
@@ -1171,7 +1254,7 @@ impl ZenithApp {
                 }
             }
             Cmd::RenameSymbol | Cmd::FindReferences | Cmd::FormatDocument => {
-                let root = self.workspace.clone();
+                let root = self.active_root();
                 let Some(doc) = self.docs.get_mut(self.active) else { return };
                 if !doc.lsp_active {
                     self.toast("No language server for this file", NotifyLevel::Info);
@@ -1288,7 +1371,7 @@ impl ZenithApp {
                 let Some(action) = self.code_actions.get(i).cloned() else { return };
                 self.apply_edits_quiet(action.edits, false);
                 if let Some(cmd) = &action.command {
-                    let root = self.workspace.clone();
+                    let root = self.active_root();
                     if let Some(doc) = self.docs.get_mut(self.active) {
                         self.lsp.execute_command(doc, root.as_deref(), cmd);
                     }
@@ -1379,8 +1462,8 @@ impl ZenithApp {
     // ------------------------------------------------------------------
 
     fn handle_lsp(&mut self) {
-        let root = self.workspace.clone();
-        for doc in &mut self.docs {
+        let roots: Vec<Option<PathBuf>> = self.docs.iter().map(|d| self.root_of(d.path())).collect();
+        for (doc, root) in self.docs.iter_mut().zip(roots) {
             self.lsp.sync(doc, root.as_deref(), false);
         }
         for outcome in self.lsp.poll(&mut self.docs, &mut self.pending_definition) {
@@ -1478,12 +1561,12 @@ impl ZenithApp {
     // ------------------------------------------------------------------
 
     fn handle_git(&mut self) {
-        let Some(g) = &mut self.git else { return };
-        if g.poll() {
-            let map = g.status.iter().map(|e| (e.path.clone(), e.letter())).collect();
-            if let Some(t) = &mut self.tree {
-                t.set_git_status(map);
-            }
+        let mut changed = false;
+        for g in self.git.iter_mut().chain(self.extra_gits.iter_mut().flatten()) {
+            changed |= g.poll();
+        }
+        if changed {
+            self.update_tree_git_status();
         }
         if let Some(doc) = self.docs.get_mut(self.active) {
             doc.update_git_hunks();
@@ -1500,6 +1583,10 @@ impl ZenithApp {
 
     /// Check out (or create) a branch, then refresh open files from disk.
     fn git_switch(&mut self, branch: &str, create: bool) {
+        self.with_repo(self.active_repo(), |app| app.git_switch_current(branch, create));
+    }
+
+    fn git_switch_current(&mut self, branch: &str, create: bool) {
         let Some(g) = &mut self.git else { return };
         let res = if create { g.create_branch(branch) } else { g.checkout(branch) };
         match res {
@@ -1520,16 +1607,49 @@ impl ZenithApp {
 
     /// Re-read HEAD contents for open files (after commit / checkout).
     fn reload_git_bases(&mut self) {
-        let Some(g) = &self.git else { return };
-        for d in &mut self.docs {
-            if let Some(p) = d.path().map(Path::to_path_buf) {
-                d.set_git_base(g.head_text(&p));
-                d.blame_rx = g.blame_async(&p);
+        let bases: Vec<_> = self
+            .docs
+            .iter()
+            .map(|d| {
+                let p = d.path()?;
+                let g = self.git_for(p)?;
+                Some((g.head_text(p), g.blame_async(p)))
+            })
+            .collect();
+        for (d, b) in self.docs.iter_mut().zip(bases) {
+            if let Some((base, blame)) = b {
+                d.set_git_base(base);
+                d.blame_rx = blame;
             }
         }
     }
 
     fn git_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette) {
+        let roots = self.roots();
+        if self.scm_repo >= roots.len() {
+            self.scm_repo = 0;
+        }
+        if roots.len() > 1 {
+            let name = |r: &PathBuf| r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut sel = self.scm_repo;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Repository").size(11.5).color(p.text_dim));
+                egui::ComboBox::from_id_salt("scm_repo").selected_text(name(&roots[sel])).show_ui(ui, |ui| {
+                    for (i, r) in roots.iter().enumerate() {
+                        let changes = self.repo_slot(i).as_ref().map_or(0, |g| g.status.len());
+                        let label = if changes > 0 { format!("{}  ({changes})", name(r)) } else { name(r) };
+                        ui.selectable_value(&mut sel, i, label);
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            self.scm_repo = sel;
+        }
+        let root = roots.get(self.scm_repo).cloned();
+        self.with_repo(self.scm_repo, |app| app.git_repo_ui(ctx, ui, p, root));
+    }
+
+    fn git_repo_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette, root: Option<PathBuf>) {
         ui.horizontal(|ui| {
             Self::section_header(ui, p, "SOURCE CONTROL");
             if let Some(g) = &mut self.git {
@@ -1542,8 +1662,8 @@ impl ZenithApp {
         });
         let Some(g) = &mut self.git else {
             ui.label(RichText::new("This folder is not a Git repository.").color(p.text_dim));
-            if self.workspace.is_some() && ui.button("Initialize Repository").clicked() {
-                if let Some(ws) = self.workspace.clone() {
+            if root.is_some() && ui.button("Initialize Repository").clicked() {
+                if let Some(ws) = root {
                     match crate::git::init(&ws) {
                         Ok(()) => self.git = Git::open(&ws),
                         Err(e) => self.toast(e, NotifyLevel::Error),
@@ -1869,7 +1989,7 @@ impl ZenithApp {
     }
 
     fn goto_definition(&mut self, idx: usize) {
-        let root = self.workspace.clone();
+        let root = self.active_root();
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         if !doc.lsp_active {
             self.toast("No language server for this file (see Settings → language_servers)", NotifyLevel::Info);
@@ -2674,7 +2794,8 @@ impl ZenithApp {
             Self::section_header(ui, p, "LANGUAGE SERVERS");
             let running = self.lsp.running();
             for cfg in self.lsp.configs() {
-                let (dot, tip) = if running.contains(&cfg.name) {
+                let is_running = running.iter().any(|k| k.starts_with(&format!("{} · ", cfg.name)));
+                let (dot, tip) = if is_running {
                     (p.success, "running")
                 } else if cfg.is_installed() {
                     (p.accent, "installed — starts when you open a matching file")
@@ -3103,13 +3224,13 @@ impl ZenithApp {
                 }
                 EditorAction::SendSelectionToAgent => self.run(ctx, Cmd::SendSelectionToAgent),
                 EditorAction::Complete { trigger } => {
-                    let root = self.workspace.clone();
+                    let root = self.active_root();
                     if let Some(doc) = self.docs.get_mut(self.active) {
                         self.lsp.request_completion(doc, root.as_deref(), trigger);
                     }
                 }
                 EditorAction::Hover { idx } => {
-                    let root = self.workspace.clone();
+                    let root = self.active_root();
                     if let Some(doc) = self.docs.get_mut(self.active) {
                         self.lsp.request_hover(doc, root.as_deref(), idx);
                     }
@@ -3117,7 +3238,7 @@ impl ZenithApp {
                 EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
                 EditorAction::Run(cmd) => self.run(ctx, cmd),
                 EditorAction::SignatureHelp => {
-                    let root = self.workspace.clone();
+                    let root = self.active_root();
                     if let Some(doc) = self.docs.get_mut(self.active) {
                         self.lsp.request_signature_help(doc, root.as_deref());
                     }
@@ -3197,7 +3318,7 @@ impl ZenithApp {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let small = |t: String| RichText::new(t).size(12.0).color(p.text_dim);
-            if let Some(b) = self.git.as_ref().and_then(|g| g.branch.as_ref()) {
+            if let Some(b) = self.repo_slot(self.active_repo()).as_ref().and_then(|g| g.branch.as_ref()) {
                 let r = ui.add(egui::Label::new(small(format!("⎇ {b}"))).sense(Sense::click()));
                 if r.on_hover_text("Switch branch").clicked() {
                     cmd = Some(Cmd::GitSwitchBranch);
@@ -3686,7 +3807,7 @@ impl ZenithApp {
                 return;
             }
             InputKind::RenameSymbol(idx) => {
-                let root = self.workspace.clone();
+                let root = self.active_root();
                 if let Some(doc) = self.docs.get_mut(self.active) {
                     self.pending_rename = self.lsp.request_rename(doc, root.as_deref(), *idx, &name);
                 }
