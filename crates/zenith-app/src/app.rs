@@ -1675,6 +1675,40 @@ impl ZenithApp {
         if let Some(b) = &g.branch {
             ui.label(RichText::new(format!("⎇ {b}")).color(p.accent));
         }
+        let mut result: Option<Result<String, String>> = None;
+        let mut op_done = false;
+        if let Some(op) = g.operation {
+            let conflicts = g.status.iter().filter(|e| e.is_conflicted()).count();
+            egui::Frame::new()
+                .fill(p.warning.gamma_multiply(0.12))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(format!("⚠ {} in progress", op.label())).color(p.warning).strong());
+                    ui.label(
+                        RichText::new(if conflicts > 0 {
+                            format!(
+                                "{conflicts} file(s) with conflicts. Resolve them in the editor, then stage with +."
+                            )
+                        } else {
+                            "All conflicts resolved. Continue to finish.".to_string()
+                        })
+                        .size(11.5)
+                        .color(p.text_dim),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(conflicts == 0, egui::Button::new("✓ Continue")).clicked() {
+                            result = Some(g.continue_operation());
+                            op_done = true;
+                        }
+                        if ui.button("✕ Abort").clicked() {
+                            result = Some(g.abort_operation());
+                            op_done = true;
+                        }
+                    });
+                });
+        }
         ui.add_space(4.0);
         let staged_n = g.status.iter().filter(|e| e.is_staged()).count();
         let msg = ui.add(
@@ -1693,7 +1727,6 @@ impl ZenithApp {
             });
         let mut commit = ctrl_enter;
         let mut ai_commit = false;
-        let mut result: Option<Result<String, String>> = None;
         ui.horizontal(|ui| {
             let w = ui.available_width();
             let can = !self.commit_message.trim().is_empty() && !g.status.is_empty();
@@ -1730,6 +1763,22 @@ impl ZenithApp {
             if ui.small_button("+ Stage all").clicked() {
                 result = Some(g.stage_all().map(|_| String::new()));
             }
+            if ui
+                .add_enabled(!g.status.is_empty(), egui::Button::new("⊟ Stash").small())
+                .on_hover_text("Stash all changes (message box is used as the stash name)")
+                .clicked()
+            {
+                result = Some(g.stash(&self.commit_message));
+                op_done = true;
+            }
+            if ui
+                .add_enabled(g.stashes > 0, egui::Button::new(format!("⊞ Pop ({})", g.stashes)).small())
+                .on_hover_text("Apply and drop the latest stash")
+                .clicked()
+            {
+                result = Some(g.stash_pop());
+                op_done = true;
+            }
         });
         if commit && !self.commit_message.trim().is_empty() {
             let r = g.commit(self.commit_message.trim());
@@ -1743,9 +1792,22 @@ impl ZenithApp {
         let mut open = None;
         let mut action: Option<(bool, String)> = None; // (stage?, rel)
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (title, staged) in [("STAGED CHANGES", true), ("CHANGES", false)] {
-                let list: Vec<_> =
-                    g.status.iter().filter(|e| if staged { e.is_staged() } else { e.is_unstaged() }).collect();
+            for (title, staged, merge) in
+                [("MERGE CHANGES", false, true), ("STAGED CHANGES", true, false), ("CHANGES", false, false)]
+            {
+                let list: Vec<_> = g
+                    .status
+                    .iter()
+                    .filter(|e| {
+                        if merge {
+                            e.is_conflicted()
+                        } else if staged {
+                            e.is_staged()
+                        } else {
+                            e.is_unstaged()
+                        }
+                    })
+                    .collect();
                 if list.is_empty() {
                     continue;
                 }
@@ -1757,6 +1819,7 @@ impl ZenithApp {
                     }
                     let letter = e.letter();
                     let color = match letter {
+                        '!' => p.error,
                         'U' | 'A' => p.success,
                         'D' => p.error,
                         _ => p.warning,
@@ -1808,7 +1871,15 @@ impl ZenithApp {
                             p.text,
                         );
                     }
-                    if b.on_hover_text(if staged { "Unstage" } else { "Stage" }).clicked() {
+                    if b.on_hover_text(if merge {
+                        "Mark as resolved (stage)"
+                    } else if staged {
+                        "Unstage"
+                    } else {
+                        "Stage"
+                    })
+                    .clicked()
+                    {
                         action = Some((!staged, e.rel.clone()));
                     } else if resp.clicked() {
                         open = Some(e.path.clone());
@@ -1831,7 +1902,16 @@ impl ZenithApp {
                 Err(e) => self.toast(e, NotifyLevel::Error),
             }
         }
-        if committed {
+        if committed || op_done {
+            // Abort / continue / stash change files on disk: clean buffers follow.
+            if op_done {
+                for d in &mut self.docs {
+                    if !d.buffer.is_dirty() && d.changed_on_disk() {
+                        let _ = d.reload_from_disk();
+                    }
+                }
+                self.refresh_trees();
+            }
             self.reload_git_bases();
         }
         if let Some(path) = open {

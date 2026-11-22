@@ -30,15 +30,23 @@ pub struct StatusEntry {
 
 impl StatusEntry {
     pub fn is_staged(&self) -> bool {
-        self.staged != ' ' && self.staged != '?'
+        self.staged != ' ' && self.staged != '?' && !self.is_conflicted()
     }
 
     pub fn is_unstaged(&self) -> bool {
-        self.unstaged != ' '
+        self.unstaged != ' ' && !self.is_conflicted()
+    }
+
+    /// Unmerged path (merge / rebase conflict).
+    pub fn is_conflicted(&self) -> bool {
+        matches!((self.staged, self.unstaged), ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D'))
     }
 
     /// Single letter shown in the UI.
     pub fn letter(&self) -> char {
+        if self.is_conflicted() {
+            return '!';
+        }
         match (self.staged, self.unstaged) {
             ('?', _) => 'U',
             (_, 'D') | ('D', _) => 'D',
@@ -235,18 +243,86 @@ pub fn diff_hunks(base: &str, current: &str) -> Hunks {
     out
 }
 
+/// A multi-step operation in progress (stopped for conflicts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl Operation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Operation::Merge => "Merging",
+            Operation::Rebase => "Rebasing",
+            Operation::CherryPick => "Cherry-picking",
+            Operation::Revert => "Reverting",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Operation::Merge => "merge",
+            Operation::Rebase => "rebase",
+            Operation::CherryPick => "cherry-pick",
+            Operation::Revert => "revert",
+        }
+    }
+
+    fn detect(git_dir: &Path) -> Option<Self> {
+        let has = |n: &str| git_dir.join(n).exists();
+        if has("rebase-merge") || has("rebase-apply") {
+            Some(Operation::Rebase)
+        } else if has("MERGE_HEAD") {
+            Some(Operation::Merge)
+        } else if has("CHERRY_PICK_HEAD") {
+            Some(Operation::CherryPick)
+        } else if has("REVERT_HEAD") {
+            Some(Operation::Revert)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RepoState {
+    status: Vec<StatusEntry>,
+    branch: Option<String>,
+    operation: Option<Operation>,
+    stashes: usize,
+}
+
 pub struct Git {
     pub root: PathBuf,
+    git_dir: PathBuf,
     pub branch: Option<String>,
     pub status: Vec<StatusEntry>,
-    status_rx: Option<Receiver<(Vec<StatusEntry>, Option<String>)>>,
+    pub operation: Option<Operation>,
+    /// Number of stash entries.
+    pub stashes: usize,
+    status_rx: Option<Receiver<RepoState>>,
     last_refresh: Option<Instant>,
 }
 
 impl Git {
     pub fn open(dir: &Path) -> Option<Self> {
         let root = repo_root(dir)?;
-        let mut g = Self { root, branch: None, status: vec![], status_rx: None, last_refresh: None };
+        let git_dir = git(&root, &["rev-parse", "--absolute-git-dir"])
+            .map(|s| PathBuf::from(s.trim()))
+            .unwrap_or_else(|_| root.join(".git"));
+        let mut g = Self {
+            root,
+            git_dir,
+            branch: None,
+            status: vec![],
+            operation: None,
+            stashes: 0,
+            status_rx: None,
+            last_refresh: None,
+        };
         g.refresh();
         Some(g)
     }
@@ -258,6 +334,7 @@ impl Git {
         }
         let (tx, rx) = channel();
         let root = self.root.clone();
+        let git_dir = self.git_dir.clone();
         thread::spawn(move || {
             // --no-optional-locks: never take index.lock in the background,
             // so it can't race with stage/commit.
@@ -266,7 +343,9 @@ impl Git {
                     .map(|s| parse_status(&root, &s))
                     .unwrap_or_default();
             let branch = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok().map(|s| s.trim().to_string());
-            let _ = tx.send((status, branch));
+            let stashes = git(&root, &["--no-optional-locks", "stash", "list"]).map(|s| s.lines().count()).unwrap_or(0);
+            let operation = Operation::detect(&git_dir);
+            let _ = tx.send(RepoState { status, branch, operation, stashes });
         });
         self.status_rx = Some(rx);
         self.last_refresh = Some(Instant::now());
@@ -276,10 +355,15 @@ impl Git {
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.status_rx {
-            if let Ok((status, branch)) = rx.try_recv() {
-                changed = status != self.status || branch != self.branch;
-                self.status = status;
-                self.branch = branch;
+            if let Ok(st) = rx.try_recv() {
+                changed = st.status != self.status
+                    || st.branch != self.branch
+                    || st.operation != self.operation
+                    || st.stashes != self.stashes;
+                self.status = st.status;
+                self.branch = st.branch;
+                self.operation = st.operation;
+                self.stashes = st.stashes;
                 self.status_rx = None;
             }
         }
@@ -314,6 +398,9 @@ impl Git {
     }
 
     pub fn commit(&mut self, message: &str) -> Result<String, String> {
+        if self.status.iter().any(|e| e.is_conflicted()) {
+            return Err("Resolve the merge conflicts first (stage each resolved file with +)".into());
+        }
         let staged_any = self.status.iter().any(|e| e.is_staged());
         if !staged_any {
             git(&self.root, &["add", "-A"])?;
@@ -362,6 +449,46 @@ impl Git {
         Ok(())
     }
 
+    /// Abort the merge / rebase / cherry-pick in progress.
+    pub fn abort_operation(&mut self) -> Result<String, String> {
+        let op = self.operation.ok_or("Nothing to abort")?;
+        let r = git(&self.root, &[op.command(), "--abort"]);
+        self.refresh_now();
+        r.map(|_| format!("{} aborted", op.label()))
+    }
+
+    /// Continue after the conflicts were resolved and staged.
+    pub fn continue_operation(&mut self) -> Result<String, String> {
+        let op = self.operation.ok_or("Nothing to continue")?;
+        if self.status.iter().any(|e| e.is_conflicted()) {
+            return Err("Resolve the merge conflicts first (stage each resolved file with +)".into());
+        }
+        // Keep the prepared commit message instead of opening an editor.
+        let r = match op {
+            Operation::Merge => git(&self.root, &["commit", "--no-edit"]),
+            _ => git(&self.root, &["-c", "core.editor=true", op.command(), "--continue"]),
+        };
+        self.refresh_now();
+        r.map(|s| s.lines().next().unwrap_or("").to_string())
+    }
+
+    /// Stash all changes (including untracked files).
+    pub fn stash(&mut self, message: &str) -> Result<String, String> {
+        let mut args = vec!["stash", "push", "-u"];
+        if !message.trim().is_empty() {
+            args.extend(["-m", message.trim()]);
+        }
+        let r = git(&self.root, &args);
+        self.refresh_now();
+        r.map(|s| s.lines().next().unwrap_or("Stashed").to_string())
+    }
+
+    pub fn stash_pop(&mut self) -> Result<String, String> {
+        let r = git(&self.root, &["stash", "pop"]);
+        self.refresh_now();
+        r.map(|_| "Stash applied".to_string())
+    }
+
     fn refresh_now(&mut self) {
         self.status_rx = None;
         self.refresh();
@@ -385,6 +512,16 @@ mod tests {
         let a = st.iter().find(|e| e.rel == "src/a.rs").unwrap();
         assert!(a.is_unstaged() && !a.is_staged());
         assert_eq!(st.iter().find(|e| e.rel == "c.rs").unwrap().letter(), 'R');
+    }
+
+    #[test]
+    fn conflicts_are_their_own_group() {
+        let st = parse_status(Path::new("/r"), "UU a.rs AA b.rs M  c.rs ");
+        let a = &st[0];
+        assert!(a.is_conflicted() && !a.is_staged() && !a.is_unstaged());
+        assert_eq!(a.letter(), '!');
+        assert!(st[1].is_conflicted());
+        assert!(!st[2].is_conflicted() && st[2].is_staged());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthChar;
 use zenith_core::{Position, Selection};
 use zenith_lsp::Severity;
 
+use crate::conflicts::Resolution;
 use crate::document::Document;
 use crate::settings::Settings;
 use crate::theme::{Palette, MONO_BOLD, MONO_ITALIC};
@@ -89,6 +90,9 @@ pub fn editor_ui(
     if doc.find.open {
         find_bar(ui, doc, p);
     }
+    if !doc.conflicts.is_empty() {
+        conflict_bar(ui, doc, p);
+    }
 
     let font = FontId::monospace(s.editor_font_size);
     let (char_w, row_h) = crate::theme::mono_metrics(ui, &font);
@@ -149,6 +153,7 @@ pub fn editor_ui(
         doc.signature = None;
     }
     let mut hover_screen: Option<(Pos2, usize)> = None;
+    let mut conflict_click: Option<(usize, Resolution)> = None;
 
     let mut scroll = egui::ScrollArea::both()
         .id_salt(id.with("scroll"))
@@ -393,6 +398,26 @@ pub fn editor_ui(
                         painter.rect_filled(row, 0.0, p.current_line);
                     }
 
+                    // Merge conflict regions: current (ours) green, incoming (theirs) blue-violet.
+                    let ci = doc.conflicts.partition_point(|c| c.end < line);
+                    if let Some(c) = doc.conflicts.get(ci).filter(|c| c.start <= line) {
+                        let (cur, inc) = (p.success, p.accent);
+                        let tint = if line == c.start {
+                            cur.gamma_multiply(0.28)
+                        } else if line == c.end {
+                            inc.gamma_multiply(0.28)
+                        } else if line == c.mid || Some(line) == c.base {
+                            p.text_faint.gamma_multiply(0.15)
+                        } else if c.current().contains(&line) {
+                            cur.gamma_multiply(0.10)
+                        } else if c.incoming().contains(&line) {
+                            inc.gamma_multiply(0.10)
+                        } else {
+                            p.text_faint.gamma_multiply(0.06) // diff3 base section
+                        };
+                        painter.rect_filled(row, 0.0, tint);
+                    }
+
                     // Find matches.
                     while mi < doc.find.matches.len() && doc.find.matches[mi].start <= line_end {
                         let r = doc.find.matches[mi].clone();
@@ -477,9 +502,41 @@ pub fn editor_ui(
                         painter.galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
                     }
 
-                    // Inline problem message at the end of the line ("error lens").
+                    // Conflict actions on the `<<<<<<<` line.
                     let mut lens_drawn = false;
-                    if s.inline_diagnostics && last_seg {
+                    if let Some(c) = doc.conflicts.get(ci).filter(|c| c.start == line && last_seg) {
+                        let mut x = x_of(chars.len()) + m.char_w * 3.0;
+                        let font = FontId::proportional(m.font.size * 0.82);
+                        let labels = [
+                            ("Accept Current", Resolution::Current),
+                            ("Accept Incoming", Resolution::Incoming),
+                            ("Accept Both", Resolution::Both),
+                        ];
+                        for (k, (label, res)) in labels.into_iter().enumerate() {
+                            let galley = ui.fonts(|f| f.layout_no_wrap(label.into(), font.clone(), p.text));
+                            let r = Rect::from_min_size(
+                                egui::pos2(x - 5.0, y + 2.0),
+                                egui::vec2(galley.size().x + 10.0, m.line_h - 4.0),
+                            );
+                            let resp = ui.interact(r, id.with(("conflict", c.start, k)), Sense::click());
+                            let hovered = resp.hovered();
+                            painter.rect_filled(r, 4.0, if hovered { p.bg_active } else { p.bg_hover });
+                            let color = if hovered { p.text } else { p.text_dim };
+                            painter.galley(
+                                egui::pos2(x, y + (m.line_h - galley.size().y) / 2.0),
+                                galley.clone(),
+                                color,
+                            );
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                conflict_click = Some((ci, res));
+                            }
+                            x = r.max.x + 10.0;
+                        }
+                        lens_drawn = true;
+                    }
+                    // Inline problem message at the end of the line ("error lens").
+                    let in_conflict = doc.conflicts.get(ci).is_some_and(|c| c.start <= line);
+                    if s.inline_diagnostics && last_seg && !lens_drawn && !in_conflict {
                         if let Some(d) = doc
                             .diagnostics
                             .iter()
@@ -700,6 +757,9 @@ pub fn editor_ui(
             })
         })
         .inner;
+    if let Some((i, r)) = conflict_click {
+        doc.resolve_conflict(i, r);
+    }
 
     // --- minimap ---
     if show_minimap {
@@ -1526,6 +1586,37 @@ fn multi_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool) -> Option
         _ => return None,
     }
     Some(true)
+}
+
+/// Bar above a file with merge conflicts: count, bulk actions, navigation.
+fn conflict_bar(ui: &mut egui::Ui, doc: &mut Document, p: &Palette) {
+    let n = doc.conflicts.len();
+    egui::Frame::new().fill(p.warning.gamma_multiply(0.12)).inner_margin(egui::Margin::symmetric(10, 4)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {n} merge conflict{}", if n == 1 { "" } else { "s" }))
+                        .color(p.warning)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                if ui.small_button("Next ↓").on_hover_text("Go to the next conflict").clicked() {
+                    doc.next_conflict();
+                }
+                if ui.small_button("Accept All Current").clicked() {
+                    doc.resolve_all_conflicts(Resolution::Current);
+                }
+                if ui.small_button("Accept All Incoming").clicked() {
+                    doc.resolve_all_conflicts(Resolution::Incoming);
+                }
+                if ui.small_button("Accept All Both").clicked() {
+                    doc.resolve_all_conflicts(Resolution::Both);
+                }
+            });
+        },
+    );
 }
 
 fn find_bar(ui: &mut egui::Ui, doc: &mut Document, p: &Palette) {

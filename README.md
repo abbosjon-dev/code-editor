@@ -16,7 +16,7 @@ macOS, Windows va Linux'da ishlaydi.
 | ⌨ **Terminal** | To'liq terminal emulyatori (PTY: Unix'da openpty, Windows'da ConPTY), 256/truecolor, scrollback, sichqoncha, nusxa olish, bir nechta tab. `Ctrl+bosish` bilan chiqishdagi `fayl:qator:ustun` havolalarini muharrirda va URL'larni brauzerda ochadi. |
 | 📝 **Muharrir** | **Multi-cursor** (Ctrl+D, Alt+bosish, Ctrl+Alt+↑↓), **split editor** (`Ctrl+\`), **kod bloklarini yig'ish** (gutter'dagi ▾ yoki `Ctrl+Shift+[` / `]`), **so'zlarni o'rash** (`Alt+Z`), **Markdown preview** (`Ctrl+Alt+P`, rasmlar bilan), qator ichida xato xabarlari, sintaksis ranglash (~200 til), avtomatik qavs yopish, aqlli indent, bir nechta tab, undo/redo, qidirish va almashtirish, minimap, indent chiziqlari, qavs juftini ko'rsatish, qatorni ko'chirish/nusxalash, izoh qo'yish. |
 | 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`), havolalarni topish (`Shift+F12`), nomni hamma joyda o'zgartirish (`F2`), formatlash (`Shift+Alt+F`, ixtiyoriy saqlashda formatlash), parametr maslahatlari, tezkor tuzatishlar (`Ctrl+.` / 💡), fayldagi belgiga o'tish (`Ctrl+T`). O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
-| ⎇ **Git** | Gutter'da o'zgarish belgilari (qo'shilgan / o'zgargan / o'chirilgan), Source Control paneli (`Ctrl+Shift+G`): stage/unstage, commit (`Ctrl+Enter`), push/pull, fayl daraxtida rangli holat. **✳ Commit with AI** — agent diff'ni ko'rib, commit'ni o'zi yozadi. |
+| ⎇ **Git** | Gutter'da o'zgarish belgilari (qo'shilgan / o'zgargan / o'chirilgan), Source Control paneli (`Ctrl+Shift+G`): stage/unstage, commit (`Ctrl+Enter`), push/pull, stash, merge konfliktlarini hal qilish, fayl daraxtida rangli holat. **✳ Commit with AI** — agent diff'ni ko'rib, commit'ni o'zi yozadi. |
 | 🗂 **Bir nechta papka** | Bir oynada bir nechta loyiha papkasi (multi-root): Explorer, tezkor ochish va fayllarda qidirish hammasini qamraydi; har bir papka o'z Git repo'si (Source Control'da repo tanlash, gutter/blame/branch) va o'z til serveriga ega; sessiyada saqlanadi. |
 | 🔍 **Navigatsiya** | Buyruqlar palitrasi (`Ctrl+Shift+P`), fuzzy fayl qidirish (`Ctrl+P`), fayllar ichida qidirish va almashtirish (`Ctrl+Shift+F`: regex, butun so'z, katta-kichik harf, `$1` guruhlar, oldindan ko'rish; `.gitignore`'ni hisobga oladi), qatorga o'tish. |
 | 🎨 **Chiroyli UI** | Zenith Midnight (qorong'i) va Daylight (yorug') temalari, 30+ sintaksis temasi, JetBrains Mono + Inter shriftlari. |
@@ -121,6 +121,14 @@ Source Control'da faylni bossangiz, u HEAD bilan **yonma-yon diff** ko'rinishida
 orasida yurish, "Open file" — tahrirga qaytish). Gutter'dagi rangli o'zgarish chizig'ini bossangiz — eski/yangi qatorlar va **↺ Revert** (faqat shu o'zgarishni qaytarish). Kursor turgan qator oxirida **git blame** (muallif, vaqt, commit xabari). Status qatoridagi branch nomini bossangiz — **branch almashtirish yoki yangi branch yaratish**.
 
 ![Git diff](docs/git-diff.png)
+
+**Merge konfliktlari:** `git merge` / `rebase` / `cherry-pick` to'qnashuvga uchrasa, faylda `<<<<<<<` … `>>>>>>>` bloklari
+rangli ko'rinadi (joriy — yashil, kelayotgan — binafsha) va har birida **Accept Current / Accept Incoming / Accept Both**
+tugmalari chiqadi; yuqoridagi panelda konfliktlar soni, **Next ↓** va hammasini birdan qabul qilish. Source Control'da
+"MERGE CHANGES" bo'limi, **+** bilan "hal qilindi" deb belgilash va **Continue / Abort**. **⊟ Stash / ⊞ Pop** — o'zgarishlarni
+vaqtincha yashirish va qaytarish.
+
+![Merge konfliktlari](docs/merge.png)
 
 Tizimdagi `git` buyrug'idan foydalanadi (alohida kutubxona shart emas). Fon holati `--no-optional-locks` bilan o'qiladi,
 shuning uchun terminal yoki AI agent bilan bir vaqtda ishlaganda `index.lock` to'qnashuvi bo'lmaydi.

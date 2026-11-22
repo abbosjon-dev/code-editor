@@ -90,6 +90,9 @@ pub struct Document {
     pub git_base: Option<String>,
     pub git_hunks: crate::git::Hunks,
     git_hunks_version: Option<u64>,
+    /// Git merge conflicts (marker lines) in the buffer.
+    pub conflicts: Vec<crate::conflicts::Conflict>,
+    conflicts_version: Option<u64>,
     /// Pending review of a change made outside the editor (e.g. by an AI agent).
     pub review: Option<crate::review::Review>,
     /// Show the side-by-side diff against HEAD instead of the editor.
@@ -159,6 +162,8 @@ impl Document {
             git_base: None,
             git_hunks: vec![],
             git_hunks_version: None,
+            conflicts: vec![],
+            conflicts_version: None,
             review: None,
             show_git_diff: false,
             md_preview: false,
@@ -262,7 +267,8 @@ impl Document {
     /// Sync caches after edits. Call once per frame before rendering.
     pub fn sync(&mut self) {
         let n = self.buffer.len_lines();
-        if let Some((line, last)) = self.buffer.take_changed_lines() {
+        let changed = self.buffer.take_changed_lines();
+        if let Some((line, last)) = changed {
             let delta_lines = n as isize - self.last_len_lines as isize;
             if self.last_len_lines == 0 {
                 self.highlight.invalidate_from(line);
@@ -291,6 +297,7 @@ impl Document {
             }
         }
         self.last_len_lines = n;
+        self.update_conflicts(changed);
         self.update_find();
     }
 
@@ -311,6 +318,82 @@ impl Document {
             Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
             _ => vec![],
         };
+    }
+
+    // ---------- merge conflicts ----------
+
+    /// Rescan for conflict markers after an edit of lines `changed` (None =
+    /// unknown). Typing in a file without conflicts costs only a look at the
+    /// edited lines.
+    fn update_conflicts(&mut self, changed: Option<(usize, usize)>) {
+        let v = self.buffer.version();
+        if self.conflicts_version == Some(v) {
+            return;
+        }
+        let first_scan = self.conflicts_version.is_none();
+        self.conflicts_version = Some(v);
+        let rope = self.buffer.rope();
+        if !first_scan && self.conflicts.is_empty() {
+            let Some((a, b)) = changed else { return };
+            let n = rope.len_lines();
+            let marker =
+                (a.min(n)..(b + 1).min(n)).any(|l| matches!(rope.line(l).chars().next(), Some('<' | '=' | '>' | '|')));
+            if !marker {
+                return;
+            }
+        }
+        if rope.len_lines() > 200_000 {
+            self.conflicts.clear();
+            return;
+        }
+        // Cheap pre-check: only lines starting with a marker character matter.
+        let lines: Vec<String> = rope
+            .lines()
+            .map(|l| match l.chars().next() {
+                Some('<' | '=' | '>' | '|') => l.chars().take(64).collect(),
+                _ => String::new(),
+            })
+            .collect();
+        self.conflicts = crate::conflicts::find(lines.iter().map(String::as_str));
+    }
+
+    /// Replace conflict `i` with the chosen side(s) (one undo step).
+    pub fn resolve_conflict(&mut self, i: usize, r: crate::conflicts::Resolution) {
+        self.resolve_conflicts(&[i], r);
+    }
+
+    pub fn resolve_all_conflicts(&mut self, r: crate::conflicts::Resolution) {
+        let all: Vec<usize> = (0..self.conflicts.len()).collect();
+        self.resolve_conflicts(&all, r);
+    }
+
+    fn resolve_conflicts(&mut self, which: &[usize], r: crate::conflicts::Resolution) {
+        let rope = self.buffer.rope();
+        let edits: Vec<(usize, usize, String)> = which
+            .iter()
+            .filter_map(|&i| self.conflicts.get(i))
+            .map(|c| {
+                let lines: Vec<String> = (0..=c.end).map(|l| rope.line(l).to_string()).collect();
+                let text = crate::conflicts::resolve(&lines, c, r);
+                let end = if c.end + 1 < rope.len_lines() { rope.line_to_char(c.end + 1) } else { rope.len_chars() };
+                (rope.line_to_char(c.start), end, text)
+            })
+            .collect();
+        if !edits.is_empty() {
+            self.buffer.apply_edits(edits);
+            self.conflicts_version = None;
+            self.update_conflicts(None);
+        }
+    }
+
+    /// Move the caret to the next conflict after the caret (wrapping).
+    pub fn next_conflict(&mut self) -> bool {
+        let line = self.buffer.cursor_pos().line;
+        let Some(c) = self.conflicts.iter().find(|c| c.start > line).or(self.conflicts.first()).copied() else {
+            return false;
+        };
+        self.goto_line(c.start);
+        true
     }
 
     // ---------- folding ----------
