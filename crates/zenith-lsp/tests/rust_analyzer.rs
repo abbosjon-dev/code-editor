@@ -221,3 +221,59 @@ fn rust_analyzer_signature_code_actions_symbols() {
         "{names:?}"
     );
 }
+
+#[test]
+#[ignore]
+fn rust_analyzer_inlay_hints_and_workspace_symbols() {
+    let cfg = default_servers().into_iter().find(|s| s.name == "rust-analyzer").unwrap();
+    if !cfg.is_installed() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("zenith-lsp-e2e3-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo3\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        .unwrap();
+    let src = "fn add(left: i32, right: i32) -> i32 { left + right }\nfn main() {\n    let total = add(1, 2);\n    println!(\"{total}\");\n}\n";
+    let file = dir.join("src/main.rs");
+    std::fs::write(&file, src).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut client = LspClient::start(cfg, &dir, tx, Arc::new(|| {})).unwrap();
+    client.did_open(&file, "rust", 1, src);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (mut hints_req, mut sym_req) = (None, None);
+    let (mut hints, mut syms) = (vec![], vec![]);
+    while Instant::now() < deadline && (hints.is_empty() || syms.is_empty()) {
+        if hints_req.is_none() && hints.is_empty() {
+            hints_req = Some(client.inlay_hints(&file, 0, 4));
+        }
+        if sym_req.is_none() && syms.is_empty() {
+            sym_req = Some(client.workspace_symbols("add"));
+        }
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(LspEvent::InlayHints { request, hints: h }) if Some(request) == hints_req => {
+                eprintln!("hints: {h:?}");
+                if h.iter().any(|x| x.label.contains("i32")) {
+                    hints = h;
+                } else {
+                    hints_req = None;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            Ok(LspEvent::WorkspaceSymbols { request, symbols }) if Some(request) == sym_req => {
+                if symbols.iter().any(|s| s.name == "add") {
+                    syms = symbols;
+                } else {
+                    sym_req = None;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+            _ => {}
+        }
+    }
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+    // `let total` gets a type hint, `add(1, 2)` parameter hints.
+    assert!(hints.iter().any(|h| h.line == 2 && h.label.contains("i32")), "{hints:?}");
+    assert!(hints.iter().any(|h| h.label.starts_with("left")), "{hints:?}");
+    assert!(syms.iter().any(|s| s.name == "add" && s.path.is_some()), "{syms:?}");
+}

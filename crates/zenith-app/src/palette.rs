@@ -22,6 +22,8 @@ pub enum PaletteAction {
     GitCheckout(String),
     GitNewBranch,
     GotoPosition(usize, usize),
+    /// Open a file at an LSP position (line, UTF-16 column).
+    OpenAt(std::path::PathBuf, usize, usize),
 }
 
 #[derive(Clone)]
@@ -37,6 +39,8 @@ pub enum Mode {
     Files,
     GotoLine,
     Pick,
+    /// Items come from the language server as the query changes.
+    WorkspaceSymbols,
 }
 
 pub struct CommandPalette {
@@ -79,6 +83,12 @@ impl CommandPalette {
         self.selected = 0;
         self.filtered_for = None;
         self.focus = true;
+    }
+
+    /// Replace the items, keeping the query (live results).
+    pub fn set_items(&mut self, items: Vec<Item>) {
+        self.items = items;
+        self.filtered_for = None;
     }
 
     pub fn close(&mut self) {

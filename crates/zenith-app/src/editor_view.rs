@@ -77,6 +77,31 @@ fn visual_cols(chars: &[char], tab: usize) -> Vec<usize> {
     out
 }
 
+/// Like [`visual_cols`], but leaving room for the line's inlay hints: a
+/// hint before char `i` pushes `i` and everything after it to the right.
+fn line_vcols(doc: &Document, line: usize, chars: &[char], tab: usize) -> Vec<usize> {
+    let hints = doc.hints_on(line);
+    if hints.is_empty() {
+        return visual_cols(chars, tab);
+    }
+    let mut out = Vec::with_capacity(chars.len() + 1);
+    let mut v = 0;
+    let mut h = 0;
+    for i in 0..=chars.len() {
+        if i < chars.len() {
+            while h < hints.len() && hints[h].col <= i {
+                v += hints[h].label.chars().count();
+                h += 1;
+            }
+        }
+        out.push(v);
+        if let Some(&c) = chars.get(i) {
+            v += if c == '\t' { tab - v % tab } else { c.width().unwrap_or(1).max(1) };
+        }
+    }
+    out
+}
+
 fn line_chars(doc: &Document, line: usize) -> Vec<char> {
     let rope = doc.buffer.rope();
     if line >= rope.len_lines() {
@@ -208,7 +233,7 @@ pub fn editor_ui(
                             .min(total_rows.saturating_sub(1));
                         let line = fm.line_at(row);
                         let chars = line_chars(doc, line);
-                        let vc = visual_cols(&chars, m.tab);
+                        let vc = line_vcols(doc, line, &chars, m.tab);
                         let (seg_s, seg_e) = fm.row_cols(row);
                         let seg_s = seg_s.min(chars.len());
                         // On a wrapped row (not the last), stay before the break.
@@ -301,7 +326,7 @@ pub fn editor_ui(
                         let line = fm.line_at(row);
                         if row < total_rows {
                             let chars = line_chars(doc, line);
-                            let vc = visual_cols(&chars, m.tab);
+                            let vc = line_vcols(doc, line, &chars, m.tab);
                             let seg_s = fm.row_cols(row).0.min(chars.len());
                             let target = ((pos.x - text_x) / m.char_w).floor() as isize + vc[seg_s] as isize;
                             if let Some(col) =
@@ -445,7 +470,7 @@ pub fn editor_ui(
                     let line = fm.line_at(row);
                     let y = rect.min.y + row as f32 * m.line_h;
                     let chars = line_chars(doc, line);
-                    let vc = visual_cols(&chars, m.tab);
+                    let vc = line_vcols(doc, line, &chars, m.tab);
                     // The part of the line shown on this row (soft wrap).
                     let (seg_s, seg_raw_e) = fm.row_cols(row);
                     let seg_s = seg_s.min(chars.len());
@@ -570,12 +595,46 @@ pub fn editor_ui(
                         }
                     }
 
-                    // Text.
+                    // Text (in pieces between inlay hints, which take their own room).
+                    let hints = doc.hints_on(line);
                     if seg_e > seg_s {
-                        let spans = doc.highlight.line(line).map(|sp| slice_spans(sp, seg_s, seg_e));
-                        let job = layout_line(&chars[seg_s..seg_e], spans.as_deref(), &m, p);
-                        let galley = ui.fonts(|f| f.layout_job(job));
-                        painter.galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
+                        let mut cuts: Vec<usize> =
+                            hints.iter().map(|h| h.col).filter(|&c| c > seg_s && c < seg_e).collect();
+                        cuts.dedup();
+                        let mut a = seg_s;
+                        for b in cuts.into_iter().chain([seg_e]) {
+                            if b > a {
+                                let spans = doc.highlight.line(line).map(|sp| slice_spans(sp, a, b));
+                                let job = layout_line(&chars[a..b], spans.as_deref(), &m, p);
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                painter.galley(egui::pos2(x_of(a), y + (m.line_h - m.row_h) / 2.0), galley, p.text);
+                            }
+                            a = b;
+                        }
+                    }
+                    for h in hints {
+                        let at_end = h.col >= chars.len();
+                        if h.col < seg_s || h.col > seg_e || (at_end && !last_seg) || (h.col == seg_e && !at_end) {
+                            continue;
+                        }
+                        let w = h.label.chars().count() as f32 * m.char_w;
+                        // Before char `col` (its room is already in `vc`), or after the line's end.
+                        let x0 = if at_end { x_of(chars.len()) } else { x_of(h.col) - w };
+                        let label = h.label.trim();
+                        let lead = h.label.len() - h.label.trim_start().len();
+                        let x = x0 + lead as f32 * m.char_w;
+                        let r = Rect::from_min_size(
+                            egui::pos2(x - 1.0, y + 3.0),
+                            egui::vec2(label.chars().count() as f32 * m.char_w + 2.0, m.line_h - 6.0),
+                        );
+                        painter.rect_filled(r, 3.0, p.bg_hover);
+                        painter.text(
+                            egui::pos2(x, y + m.line_h / 2.0),
+                            Align2::LEFT_CENTER,
+                            label,
+                            m.font.clone(),
+                            p.text_faint,
+                        );
                     }
 
                     // Conflict actions on the `<<<<<<<` line.
@@ -699,7 +758,7 @@ pub fn editor_ui(
                 // Screen position of a caret, honoring soft wrap.
                 let caret_xy = |doc: &Document, line: usize, col: usize| -> (f32, f32) {
                     let chars = line_chars(doc, line);
-                    let vc = visual_cols(&chars, m.tab);
+                    let vc = line_vcols(doc, line, &chars, m.tab);
                     let col = col.min(chars.len());
                     let row = fm.row_of_pos(line, col);
                     let seg_s = fm.row_cols(row).0.min(col);
@@ -1779,11 +1838,11 @@ fn move_visual(doc: &mut Document, dir: isize, shift: bool) {
     let target = target as usize;
     let (s0, _) = map.row_cols(row);
     let cur_chars = line_chars(doc, pos.line);
-    let cvc = visual_cols(&cur_chars, tab);
+    let cvc = line_vcols(doc, pos.line, &cur_chars, tab);
     let x = cvc[pos.col.min(cur_chars.len())] - cvc[s0.min(cur_chars.len())];
     let line = map.line_at(target);
     let chars = line_chars(doc, line);
-    let vc = visual_cols(&chars, tab);
+    let vc = line_vcols(doc, line, &chars, tab);
     let (ts, te) = map.row_cols(target);
     let ts = ts.min(chars.len());
     let te = if te == usize::MAX { chars.len() } else { te.saturating_sub(1).max(ts) };

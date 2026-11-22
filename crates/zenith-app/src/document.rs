@@ -41,6 +41,14 @@ pub struct Signature {
     pub help: Option<zenith_lsp::SignatureHelp>,
 }
 
+/// An inlay hint placed before char `col` of `line`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlayView {
+    pub line: usize,
+    pub col: usize,
+    pub label: String,
+}
+
 pub struct Hover {
     pub request: u64,
     pub idx: usize,
@@ -99,6 +107,13 @@ pub struct Document {
     pub breakpoints_gen: u64,
     /// Line where the debugger is stopped.
     pub debug_line: Option<usize>,
+    /// Inlay hints sorted by position; the version they were computed for,
+    /// and the request in flight (id, version).
+    pub inlay_hints: Vec<InlayView>,
+    pub inlay_version: Option<u64>,
+    pub inlay_request: Option<(u64, u64)>,
+    /// Empty answers are retried (servers answer [] while indexing).
+    pub inlay_retry: (u8, Option<std::time::Instant>),
     /// The debugger is paused (hovering shows values).
     pub debug_paused: bool,
     /// Value of the expression under the mouse: (char index, "expr = value").
@@ -179,6 +194,10 @@ impl Document {
             breakpoints_gen: 0,
             debug_line: None,
             debug_paused: false,
+            inlay_hints: vec![],
+            inlay_version: None,
+            inlay_request: None,
+            inlay_retry: (0, None),
             debug_value: None,
             conflicts_version: None,
             review: None,
@@ -312,6 +331,21 @@ impl Document {
                     .collect();
                 self.folds_gen += 1;
             }
+            // Inlay hints: drop the edited lines' hints, move the rest.
+            if !self.inlay_hints.is_empty() {
+                // Last edited line, in the old numbering.
+                let old_last = (last as isize - delta).max(line as isize);
+                self.inlay_hints.retain_mut(|h| {
+                    if h.line < line {
+                        true
+                    } else if (h.line as isize) <= old_last {
+                        false
+                    } else {
+                        h.line = (h.line as isize + delta) as usize;
+                        true
+                    }
+                });
+            }
             // Breakpoints move with their lines too.
             if delta != 0 && !self.breakpoints.is_empty() && self.last_len_lines > 0 {
                 let removed_end = if delta < 0 { line as isize - delta } else { line as isize };
@@ -357,6 +391,13 @@ impl Document {
             Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
             _ => vec![],
         };
+    }
+
+    /// Inlay hints on `line`.
+    pub fn hints_on(&self, line: usize) -> &[InlayView] {
+        let a = self.inlay_hints.partition_point(|h| h.line < line);
+        let b = self.inlay_hints.partition_point(|h| h.line <= line);
+        &self.inlay_hints[a..b]
     }
 
     // ---------- debugging ----------

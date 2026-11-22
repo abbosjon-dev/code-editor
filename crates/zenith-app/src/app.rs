@@ -41,6 +41,14 @@ enum SidebarView {
     PluginPanel(usize),
 }
 
+#[derive(Default)]
+struct WsSymbols {
+    query: String,
+    changed: Option<Instant>,
+    pending: Vec<u64>,
+    results: Vec<zenith_lsp::Symbol>,
+}
+
 /// Contents of a plugin panel (from its last `set_panel`).
 #[derive(Default)]
 struct PanelData {
@@ -152,6 +160,8 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Live "Go to Symbol in Workspace" state.
+    ws_symbols: WsSymbols,
     /// Breakpoints of files that aren't open.
     bp_store: std::collections::BTreeMap<PathBuf, crate::debug::Breakpoints>,
     changes_refreshed: Option<Instant>,
@@ -250,6 +260,7 @@ impl ZenithApp {
             debugger: crate::debug::Debugger::new(waker.clone()),
             debug_configs: None,
             bp_store: Default::default(),
+            ws_symbols: Default::default(),
             changes_refreshed: None,
             scm_repo: 0,
             commit_message: String::new(),
@@ -1228,6 +1239,21 @@ impl ZenithApp {
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
             }
+            Cmd::GotoWorkspaceSymbol => {
+                self.ws_symbols = Default::default();
+                self.palette.show(Mode::WorkspaceSymbols, vec![], "Type to search symbols in the workspace");
+                if self.lsp.running().is_empty() {
+                    self.toast("No language server is running yet — open a source file first", NotifyLevel::Info);
+                }
+            }
+            Cmd::ToggleInlayHints => {
+                self.settings.inlay_hints = !self.settings.inlay_hints;
+                self.write_settings();
+                for d in &mut self.docs {
+                    d.inlay_hints.clear();
+                    d.inlay_version = None;
+                }
+            }
             Cmd::ShowDebug => {
                 self.sidebar = SidebarView::Debug;
                 self.show_sidebar = true;
@@ -1607,6 +1633,18 @@ impl ZenithApp {
                 self.launch_agent(&id);
             }
             PaletteAction::OpenRecent(p) => self.open_workspace(p),
+            PaletteAction::OpenAt(path, line, character) => {
+                if self.open_file(&path) {
+                    if let Some(doc) = self.active_doc() {
+                        let idx =
+                            doc.lsp_to_char(zenith_lsp::LspPos { line: line as u32, character: character as u32 });
+                        doc.buffer.clear_extra();
+                        doc.buffer.set_cursor(idx, false);
+                        doc.reveal_line = Some(line);
+                    }
+                    self.focus_editor = true;
+                }
+            }
             PaletteAction::GotoPosition(line, character) => {
                 if let Some(doc) = self.active_doc() {
                     let idx = doc.lsp_to_char(zenith_lsp::LspPos { line: line as u32, character: character as u32 });
@@ -1844,11 +1882,41 @@ impl ZenithApp {
     // Language servers
     // ------------------------------------------------------------------
 
+    /// Re-query workspace symbols when the palette's query changed (debounced).
+    fn update_workspace_symbols(&mut self) {
+        if !(self.palette.open && self.palette.mode == Mode::WorkspaceSymbols) {
+            return;
+        }
+        let q = self.palette.query.trim().to_string();
+        if q == self.ws_symbols.query {
+            self.ws_symbols.changed = None;
+            return;
+        }
+        let since = *self.ws_symbols.changed.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_millis(150) {
+            self.waker.as_ref()();
+            return;
+        }
+        self.ws_symbols.query = q.clone();
+        self.ws_symbols.changed = None;
+        self.ws_symbols.results.clear();
+        self.ws_symbols.pending = if q.is_empty() { vec![] } else { self.lsp.request_workspace_symbols(&q) };
+        if q.is_empty() {
+            self.palette.set_items(vec![]);
+        }
+    }
+
     fn handle_lsp(&mut self) {
         let roots: Vec<Option<PathBuf>> = self.docs.iter().map(|d| self.root_of(d.path())).collect();
-        for (doc, root) in self.docs.iter_mut().zip(roots) {
+        self.lsp.inlay_hints = self.settings.inlay_hints;
+        for (i, (doc, root)) in self.docs.iter_mut().zip(roots).enumerate() {
             self.lsp.sync(doc, root.as_deref(), false);
+            // Hints only for what's on screen.
+            if i == self.active || (self.split && i == self.other) {
+                self.lsp.maybe_request_inlay_hints(doc, root.as_deref());
+            }
         }
+        self.update_workspace_symbols();
         for outcome in self.lsp.poll(&mut self.docs, &mut self.pending_definition) {
             match outcome {
                 LspOutcome::GotoLocation { path, line, character } => {
@@ -1905,6 +1973,28 @@ impl ZenithApp {
                                 .collect();
                             self.code_actions = actions;
                             self.palette.show(Mode::Pick, items, "Quick fix / code action");
+                        }
+                    }
+                }
+                LspOutcome::WorkspaceSymbols { request, symbols } => {
+                    if let Some(pos) = self.ws_symbols.pending.iter().position(|r| *r == request) {
+                        self.ws_symbols.pending.remove(pos);
+                        self.ws_symbols.results.extend(symbols);
+                        let items = self
+                            .ws_symbols
+                            .results
+                            .iter()
+                            .filter_map(|s| {
+                                let path = s.path.clone()?;
+                                Some(Item {
+                                    label: s.name.clone(),
+                                    detail: format!("{}  {}:{}", s.kind_label(), self.rel_path(&path), s.line + 1),
+                                    action: PaletteAction::OpenAt(path, s.line as usize, s.character as usize),
+                                })
+                            })
+                            .collect();
+                        if self.palette.open && self.palette.mode == Mode::WorkspaceSymbols {
+                            self.palette.set_items(items);
                         }
                     }
                 }
@@ -2500,6 +2590,7 @@ impl ZenithApp {
             (cs, Key::D, Cmd::ShowDebug, true),
             (cs, Key::Space, Cmd::TriggerParameterHints, false),
             (cmd, Key::Period, Cmd::CodeActions, false),
+            (cs, Key::T, Cmd::GotoWorkspaceSymbol, true),
             (cmd, Key::T, Cmd::GotoSymbol, false),
             (cs, Key::Backtick, Cmd::NewTerminal, true),
             (ctrl | Modifiers::SHIFT, Key::Tab, Cmd::PrevTab, false),

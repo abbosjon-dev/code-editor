@@ -6,7 +6,7 @@
 //! channel, so the UI never waits on a server.
 
 mod protocol;
-mod text;
+pub mod text;
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
@@ -191,6 +191,21 @@ pub struct Symbol {
     pub line: u32,
     pub character: u32,
     pub depth: usize,
+    /// File (workspace symbols only).
+    pub path: Option<PathBuf>,
+}
+
+/// An inlay hint: virtual text shown inside a line (types, parameter names).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlayHint {
+    pub line: u32,
+    /// UTF-16 column.
+    pub character: u32,
+    pub label: String,
+    /// 1 = type, 2 = parameter.
+    pub kind: u32,
+    pub padding_left: bool,
+    pub padding_right: bool,
 }
 
 impl Symbol {
@@ -266,6 +281,14 @@ pub enum LspEvent {
         request: u64,
         symbols: Vec<Symbol>,
     },
+    WorkspaceSymbols {
+        request: u64,
+        symbols: Vec<Symbol>,
+    },
+    InlayHints {
+        request: u64,
+        hints: Vec<InlayHint>,
+    },
     /// The server asked us to apply an edit (e.g. after a code action command).
     ApplyEdit {
         edits: Vec<(PathBuf, Vec<TextEdit>)>,
@@ -298,6 +321,8 @@ enum Pending {
     SignatureHelp,
     CodeAction,
     Symbols,
+    WorkspaceSymbols,
+    InlayHints,
     Other,
 }
 
@@ -386,7 +411,7 @@ impl LspClient {
                 "capabilities": {
                     "general": { "positionEncodings": ["utf-16"] },
                     "window": { "workDoneProgress": true },
-                    "workspace": { "configuration": true, "workspaceFolders": true, "applyEdit": true },
+                    "workspace": { "configuration": true, "workspaceFolders": true, "applyEdit": true, "symbol": {} },
                     "textDocument": {
                         "synchronization": { "didSave": true, "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false },
@@ -411,7 +436,8 @@ impl LspClient {
                             },
                             "isPreferredSupport": true
                         },
-                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
+                        "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                        "inlayHint": { "dynamicRegistration": false }
                     }
                 }
             }
@@ -541,6 +567,23 @@ impl LspClient {
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": text::path_to_uri(path) } }),
             Pending::Symbols,
+        )
+    }
+
+    /// Symbols matching `query` across the workspace.
+    pub fn workspace_symbols(&mut self, query: &str) -> u64 {
+        self.request("workspace/symbol", json!({ "query": query }), Pending::WorkspaceSymbols)
+    }
+
+    /// Inlay hints for lines `start..=end` of a document (`end` must exist).
+    pub fn inlay_hints(&mut self, path: &Path, start: u32, end: u32) -> u64 {
+        self.request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": text::path_to_uri(path) },
+                "range": { "start": { "line": start, "character": 0 }, "end": { "line": end, "character": 10_000 } }
+            }),
+            Pending::InlayHints,
         )
     }
 
@@ -680,6 +723,12 @@ fn handle_message(
                     let mut symbols = vec![];
                     parse_symbols(&result, 0, &mut symbols);
                     out.push(LspEvent::Symbols { request: id, symbols });
+                }
+                Some(Pending::WorkspaceSymbols) => {
+                    out.push(LspEvent::WorkspaceSymbols { request: id, symbols: parse_workspace_symbols(&result) });
+                }
+                Some(Pending::InlayHints) => {
+                    out.push(LspEvent::InlayHints { request: id, hints: parse_inlay_hints(&result) });
                 }
                 Some(Pending::Other) | None => {}
             }
@@ -874,6 +923,7 @@ pub(crate) fn parse_symbols(v: &Value, depth: usize, out: &mut Vec<Symbol>) {
             line: range.start.line,
             character: range.start.character,
             depth,
+            path: None,
         });
         parse_symbols(&s["children"], depth + 1, out);
     }
@@ -881,6 +931,53 @@ pub(crate) fn parse_symbols(v: &Value, depth: usize, out: &mut Vec<Symbol>) {
         // SymbolInformation lists are not ordered.
         out.sort_by_key(|s| (s.line, s.character));
     }
+}
+
+/// `workspace/symbol` results (SymbolInformation or WorkspaceSymbol).
+pub(crate) fn parse_workspace_symbols(v: &Value) -> Vec<Symbol> {
+    let Some(list) = v.as_array() else { return vec![] };
+    list.iter()
+        .filter_map(|s| {
+            let name = s["name"].as_str()?;
+            let uri = s["location"]["uri"].as_str()?;
+            let range = parse_range(&s["location"]["range"]).unwrap_or_default();
+            Some(Symbol {
+                name: name.to_string(),
+                detail: s["containerName"].as_str().unwrap_or_default().to_string(),
+                kind: s["kind"].as_u64().unwrap_or(0) as u32,
+                line: range.start.line,
+                character: range.start.character,
+                depth: 0,
+                path: text::uri_to_path(uri),
+            })
+        })
+        .take(500)
+        .collect()
+}
+
+pub(crate) fn parse_inlay_hints(v: &Value) -> Vec<InlayHint> {
+    let Some(list) = v.as_array() else { return vec![] };
+    let mut out: Vec<InlayHint> = list
+        .iter()
+        .filter_map(|h| {
+            let label = match &h["label"] {
+                Value::String(s) => s.clone(),
+                Value::Array(parts) => parts.iter().filter_map(|p| p["value"].as_str()).collect(),
+                _ => return None,
+            };
+            Some(InlayHint {
+                line: h["position"]["line"].as_u64()? as u32,
+                character: h["position"]["character"].as_u64()? as u32,
+                label: label.trim().to_string(),
+                kind: h["kind"].as_u64().unwrap_or(0) as u32,
+                padding_left: h["paddingLeft"].as_bool().unwrap_or(false),
+                padding_right: h["paddingRight"].as_bool().unwrap_or(false),
+            })
+        })
+        .filter(|h| !h.label.is_empty())
+        .collect();
+    out.sort_by_key(|h| (h.line, h.character));
+    out
 }
 
 /// Apply LSP text edits (UTF-16 positions) to a string.
@@ -920,6 +1017,22 @@ pub fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inlay_hints_and_workspace_symbols() {
+        let h = parse_inlay_hints(&json!([
+            {"position": {"line": 3, "character": 9}, "label": ": i32", "kind": 1},
+            {"position": {"line": 1, "character": 4}, "label": [{"value": "x"}, {"value": ":"}], "kind": 2, "paddingRight": true},
+            {"position": {"line": 1, "character": 5}, "label": "  "}
+        ]));
+        assert_eq!(h.len(), 2);
+        assert_eq!((h[0].line, h[0].label.as_str(), h[0].padding_right), (1, "x:", true));
+        assert_eq!((h[1].character, h[1].kind), (9, 1));
+        let s = parse_workspace_symbols(&json!([
+            {"name": "main", "kind": 12, "containerName": "app", "location": {"uri": "file:///tmp/a.rs", "range": {"start": {"line": 4, "character": 3}, "end": {"line": 4, "character": 7}}}}
+        ]));
+        assert_eq!((s[0].name.as_str(), s[0].line, s[0].path.as_deref()), ("main", 4, Some(Path::new("/tmp/a.rs"))));
+    }
 
     #[test]
     fn applies_edits_with_utf16() {

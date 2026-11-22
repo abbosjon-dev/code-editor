@@ -155,6 +155,7 @@ fn appearance(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |=
         checkbox(ui, &mut s.inline_diagnostics, "Inline problems", "Show error/warning text at the end of the line");
     c.any |= checkbox(ui, &mut s.inline_blame, "Inline git blame", "Author and commit of the caret's line");
+    c.any |= checkbox(ui, &mut s.inlay_hints, "Inlay hints", "Types and parameter names from the language server");
     c.any |= checkbox(ui, &mut s.show_indent_guides, "Indent guides", "");
     c.any |= checkbox(ui, &mut s.cursor_blink, "Blinking cursor", "");
 }

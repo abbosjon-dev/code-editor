@@ -24,6 +24,8 @@ pub struct LspManager {
     wake_at: Option<Instant>,
     /// Workspace folder of each running client.
     client_roots: HashMap<String, PathBuf>,
+    /// Show inlay hints (types, parameter names).
+    pub inlay_hints: bool,
 }
 
 /// What the app should do with an event that isn't tied to a document.
@@ -52,6 +54,10 @@ pub enum LspOutcome {
         actions: Vec<zenith_lsp::CodeAction>,
     },
     Symbols {
+        request: u64,
+        symbols: Vec<zenith_lsp::Symbol>,
+    },
+    WorkspaceSymbols {
         request: u64,
         symbols: Vec<zenith_lsp::Symbol>,
     },
@@ -89,6 +95,7 @@ impl LspManager {
             enabled,
             wake_at: None,
             client_roots: HashMap::new(),
+            inlay_hints: true,
         }
     }
 
@@ -289,6 +296,31 @@ impl LspManager {
         Some(self.client_for(doc, root)?.code_actions(&path, range, diags))
     }
 
+    /// Ask every running server for workspace symbols matching `query`.
+    pub fn request_workspace_symbols(&mut self, query: &str) -> Vec<u64> {
+        self.clients.values_mut().map(|c| c.workspace_symbols(query)).collect()
+    }
+
+    /// Request inlay hints for a document once its current text reached the
+    /// server (and again after new diagnostics, when the server may know more).
+    pub fn maybe_request_inlay_hints(&mut self, doc: &mut Document, root: Option<&Path>) {
+        if !self.inlay_hints || !doc.lsp_active || doc.inlay_request.is_some() {
+            return;
+        }
+        let v = doc.buffer.version();
+        if doc.lsp_version != Some(v) || doc.inlay_version == Some(v) {
+            return;
+        }
+        if doc.inlay_retry.1.is_some_and(|t| t > Instant::now()) {
+            return;
+        }
+        let Some(path) = doc.path().map(Path::to_path_buf) else { return };
+        let last = doc.buffer.len_lines().saturating_sub(1) as u32;
+        if let Some(c) = self.client_for(doc, root) {
+            doc.inlay_request = Some((c.inlay_hints(&path, 0, last), v));
+        }
+    }
+
     pub fn request_symbols(&mut self, doc: &mut Document, root: Option<&Path>) -> Option<u64> {
         self.sync(doc, root, true);
         let path = doc.path()?.to_path_buf();
@@ -310,6 +342,8 @@ impl LspManager {
                     let path = path.canonicalize().unwrap_or(path);
                     if let Some(doc) = docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
                         doc.set_diagnostics(diagnostics.clone());
+                        // The server finished analysing: hints may be complete now.
+                        doc.inlay_version = None;
                     }
                     out.push(LspOutcome::Diagnostics { path, diagnostics });
                 }
@@ -351,6 +385,48 @@ impl LspManager {
                 LspEvent::Formatting { request, edits } => out.push(LspOutcome::Formatting { request, edits }),
                 LspEvent::CodeActions { request, actions } => out.push(LspOutcome::CodeActions { request, actions }),
                 LspEvent::Symbols { request, symbols } => out.push(LspOutcome::Symbols { request, symbols }),
+                LspEvent::WorkspaceSymbols { request, symbols } => {
+                    out.push(LspOutcome::WorkspaceSymbols { request, symbols })
+                }
+                LspEvent::InlayHints { request, hints } => {
+                    if let Some(doc) = docs.iter_mut().find(|d| d.inlay_request.is_some_and(|(r, _)| r == request)) {
+                        let (_, v) = doc.inlay_request.take().unwrap_or_default();
+                        if v == doc.buffer.version() {
+                            let views = hints
+                                .iter()
+                                .map(|h| {
+                                    let line = h.line as usize;
+                                    let text = doc.buffer.line_text(line);
+                                    let col = zenith_lsp::text::utf16_to_char_col(&text, h.character);
+                                    let label = format!(
+                                        "{}{}{}",
+                                        if h.padding_left { " " } else { "" },
+                                        h.label,
+                                        if h.padding_right { " " } else { "" }
+                                    );
+                                    crate::document::InlayView { line, col, label }
+                                })
+                                .collect();
+                            let empty = hints.is_empty();
+                            doc.inlay_hints = views;
+                            doc.inlay_version = Some(v);
+                            if empty && doc.inlay_retry.0 < 8 {
+                                // Probably still indexing: ask again a bit later.
+                                doc.inlay_retry.0 += 1;
+                                let wait = Duration::from_millis(800 * doc.inlay_retry.0 as u64);
+                                doc.inlay_retry.1 = Some(Instant::now() + wait);
+                                doc.inlay_version = None;
+                                let waker = self.waker.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(wait + Duration::from_millis(10));
+                                    waker();
+                                });
+                            } else if !empty {
+                                doc.inlay_retry = (0, None);
+                            }
+                        }
+                    }
+                }
                 LspEvent::ApplyEdit { edits } => out.push(LspOutcome::ApplyEdit { edits }),
                 LspEvent::SignatureHelp { request, help } => {
                     for doc in docs.iter_mut() {
@@ -369,6 +445,11 @@ impl LspManager {
                     }
                     None => {
                         self.progress.remove(&server);
+                        // Indexing finished: hints may be available now.
+                        for d in docs.iter_mut() {
+                            d.inlay_version = None;
+                            d.inlay_retry = (0, None);
+                        }
                     }
                 },
                 LspEvent::Ready { server } => log::info!("language server {server} ready"),

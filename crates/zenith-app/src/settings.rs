@@ -26,6 +26,8 @@ pub struct Settings {
     pub inline_diagnostics: bool,
     /// Show who last changed the caret's line (git blame) at its end.
     pub inline_blame: bool,
+    /// Show inlay hints from the language server (types, parameter names).
+    pub inlay_hints: bool,
     pub cursor_blink: bool,
     /// Vim-style modal editing (normal / insert / visual modes).
     pub vim_mode: bool,
@@ -65,6 +67,7 @@ impl Default for Settings {
             word_wrap: false,
             inline_diagnostics: true,
             inline_blame: true,
+            inlay_hints: true,
             cursor_blink: true,
             vim_mode: false,
             auto_save: false,
