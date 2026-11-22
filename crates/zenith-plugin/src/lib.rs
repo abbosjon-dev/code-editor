@@ -37,6 +37,56 @@ pub struct Manifest {
     /// Editor events the plugin wants: "file_opened", "file_saved".
     #[serde(default)]
     pub events: Vec<String>,
+    /// Sidebar panels (an icon in the activity bar each).
+    #[serde(default)]
+    pub panels: Vec<PanelContribution>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PanelContribution {
+    pub id: String,
+    pub title: String,
+    /// One symbol shown in the activity bar, e.g. "☑".
+    #[serde(default)]
+    pub icon: String,
+}
+
+/// One row of a plugin panel.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct PanelItem {
+    pub label: String,
+    /// Dimmed text after the label.
+    #[serde(default)]
+    pub detail: String,
+    /// Short symbol before the label.
+    #[serde(default)]
+    pub icon: String,
+    /// Section header (bold, not clickable).
+    #[serde(default)]
+    pub header: bool,
+    #[serde(default)]
+    pub indent: usize,
+    /// Click opens this file (relative to the workspace or absolute)...
+    #[serde(default)]
+    pub path: Option<String>,
+    /// ...at this 1-based line.
+    #[serde(default)]
+    pub line: Option<usize>,
+    /// ...or runs this plugin command (receives `item` = `id`).
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Hover text.
+    #[serde(default)]
+    pub tooltip: String,
+}
+
+/// A button in a panel's header.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct PanelButton {
+    pub title: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -89,6 +139,17 @@ pub enum Action {
         text: String,
         #[serde(default)]
         agent: Option<String>,
+    },
+    /// Replace the contents of one of the plugin's panels.
+    SetPanel {
+        panel: String,
+        #[serde(default)]
+        items: Vec<PanelItem>,
+        /// Text shown above the items (e.g. "No TODOs found").
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        buttons: Vec<PanelButton>,
     },
 }
 
@@ -222,8 +283,29 @@ impl PluginHost {
     /// Run a plugin command. Never blocks on the plugin; the answer arrives
     /// later through [`PluginHost::poll`].
     pub fn execute(&mut self, command: &str, ctx: &EditorContext) -> Result<()> {
+        self.execute_item(command, ctx, None)
+    }
+
+    /// Run a command for a clicked panel item (`item` = the item's id).
+    pub fn execute_item(&mut self, command: &str, ctx: &EditorContext, item: Option<&str>) -> Result<()> {
         let idx = *self.commands.get(command).context("unknown plugin command")?;
-        self.send(idx, "execute", json!({ "command": command, "context": ctx }))
+        self.send(idx, "execute", json!({ "command": command, "context": ctx, "item": item }))
+    }
+
+    /// All panels of enabled plugins: (plugin id, panel).
+    pub fn panels(&self) -> Vec<(String, PanelContribution)> {
+        self.plugins
+            .iter()
+            .filter(|p| p.enabled)
+            .flat_map(|p| p.manifest.panels.iter().map(move |c| (p.manifest.id.clone(), c.clone())))
+            .collect()
+    }
+
+    /// Tell a plugin its panel became visible (starting the plugin if needed);
+    /// it answers with a `set_panel` action.
+    pub fn open_panel(&mut self, plugin_id: &str, panel: &str, ctx: &EditorContext) -> Result<()> {
+        let idx = self.plugins.iter().position(|p| p.manifest.id == plugin_id).context("unknown plugin")?;
+        self.send(idx, "event", json!({ "event": "panel_opened", "data": { "panel": panel, "context": ctx } }))
     }
 
     /// Broadcast an editor event to plugins that subscribed to it.
@@ -443,6 +525,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_panels() {
+        let ev = parse_line(
+            r#"{"method":"action","params":{"type":"set_panel","panel":"todos","items":[{"label":"a.rs","header":true},{"label":"TODO x","path":"a.rs","line":4}],"buttons":[{"title":"⟳","command":"t.refresh"}]}}"#,
+        );
+        let PluginEventKind::Action(Action::SetPanel { panel, items, buttons, message }) = &ev[0] else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(panel, "todos");
+        assert!(items[0].header && items[1].line == Some(4) && message.is_empty());
+        assert_eq!(buttons[0].command, "t.refresh");
+        let m: Manifest =
+            toml::from_str("id='t'\nname='T'\nrun=['x']\n[[panels]]\nid='todos'\ntitle='TODO'\nicon='☑'\n").unwrap();
+        assert_eq!(m.panels[0].icon, "☑");
+    }
+
+    #[test]
     fn manifest_roundtrip() {
         let m: Manifest = toml::from_str(
             r#"
@@ -481,6 +579,7 @@ mod tests {
                 run: vec!["sh".into(), "p.sh".into()],
                 commands: vec![CommandContribution { id: "t.ping".into(), title: "Ping".into(), keybinding: None }],
                 events: vec![],
+                panels: vec![],
             },
             dir.clone(),
         );

@@ -87,6 +87,45 @@ stderr'ga yozilgan hamma narsa log hisoblanadi.
 | `open_file` | `path`, `line`? | Faylni ochadi (nisbiy yo'l = workspace'dan) |
 | `run_in_terminal` | `command` | Yangi terminalda buyruqni bajaradi |
 | `send_to_agent` | `text`, `agent`? | AI agentga matn yuboradi (kerak bo'lsa ishga tushiradi) |
+| `set_panel` | `panel`, `items`, `message`?, `buttons`? | Plugin panelining tarkibini almashtiradi (pastga qarang) |
+
+## Yon panel (sidebar panel)
+
+Plugin activity bar'da o'z ikonkasi bo'lgan panel qo'shishi mumkin:
+
+```toml
+[[panels]]
+id = "todos"
+title = "TODO Tree"
+icon = "☑"          # bitta belgi; bo'sh bo'lsa sarlavhaning birinchi harfi
+```
+
+Foydalanuvchi panelni ochganda (yoki ⟳ bosganda) plugin ishga tushadi va quyidagi hodisani oladi:
+
+```json
+{"id":3,"method":"event","params":{"event":"panel_opened","data":{"panel":"todos","context":{...}}}}
+```
+
+Plugin panel tarkibini `set_panel` amali bilan yuboradi — javob sifatida yoki istalgan vaqtda (masalan, `file_saved` dan keyin):
+
+```json
+{"method":"action","params":{"type":"set_panel","panel":"todos",
+  "message":"3 ta vazifa",
+  "buttons":[{"title":"✳ Ask AI","command":"todo-tree.ask-ai"}],
+  "items":[
+    {"label":"main.rs","detail":"src","header":true},
+    {"icon":"○","label":"handle empty names","detail":"L9","indent":1,"path":"src/main.rs","line":9},
+    {"label":"Qayta ishlash","command":"my.cmd","id":"item-7"}
+  ]}}
+```
+
+`items` maydonlari: `label`, `detail` (xira matn), `icon`, `header` (bo'lim sarlavhasi), `indent`, `tooltip`;
+bosilganda `path` + `line` faylni ochadi, yoki `command` plugin buyrug'ini chaqiradi (`execute` so'rovida
+`"item": <id>` bo'ladi). `buttons` — panel sarlavhasidagi tugmalar.
+
+To'liq misol: [`plugins/examples/todo-tree`](../plugins/examples/todo-tree/main.py).
+
+![Plugin paneli](plugin-panel.png)
 
 ## Eng kichik plugin (Node.js)
 

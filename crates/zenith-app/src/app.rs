@@ -36,6 +36,16 @@ enum SidebarView {
     Problems,
     Agents,
     Plugins,
+    /// A plugin's panel (index into `PluginHost::panels()`).
+    PluginPanel(usize),
+}
+
+/// Contents of a plugin panel (from its last `set_panel`).
+#[derive(Default)]
+struct PanelData {
+    items: Vec<zenith_plugin::PanelItem>,
+    message: String,
+    buttons: Vec<zenith_plugin::PanelButton>,
 }
 
 struct Toast {
@@ -124,6 +134,8 @@ pub struct ZenithApp {
     extra_gits: Vec<Option<Git>>,
     /// Last `@` mention query and its matches (Ask AI dialog).
     mention_cache: Option<(String, Vec<crate::mention::Candidate>)>,
+    /// Plugin panel contents keyed by `plugin/panel`.
+    panel_data: HashMap<String, PanelData>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
     commit_message: String,
@@ -212,6 +224,7 @@ impl ZenithApp {
             git: None,
             extra_gits: vec![],
             mention_cache: None,
+            panel_data: HashMap::new(),
             scm_repo: 0,
             commit_message: String::new(),
             docs: vec![],
@@ -676,14 +689,17 @@ impl ZenithApp {
         self.session.active = self.active;
         self.session.show_sidebar = Some(self.show_sidebar);
         self.session.sidebar = match self.sidebar {
-            SidebarView::Explorer => "explorer",
-            SidebarView::Search => "search",
-            SidebarView::Git => "git",
-            SidebarView::Problems => "problems",
-            SidebarView::Agents => "agents",
-            SidebarView::Plugins => "plugins",
-        }
-        .into();
+            SidebarView::Explorer => "explorer".into(),
+            SidebarView::Search => "search".into(),
+            SidebarView::Git => "git".into(),
+            SidebarView::Problems => "problems".into(),
+            SidebarView::Agents => "agents".into(),
+            SidebarView::Plugins => "plugins".into(),
+            SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
+                Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
+                None => "explorer".into(),
+            },
+        };
         self.session.show_terminal = self.show_terminal;
         self.session.show_ai = self.show_ai;
         self.session.split = self.split;
@@ -721,8 +737,19 @@ impl ZenithApp {
             "problems" => SidebarView::Problems,
             "agents" => SidebarView::Agents,
             "plugins" => SidebarView::Plugins,
-            _ => SidebarView::Explorer,
+            other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
+                Some((plugin, panel)) => self
+                    .plugins
+                    .panels()
+                    .iter()
+                    .position(|(pl, pa)| pl == plugin && pa.id == panel)
+                    .map_or(SidebarView::Explorer, SidebarView::PluginPanel),
+                None => SidebarView::Explorer,
+            },
         };
+        if let (SidebarView::PluginPanel(i), true) = (self.sidebar, self.show_sidebar) {
+            self.open_plugin_panel(i);
+        }
         if sess.split && self.docs.len() > 1 {
             self.split = true;
             self.other = (self.active + 1) % self.docs.len();
@@ -1464,6 +1491,131 @@ impl ZenithApp {
             }
             Action::RunInTerminal { command } => self.run_in_terminal(&command),
             Action::SendToAgent { text, agent } => self.send_to_agent(text, true, agent),
+            Action::SetPanel { panel, items, message, buttons } => {
+                self.panel_data.insert(format!("{plugin}/{panel}"), PanelData { items, message, buttons });
+            }
+        }
+    }
+
+    /// Ask the plugin to fill (refresh) panel `i`.
+    fn open_plugin_panel(&mut self, i: usize) {
+        let Some((plugin, panel)) = self.plugins.panels().into_iter().nth(i) else { return };
+        let ectx = self.editor_context();
+        if let Err(e) = self.plugins.open_panel(&plugin, &panel.id, &ectx) {
+            self.toast(format!("[{plugin}] {e:#}"), NotifyLevel::Error);
+        }
+    }
+
+    fn plugin_panel_ui(&mut self, ui: &mut egui::Ui, p: &Palette, i: usize) {
+        let Some((plugin, panel)) = self.plugins.panels().into_iter().nth(i) else {
+            self.sidebar = SidebarView::Explorer;
+            return;
+        };
+        let key = format!("{plugin}/{}", panel.id);
+        let mut run: Option<(String, Option<String>)> = None;
+        let mut open: Option<(String, Option<usize>)> = None;
+        let mut refresh = false;
+        let data = self.panel_data.get(&key);
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, &panel.title.to_uppercase());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                    refresh = true;
+                }
+                for b in data.map(|d| d.buttons.as_slice()).unwrap_or_default().iter().rev() {
+                    if ui.small_button(&b.title).clicked() {
+                        run = Some((b.command.clone(), None));
+                    }
+                }
+            });
+        });
+        match data {
+            None => {
+                ui.label(RichText::new("Loading…").color(p.text_dim));
+            }
+            Some(d) => {
+                if !d.message.is_empty() {
+                    ui.label(RichText::new(&d.message).color(p.text_dim));
+                    ui.add_space(4.0);
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for (k, it) in d.items.iter().enumerate() {
+                        let indent = it.indent as f32 * 14.0;
+                        if it.header {
+                            ui.add_space(if k == 0 { 0.0 } else { 6.0 });
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                let text = if it.icon.is_empty() {
+                                    it.label.clone()
+                                } else {
+                                    format!("{} {}", it.icon, it.label)
+                                };
+                                ui.label(RichText::new(text).strong().color(p.text));
+                                if !it.detail.is_empty() {
+                                    ui.label(RichText::new(&it.detail).size(11.0).color(p.text_dim));
+                                }
+                            });
+                            continue;
+                        }
+                        let clickable = it.path.is_some() || it.command.is_some();
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 22.0),
+                            if clickable { Sense::click() } else { Sense::hover() },
+                        );
+                        if resp.hovered() && clickable {
+                            ui.painter().rect_filled(rect, 4.0, p.bg_hover);
+                        }
+                        let painter = ui.painter().with_clip_rect(rect);
+                        let mut x = rect.min.x + 8.0 + indent;
+                        if !it.icon.is_empty() {
+                            let r = painter.text(
+                                egui::pos2(x, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &it.icon,
+                                FontId::proportional(12.0),
+                                p.accent,
+                            );
+                            x = r.max.x + 6.0;
+                        }
+                        let r = painter.text(
+                            egui::pos2(x, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            &it.label,
+                            FontId::proportional(13.0),
+                            p.text,
+                        );
+                        if !it.detail.is_empty() {
+                            painter.text(
+                                egui::pos2(r.max.x + 8.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &it.detail,
+                                FontId::proportional(11.5),
+                                p.text_dim,
+                            );
+                        }
+                        let resp = if it.tooltip.is_empty() { resp } else { resp.on_hover_text(&it.tooltip) };
+                        if resp.clicked() {
+                            if let Some(path) = &it.path {
+                                open = Some((path.clone(), it.line));
+                            } else if let Some(c) = &it.command {
+                                run = Some((c.clone(), it.id.clone()));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        if refresh {
+            self.open_plugin_panel(i);
+        }
+        if let Some((path, line)) = open {
+            self.apply_plugin_action(&plugin, Action::OpenFile { path, line });
+        }
+        if let Some((cmd, item)) = run {
+            let ectx = self.editor_context();
+            if let Err(e) = self.plugins.execute_item(&cmd, &ectx, item.as_deref()) {
+                self.toast(format!("[{plugin}] {e:#}"), NotifyLevel::Error);
+            }
         }
     }
 
@@ -2373,7 +2525,17 @@ impl ZenithApp {
                 (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
-            ] {
+            ]
+            .into_iter()
+            .map(|(v, g, t)| (v, g.to_string(), t.to_string()))
+            .chain(self.plugins.panels().into_iter().enumerate().map(|(i, (_, panel))| {
+                let glyph = if panel.icon.is_empty() {
+                    panel.title.chars().next().unwrap_or('◇').to_uppercase().to_string()
+                } else {
+                    panel.icon.clone()
+                };
+                (SidebarView::PluginPanel(i), glyph, panel.title.clone())
+            })) {
                 let active = self.show_sidebar && self.sidebar == view;
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), Sense::click());
                 if active {
@@ -2391,6 +2553,9 @@ impl ZenithApp {
                     } else {
                         self.sidebar = view;
                         self.show_sidebar = true;
+                        if let SidebarView::PluginPanel(i) = view {
+                            self.open_plugin_panel(i);
+                        }
                     }
                 }
             }
@@ -2505,6 +2670,7 @@ impl ZenithApp {
             SidebarView::Search => self.search_ui(ui, &p),
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
+            SidebarView::PluginPanel(i) => self.plugin_panel_ui(ui, &p, i),
             SidebarView::Git => self.git_ui(ctx, ui, &p),
             SidebarView::Problems => self.problems_ui(ui, &p),
         }
@@ -2863,11 +3029,15 @@ impl ZenithApp {
             if ui.button("🗁 Folder").clicked() {
                 self.run(ctx, Cmd::OpenPluginsFolder);
             }
-            if ui.button("+ Create sample").on_hover_text("Scaffold an example plugin you can edit").clicked() {
+            if ui
+                .button("+ Create sample")
+                .on_hover_text("Scaffold example plugins you can edit (commands + a sidebar panel)")
+                .clicked()
+            {
                 match crate::sample_plugin::scaffold(&settings::plugins_dir()) {
                     Ok(dir) => {
                         self.load_plugins();
-                        self.toast(format!("Sample plugin created in {}", dir.display()), NotifyLevel::Info);
+                        self.toast(format!("Sample plugins created in {}", dir.display()), NotifyLevel::Info);
                         self.open_file(&dir.join("main.py"));
                     }
                     Err(e) => self.toast(format!("Couldn't create sample: {e}"), NotifyLevel::Error),

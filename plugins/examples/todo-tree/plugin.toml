@@ -1,0 +1,18 @@
+id = "todo-tree"
+name = "TODO Tree"
+version = "0.1.0"
+description = "Example plugin with a sidebar panel: lists TODO / FIXME / HACK comments in the workspace."
+run = ["python3", "main.py"]
+# Refresh the panel when a file is saved.
+events = ["file_saved"]
+
+# A panel gets its own icon in the activity bar. When it is opened the
+# plugin receives a `panel_opened` event and answers with a `set_panel` action.
+[[panels]]
+id = "todos"
+title = "TODO Tree"
+icon = "☑"
+
+[[commands]]
+id = "todo-tree.ask-ai"
+title = "TODO Tree: Ask AI to Resolve TODOs"
