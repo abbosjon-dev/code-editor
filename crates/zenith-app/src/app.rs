@@ -36,6 +36,7 @@ enum SidebarView {
     Problems,
     Agents,
     Plugins,
+    Debug,
     /// A plugin's panel (index into `PluginHost::panels()`).
     PluginPanel(usize),
 }
@@ -145,6 +146,11 @@ pub struct ZenithApp {
     /// Files changed since the first agent started (multi-file review).
     changes: crate::changeset::ChangeSet,
     show_changes: bool,
+    debugger: crate::debug::Debugger,
+    /// Launch configurations shown in Run & Debug (cached).
+    debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Breakpoints of files that aren't open.
+    bp_store: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
     changes_refreshed: Option<Instant>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
@@ -238,6 +244,9 @@ impl ZenithApp {
             user_keys: vec![],
             changes: Default::default(),
             show_changes: false,
+            debugger: crate::debug::Debugger::new(waker.clone()),
+            debug_configs: None,
+            bp_store: Default::default(),
             changes_refreshed: None,
             scm_repo: 0,
             commit_message: String::new(),
@@ -511,6 +520,10 @@ impl ZenithApp {
                 {
                     self.docs.clear();
                 }
+                if let Some(bps) = self.bp_store.remove(&path) {
+                    doc.breakpoints = bps;
+                    doc.breakpoints_gen += 1;
+                }
                 if let Some(g) = self.git_for(&path) {
                     doc.set_git_base(g.head_text(&path));
                     doc.blame_rx = g.blame_async(&path);
@@ -652,6 +665,9 @@ impl ZenithApp {
         }
         let doc = self.docs.remove(idx);
         self.lsp.did_close(&doc);
+        if let (Some(p), false) = (doc.path(), doc.breakpoints.is_empty()) {
+            self.bp_store.insert(p.to_path_buf(), doc.breakpoints.clone());
+        }
         let fix = |i: &mut usize, len: usize| {
             if *i > idx {
                 *i -= 1;
@@ -707,6 +723,8 @@ impl ZenithApp {
         self.session.cursors =
             self.docs.iter().filter_map(|d| d.path().map(|p| (p.to_path_buf(), d.buffer.sel.head))).collect();
         self.session.active = self.active;
+        self.session.breakpoints =
+            self.all_breakpoints().into_iter().map(|(p, l)| (p, l.into_iter().collect())).collect();
         self.session.show_sidebar = Some(self.show_sidebar);
         self.session.sidebar = match self.sidebar {
             SidebarView::Explorer => "explorer".into(),
@@ -715,6 +733,7 @@ impl ZenithApp {
             SidebarView::Problems => "problems".into(),
             SidebarView::Agents => "agents".into(),
             SidebarView::Plugins => "plugins".into(),
+            SidebarView::Debug => "debug".into(),
             SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
                 Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
                 None => "explorer".into(),
@@ -740,7 +759,30 @@ impl ZenithApp {
     }
 
     /// Re-apply carets, panels, terminals and agents from the saved session.
+    /// Breakpoints of every file: open documents and closed ones.
+    fn all_breakpoints(&self) -> std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = self.bp_store.clone();
+        for d in &self.docs {
+            if let (Some(p), false) = (d.path(), d.breakpoints.is_empty()) {
+                all.insert(p.to_path_buf(), d.breakpoints.clone());
+            }
+        }
+        all
+    }
+
     fn restore_session_state(&mut self, sess: &Session) {
+        for (path, lines) in &sess.breakpoints {
+            let set: std::collections::BTreeSet<usize> = lines.iter().copied().collect();
+            match self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
+                Some(d) => {
+                    d.breakpoints = set;
+                    d.breakpoints_gen += 1;
+                }
+                None => {
+                    self.bp_store.insert(path.clone(), set);
+                }
+            }
+        }
         for (path, idx) in &sess.cursors {
             if let Some(doc) = self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
                 let idx = (*idx).min(doc.buffer.len_chars());
@@ -757,6 +799,7 @@ impl ZenithApp {
             "problems" => SidebarView::Problems,
             "agents" => SidebarView::Agents,
             "plugins" => SidebarView::Plugins,
+            "debug" => SidebarView::Debug,
             other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
                 Some((plugin, panel)) => self
                     .plugins
@@ -1170,6 +1213,50 @@ impl ZenithApp {
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
             }
+            Cmd::ShowDebug => {
+                self.sidebar = SidebarView::Debug;
+                self.show_sidebar = true;
+                self.debug_configs = None;
+            }
+            Cmd::ToggleBreakpoint => {
+                if let Some(doc) = self.active_doc() {
+                    let line = doc.buffer.cursor_pos().line;
+                    doc.toggle_breakpoint(line);
+                }
+            }
+            Cmd::OpenLaunchConfig => {
+                let Some(ws) = self.workspace.clone() else {
+                    self.toast("Open a folder first", NotifyLevel::Info);
+                    return;
+                };
+                let p = crate::debug::launch_file(&ws);
+                if !p.exists() {
+                    let _ = std::fs::create_dir_all(p.parent().unwrap_or(&ws));
+                    let _ = std::fs::write(&p, crate::debug::LAUNCH_TEMPLATE);
+                }
+                self.debug_configs = None;
+                self.open_file(&p);
+            }
+            Cmd::DebugStart => {
+                if self.debugger.stopped_thread().is_some() {
+                    self.debugger.continue_();
+                } else if !self.debugger.active() {
+                    self.start_debugging();
+                }
+            }
+            Cmd::DebugStop => {
+                self.debugger.stop();
+                self.clear_debug_lines();
+            }
+            Cmd::DebugRestart => {
+                self.debugger.stop();
+                self.clear_debug_lines();
+                self.start_debugging();
+            }
+            Cmd::DebugPause => self.debugger.pause(),
+            Cmd::DebugStepOver => self.debugger.step("next"),
+            Cmd::DebugStepInto => self.debugger.step("stepIn"),
+            Cmd::DebugStepOut => self.debugger.step("stepOut"),
             Cmd::ReviewAgentChanges => {
                 if self.changes.base.is_none() && !self.changes.busy() {
                     match self.git.as_ref().map(|g| g.root.clone()) {
@@ -2387,6 +2474,15 @@ impl ZenithApp {
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
+            (cs, Key::F5, Cmd::DebugRestart, true),
+            (Modifiers::SHIFT, Key::F5, Cmd::DebugStop, true),
+            (Modifiers::NONE, Key::F5, Cmd::DebugStart, true),
+            (Modifiers::NONE, Key::F6, Cmd::DebugPause, true),
+            (Modifiers::NONE, Key::F9, Cmd::ToggleBreakpoint, false),
+            (Modifiers::NONE, Key::F10, Cmd::DebugStepOver, true),
+            (Modifiers::SHIFT, Key::F11, Cmd::DebugStepOut, true),
+            (Modifiers::NONE, Key::F11, Cmd::DebugStepInto, true),
+            (cs, Key::D, Cmd::ShowDebug, true),
             (cs, Key::Space, Cmd::TriggerParameterHints, false),
             (cmd, Key::Period, Cmd::CodeActions, false),
             (cmd, Key::T, Cmd::GotoSymbol, false),
@@ -2662,6 +2758,7 @@ impl ZenithApp {
                 (SidebarView::Search, "🔍", "Search (Ctrl+Shift+F)"),
                 (SidebarView::Git, "⎇", "Source Control (Ctrl+Shift+G)"),
                 (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
+                (SidebarView::Debug, "▷", "Run and Debug (Ctrl+Shift+D)"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
             ]
@@ -2809,6 +2906,7 @@ impl ZenithApp {
             SidebarView::Search => self.search_ui(ui, &p),
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
+            SidebarView::Debug => self.debug_ui(ui, &p),
             SidebarView::PluginPanel(i) => self.plugin_panel_ui(ui, &p, i),
             SidebarView::Git => self.git_ui(ctx, ui, &p),
             SidebarView::Problems => self.problems_ui(ui, &p),
@@ -4681,6 +4779,395 @@ impl ZenithApp {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Debugging
+    // ------------------------------------------------------------------
+
+    fn debug_configurations(&mut self) -> (Vec<zenith_dap::LaunchConfig>, Option<String>) {
+        if self.debug_configs.is_none() {
+            let active = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
+            self.debug_configs = Some(crate::debug::configurations(self.workspace.as_deref(), active.as_deref()));
+        }
+        self.debug_configs.clone().unwrap_or_default()
+    }
+
+    fn start_debugging(&mut self) {
+        let Some(root) = self.workspace.clone() else {
+            self.toast("Open a folder to debug", NotifyLevel::Info);
+            return;
+        };
+        self.debug_configs = None;
+        let (configs, err) = self.debug_configurations();
+        if let Some(e) = err {
+            self.toast(e, NotifyLevel::Error);
+        }
+        let Some(cfg) = configs.get(self.debugger.selected.min(configs.len().saturating_sub(1))).cloned() else {
+            self.toast("No debug configuration found: add one to .zenith/launch.toml", NotifyLevel::Warning);
+            self.sidebar = SidebarView::Debug;
+            self.show_sidebar = true;
+            return;
+        };
+        // Unsaved changes would not match what runs.
+        let dirty: Vec<usize> = (0..self.docs.len()).filter(|&i| self.docs[i].buffer.is_dirty()).collect();
+        for i in dirty {
+            if self.docs[i].path().is_some() {
+                self.save_doc(i, false);
+            }
+        }
+        self.sidebar = SidebarView::Debug;
+        self.show_sidebar = true;
+        self.debugger.start(cfg, root);
+    }
+
+    fn clear_debug_lines(&mut self) {
+        for d in &mut self.docs {
+            d.debug_line = None;
+        }
+    }
+
+    fn handle_debugger(&mut self) {
+        let bps = self.all_breakpoints();
+        for ev in self.debugger.poll(&bps) {
+            match ev {
+                crate::debug::DebugEvent::Show(path, line) => {
+                    self.clear_debug_lines();
+                    if self.open_file(&path) {
+                        if let Some(doc) = self.docs.get_mut(self.active) {
+                            doc.debug_line = Some(line);
+                            doc.reveal_line = Some(line);
+                            let idx = doc.buffer.pos_to_char(zenith_core::Position::new(line, 0));
+                            doc.buffer.clear_extra();
+                            doc.buffer.set_cursor(idx, false);
+                        }
+                    }
+                }
+                crate::debug::DebugEvent::Ended => self.clear_debug_lines(),
+                crate::debug::DebugEvent::Message(m) => self.toast(m, NotifyLevel::Warning),
+            }
+        }
+        if self.debugger.active() && self.debugger.stopped_thread().is_none() {
+            self.clear_debug_lines();
+        }
+        self.debugger.sync_breakpoints(&bps);
+    }
+
+    fn debug_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use crate::debug::State;
+        let (configs, err) = self.debug_configurations();
+        let mut cmd: Option<Cmd> = None;
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, "RUN AND DEBUG");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("⚙").on_hover_text("Open .zenith/launch.toml").clicked() {
+                    cmd = Some(Cmd::OpenLaunchConfig);
+                }
+                if ui.small_button("⟳").on_hover_text("Reload configurations").clicked() {
+                    self.debug_configs = None;
+                }
+            });
+        });
+        if let Some(e) = &err {
+            ui.label(RichText::new(e).color(p.error).small());
+        }
+        let state = self.debugger.session.as_ref().map(|s| s.state.clone());
+        match &state {
+            None => {
+                if configs.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No configurations found. Zenith detects Cargo binaries and the open Python file; \
+                             add others in .zenith/launch.toml.",
+                        )
+                        .color(p.text_dim),
+                    );
+                    if ui.button("Create launch.toml").clicked() {
+                        cmd = Some(Cmd::OpenLaunchConfig);
+                    }
+                } else {
+                    let sel = self.debugger.selected.min(configs.len() - 1);
+                    let mut new_sel = sel;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new("▶ Start").color(Color32::WHITE)).fill(p.success))
+                            .on_hover_text("F5")
+                            .clicked()
+                        {
+                            cmd = Some(Cmd::DebugStart);
+                        }
+                        egui::ComboBox::from_id_salt("debug-config")
+                            .width(ui.available_width() - 8.0)
+                            .selected_text(&configs[sel].name)
+                            .show_ui(ui, |ui| {
+                                for (i, c) in configs.iter().enumerate() {
+                                    ui.selectable_value(&mut new_sel, i, &c.name);
+                                }
+                            });
+                    });
+                    self.debugger.selected = new_sel;
+                    let c = &configs[new_sel];
+                    let adapter = zenith_dap::adapter(&c.adapter);
+                    let missing = c.command.is_empty() && adapter.is_some_and(|a| a.resolve().is_none());
+                    let detail = format!("{} · {}", adapter.map_or(c.adapter.as_str(), |a| a.name), c.program);
+                    ui.label(RichText::new(detail).small().color(p.text_dim));
+                    if missing {
+                        ui.label(
+                            RichText::new(format!(
+                                "⚠ Adapter not installed. {}",
+                                adapter.map_or("", |a| a.install_hint)
+                            ))
+                            .small()
+                            .color(p.warning),
+                        );
+                    }
+                }
+            }
+            Some(st) => {
+                let stopped = matches!(st, State::Stopped { .. });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    let b = |ui: &mut egui::Ui, label: &str, tip: &str, enabled: bool| {
+                        ui.add_enabled(enabled, egui::Button::new(label).min_size(egui::vec2(28.0, 24.0)))
+                            .on_hover_text(tip)
+                            .clicked()
+                    };
+                    if stopped {
+                        if b(ui, "▶", "Continue (F5)", true) {
+                            cmd = Some(Cmd::DebugStart);
+                        }
+                    } else if b(ui, "‖", "Pause (F6)", matches!(st, State::Running)) {
+                        cmd = Some(Cmd::DebugPause);
+                    }
+                    if b(ui, "→", "Step Over (F10)", stopped) {
+                        cmd = Some(Cmd::DebugStepOver);
+                    }
+                    if b(ui, "↓", "Step Into (F11)", stopped) {
+                        cmd = Some(Cmd::DebugStepInto);
+                    }
+                    if b(ui, "↑", "Step Out (Shift+F11)", stopped) {
+                        cmd = Some(Cmd::DebugStepOut);
+                    }
+                    if b(ui, "⟲", "Restart (Ctrl+Shift+F5)", true) {
+                        cmd = Some(Cmd::DebugRestart);
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("■").color(p.error)).min_size(egui::vec2(28.0, 24.0)))
+                        .on_hover_text("Stop (Shift+F5)")
+                        .clicked()
+                    {
+                        cmd = Some(Cmd::DebugStop);
+                    }
+                });
+                let status = match st {
+                    State::Building => "Building…".to_string(),
+                    State::Starting => "Starting…".to_string(),
+                    State::Running => "Running".to_string(),
+                    State::Stopped { reason, .. } => format!("Paused on {reason}"),
+                };
+                let name = self.debugger.session.as_ref().map(|s| s.config.name.clone()).unwrap_or_default();
+                ui.label(RichText::new(format!("{name} — {status}")).small().color(if stopped {
+                    p.warning
+                } else {
+                    p.success
+                }));
+            }
+        }
+        ui.add_space(4.0);
+
+        let mut select_frame = None;
+        let mut toggle = None;
+        let mut remove_bp: Option<(PathBuf, usize)> = None;
+        let mut open_bp: Option<(PathBuf, usize)> = None;
+        let mut eval: Option<String> = None;
+        let ws = self.workspace.clone();
+        let bps = self.all_breakpoints();
+        let avail = ui.available_height();
+        egui::ScrollArea::vertical().id_salt("debug-scroll").max_height(avail * 0.62).auto_shrink([false, true]).show(
+            ui,
+            |ui| {
+                if let Some(s) = &self.debugger.session {
+                    if !s.frames.is_empty() {
+                        ui.label(RichText::new("VARIABLES").size(11.0).strong().color(p.text_dim));
+                        let mut stack: Vec<(usize, &zenith_dap::Variable)> =
+                            s.scopes.iter().rev().map(|v| (0usize, v)).collect();
+                        let mut shown = 0;
+                        while let Some((depth, v)) = stack.pop() {
+                            shown += 1;
+                            if shown > 400 {
+                                break;
+                            }
+                            let open = s.expanded.contains(&v.reference);
+                            ui.horizontal(|ui| {
+                                ui.add_space(depth as f32 * 12.0);
+                                let arrow = if v.reference > 0 {
+                                    if open {
+                                        "▾ "
+                                    } else {
+                                        "▸ "
+                                    }
+                                } else {
+                                    "   "
+                                };
+                                let mut job = egui::text::LayoutJob::default();
+                                let f = |c: Color32, mono: bool| egui::TextFormat {
+                                    font_id: if mono { FontId::monospace(12.0) } else { FontId::proportional(12.5) },
+                                    color: c,
+                                    ..Default::default()
+                                };
+                                job.append(arrow, 0.0, f(p.text_dim, true));
+                                let is_scope = depth == 0 && v.value.is_empty();
+                                job.append(&v.name, 0.0, f(if is_scope { p.text } else { p.accent }, false));
+                                if !v.value.is_empty() {
+                                    job.append(": ", 0.0, f(p.text_dim, false));
+                                    let val: String = v.value.chars().take(120).collect();
+                                    job.append(&val, 0.0, f(p.text, true));
+                                }
+                                let r = ui.add(egui::Label::new(job).sense(Sense::click()).truncate());
+                                let r = if v.type_name.is_empty() { r } else { r.on_hover_text(&v.type_name) };
+                                if r.clicked() && v.reference > 0 {
+                                    toggle = Some(v.reference);
+                                }
+                            });
+                            if open {
+                                if let Some(kids) = s.children.get(&v.reference) {
+                                    for k in kids.iter().rev() {
+                                        stack.push((depth + 1, k));
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("CALL STACK").size(11.0).strong().color(p.text_dim));
+                        for (i, f) in s.frames.iter().enumerate() {
+                            let file = f
+                                .path
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .map(|n| format!("{}:{}", n.to_string_lossy(), f.line + 1))
+                                .unwrap_or_default();
+                            // Long generic paths: keep the end, which names the function.
+                            let n = f.name.chars().count();
+                            let short: String = if n > 34 {
+                                format!("…{}", f.name.chars().skip(n - 33).collect::<String>())
+                            } else {
+                                f.name.clone()
+                            };
+                            let text = RichText::new(format!("{short}  {file}"))
+                                .size(12.5)
+                                .color(if f.path.is_some() { p.text } else { p.text_faint });
+                            if ui.selectable_label(i == s.frame, text).on_hover_text(&f.name).clicked() {
+                                select_frame = Some(i);
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
+                ui.label(RichText::new("BREAKPOINTS").size(11.0).strong().color(p.text_dim));
+                if bps.is_empty() {
+                    ui.label(
+                        RichText::new("Click left of a line number (or F9) to add one.").small().color(p.text_faint),
+                    );
+                }
+                for (path, lines) in &bps {
+                    let rel = match ws.as_ref().and_then(|w| path.strip_prefix(w).ok()) {
+                        Some(r) => r.to_string_lossy().into_owned(),
+                        None => path.to_string_lossy().into_owned(),
+                    };
+                    for &l in lines {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").color(Color32::from_rgb(0xe5, 0x48, 0x4d)));
+                            if ui
+                                .add(
+                                    egui::Label::new(RichText::new(format!("{rel}:{}", l + 1)).size(12.5))
+                                        .sense(Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                open_bp = Some((path.clone(), l));
+                            }
+                            if ui.small_button("✕").clicked() {
+                                remove_bp = Some((path.clone(), l));
+                            }
+                        });
+                    }
+                }
+            },
+        );
+        ui.separator();
+        ui.label(RichText::new("DEBUG CONSOLE").size(11.0).strong().color(p.text_dim));
+        let input_h = 26.0;
+        egui::ScrollArea::vertical()
+            .id_salt("debug-console")
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - input_h - 6.0).max(40.0))
+            .show(ui, |ui| {
+                for (cat, line) in &self.debugger.output {
+                    let color = match cat.as_str() {
+                        "stderr" => p.error,
+                        "input" => p.accent,
+                        "result" => p.success,
+                        "console" | "important" => p.text_dim,
+                        _ => p.text,
+                    };
+                    ui.label(RichText::new(line).monospace().size(12.0).color(color));
+                }
+            });
+        let paused = self.debugger.stopped_thread().is_some();
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut self.debugger.console_input)
+                .hint_text(if paused { "Evaluate expression…" } else { "Evaluate (when paused)…" })
+                .desired_width(f32::INFINITY),
+        );
+        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            let e = std::mem::take(&mut self.debugger.console_input);
+            if !e.trim().is_empty() {
+                eval = Some(e);
+            }
+            r.request_focus();
+        }
+
+        if let Some(i) = select_frame {
+            if let Some(crate::debug::DebugEvent::Show(path, line)) = self.debugger.select_frame(i) {
+                self.clear_debug_lines();
+                if self.open_file(&path) {
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        doc.debug_line = Some(line);
+                        doc.reveal_line = Some(line);
+                    }
+                }
+            }
+        }
+        if let Some(r) = toggle {
+            self.debugger.toggle_var(r);
+        }
+        if let Some(e) = eval {
+            self.debugger.evaluate(e);
+        }
+        if let Some((path, l)) = remove_bp {
+            match self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
+                Some(d) => d.toggle_breakpoint(l),
+                None => {
+                    if let Some(set) = self.bp_store.get_mut(&path) {
+                        set.remove(&l);
+                        if set.is_empty() {
+                            self.bp_store.remove(&path);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((path, l)) = open_bp {
+            if self.open_file(&path) {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    doc.goto_line(l);
+                }
+            }
+        }
+        if let Some(c) = cmd {
+            self.run(ui.ctx(), c);
+        }
+    }
+
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
@@ -4753,6 +5240,7 @@ impl eframe::App for ZenithApp {
         if self.changes.poll() {
             ctx.request_repaint();
         }
+        self.handle_debugger();
         if self.show_changes
             && self.changes.base.is_some()
             && self.changes_refreshed.is_none_or(|t| t.elapsed() > Duration::from_secs(2))

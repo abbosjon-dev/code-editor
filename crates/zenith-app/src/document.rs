@@ -94,6 +94,11 @@ pub struct Document {
     pub conflicts: Vec<crate::conflicts::Conflict>,
     /// Vim mode state (when enabled in settings).
     pub vim: crate::vim::VimState,
+    /// Breakpoint lines (0-based); `breakpoints_gen` changes on every edit of the set.
+    pub breakpoints: std::collections::BTreeSet<usize>,
+    pub breakpoints_gen: u64,
+    /// Line where the debugger is stopped.
+    pub debug_line: Option<usize>,
     conflicts_version: Option<u64>,
     /// Pending review of a change made outside the editor (e.g. by an AI agent).
     pub review: Option<crate::review::Review>,
@@ -166,6 +171,9 @@ impl Document {
             git_hunks_version: None,
             conflicts: vec![],
             vim: Default::default(),
+            breakpoints: Default::default(),
+            breakpoints_gen: 0,
+            debug_line: None,
             conflicts_version: None,
             review: None,
             show_git_diff: false,
@@ -298,6 +306,27 @@ impl Document {
                     .collect();
                 self.folds_gen += 1;
             }
+            // Breakpoints move with their lines too.
+            if delta != 0 && !self.breakpoints.is_empty() && self.last_len_lines > 0 {
+                let removed_end = if delta < 0 { line as isize - delta } else { line as isize };
+                let moved: std::collections::BTreeSet<usize> = self
+                    .breakpoints
+                    .iter()
+                    .filter_map(|&h| {
+                        if h <= line {
+                            Some(h)
+                        } else if (h as isize) <= removed_end {
+                            None
+                        } else {
+                            Some((h as isize + delta) as usize)
+                        }
+                    })
+                    .collect();
+                if moved != self.breakpoints {
+                    self.breakpoints = moved;
+                    self.breakpoints_gen += 1;
+                }
+            }
         }
         self.last_len_lines = n;
         self.update_conflicts(changed);
@@ -321,6 +350,15 @@ impl Document {
             Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
             _ => vec![],
         };
+    }
+
+    // ---------- debugging ----------
+
+    pub fn toggle_breakpoint(&mut self, line: usize) {
+        if !self.breakpoints.remove(&line) {
+            self.breakpoints.insert(line);
+        }
+        self.breakpoints_gen += 1;
     }
 
     // ---------- merge conflicts ----------

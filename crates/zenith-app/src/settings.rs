@@ -165,6 +165,8 @@ pub struct Session {
     pub agents: Vec<String>,
     /// Additional folders in the workspace (multi-root).
     pub extra_roots: Vec<PathBuf>,
+    /// Breakpoint lines (0-based) per file.
+    pub breakpoints: Vec<(PathBuf, Vec<usize>)>,
 }
 
 impl Session {

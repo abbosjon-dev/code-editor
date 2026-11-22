@@ -16,6 +16,7 @@ zenith-terminal.workspace = true
 zenith-plugin.workspace = true
 zenith-ai.workspace = true
 zenith-lsp.workspace = true
+zenith-dap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

@@ -18,6 +18,7 @@
 | `zenith-terminal` | PTY'da jarayon ishga tushirish, VT100 parse, DSR/DA so'rovlariga javob, scrollback | `portable-pty`, `vt100` |
 | `zenith-plugin` | Manifest topish, jarayonni boshqarish, JSON-lines protokoli | `serde_json`, `toml` |
 | `zenith-lsp` | LSP mijozi: server jarayonlari, Content-Length framing, server so'rovlariga javob, UTF-16 ↔ char | `serde_json`, `url` |
+| `zenith-dap` | DAP mijozi: adapter jarayoni, so'rov/javob/hodisalar, adapterlar ro'yxati, `launch.toml` | `serde_json`, `toml` |
 | `zenith-ai` | Agent profillari, foydalanuvchi agentlarini birlashtirish, kontekst prompt | `which` |
 | `zenith-app` | Oyna, panellar, muharrir vidjeti, terminal ko'rinishi, palitra, temalar | `eframe`, `syntect`, `ignore`, `nucleo-matcher` |
 
@@ -45,14 +46,20 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [ ] LSP: inlay hints, workspace symbols, semantic tokens
 - [x] Git: yonma-yon diff ko'rinishi, branch almashtirish
 - [x] Git: hunk'ni qaytarish (gutter), inline blame
-- [ ] Git: stash, merge konfliktlarini hal qilish UI
+- [x] Git: stash, merge konfliktlarini hal qilish UI
+- [x] Ko'p papkali ish maydoni (har papka o'z Git repo'si va til serveri)
+- [x] Debugger (DAP): gdb, lldb-dap, debugpy; breakpoint, step, o'zgaruvchilar, call stack, console
+- [x] Sozlanadigan tugmalar (keybindings.toml) va Vim rejimi
+- [x] Agent o'zgarishlarini ko'p faylli ko'rib chiqish (checkpoint), terminalni bo'lish
+- [ ] Shartli breakpoint'lar, logpoint'lar, watch ifodalari
 
 **v0.3**
 - [x] Kod bloklarini yig'ish (chekinish asosida, barcha tillar uchun)
 - [ ] Tree-sitter asosida ranglash va sintaktik folding
 - [ ] MCP serverlarini sozlash UI
 - [ ] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
-- [ ] Plugin UI kengaytmalari: status bar elementlari, yon panel ko'rinishlari
+- [x] Plugin yon panellari (`[[panels]]`, `set_panel`)
+- [ ] Plugin UI kengaytmalari: status bar elementlari
 
 **v1.0**
 - [ ] Plugin marketplace / registry

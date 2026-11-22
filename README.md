@@ -113,6 +113,29 @@ command = "pylsp"
 languages = ["python"]
 ```
 
+## Debugger
+
+**Run and Debug** paneli (`Ctrl+Shift+D`, ▷ belgisi) Debug Adapter Protocol orqali ishlaydi:
+**Rust / C / C++** — GDB 14+ (`gdb -i dap`) yoki `lldb-dap`, **Python** — `debugpy` (`pip install debugpy`).
+Cargo loyihasining binarlari va ochiq Python fayli avtomatik topiladi; boshqalari uchun `.zenith/launch.toml`
+(⚙ tugmasi namunani yaratadi):
+
+```toml
+[[configurations]]
+name = "Debug program"
+adapter = "gdb"            # gdb | lldb | debugpy, yoki command = ["boshqa-adapter"]
+program = "target/debug/my-program"
+args = []
+build = "cargo build"      # ishga tushirishdan oldin
+```
+
+Breakpoint — qator raqamining chap tomonini bosing yoki `F9` (sessiyada saqlanadi, tahrirda qator bilan siljiydi).
+`F5` boshlash / davom ettirish, `F10` step over, `F11` step into, `Shift+F11` step out, `F6` pauza, `Shift+F5` to'xtatish.
+To'xtaganda: joriy qator belgilanadi, **o'zgaruvchilar** daraxti (ichiga kirish mumkin), **call stack** (bosib kadrni
+tanlash), **debug console** — dastur chiqishi va ifodalarni hisoblash.
+
+![Debugger](docs/debugger.png)
+
 ## AI agent o'zgarishlarini ko'rib chiqish
 
 Agent ishga tushganda Zenith ish maydonining "checkpoint"ini oladi (Git'ning vaqtinchalik indeksi orqali — sizning
@@ -218,6 +241,7 @@ crates/
 ├── zenith-terminal  PTY + VT100 emulyatori (portable-pty, vt100), terminal so'rovlariga javob
 ├── zenith-plugin    Plugin xosti: manifest, JSON-lines protokoli, fon oqimlari
 ├── zenith-lsp       Language Server Protocol mijozi (JSON-RPC, UTF-16 pozitsiyalar, snippetlar)
+├── zenith-dap       Debug Adapter Protocol mijozi (gdb, lldb-dap, debugpy), launch.toml
 ├── zenith-ai        AI agent profillari (Claude Code, Codex, Gemini, Aider…), prompt yasash
 └── zenith-app       GUI (eframe/egui): muharrir vidjeti, panellar, palitra, temalar
 plugins/examples/    Namuna pluginlar (Python): text-tools, todo-tree (yon panel)

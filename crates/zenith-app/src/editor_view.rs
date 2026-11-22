@@ -228,6 +228,7 @@ pub fn editor_ui(
                         } else if in_gutter
                             && pos.x < clip.min.x + 16.0
                             && doc.lsp_active
+                            && doc.buffer.char_to_pos(idx).line == doc.buffer.cursor_pos().line
                             && doc.diagnostics.iter().any(|d| d.line == doc.buffer.char_to_pos(idx).line)
                         {
                             // Lightbulb: quick fixes for this line.
@@ -240,6 +241,10 @@ pub fn editor_ui(
                         } {
                             // Git change bar: show the change with a Revert button.
                             doc.hunk_popup = Some(doc.buffer.char_to_pos(idx).line);
+                        } else if in_gutter && !shift && pos.x < clip.min.x + 16.0 {
+                            // Breakpoint column.
+                            let line = doc.buffer.char_to_pos(idx).line;
+                            doc.toggle_breakpoint(line);
                         } else if in_gutter && !shift && pos.x > clip.min.x + gutter_w - 20.0 {
                             // Fold chevron column.
                             let line = doc.buffer.char_to_pos(idx).line;
@@ -401,6 +406,10 @@ pub fn editor_ui(
 
                     if line == cursor.line && sel.is_empty() && !doc.buffer.has_multi() {
                         painter.rect_filled(row, 0.0, p.current_line);
+                    }
+
+                    if doc.debug_line == Some(line) {
+                        painter.rect_filled(row, 0.0, p.warning.gamma_multiply(0.16));
                     }
 
                     // Merge conflict regions: current (ours) green, incoming (theirs) blue-violet.
@@ -745,6 +754,39 @@ pub fn editor_ui(
                     if d.line >= first && d.line < last && d.severity <= Severity::Warning && !fm.is_hidden(d.line) {
                         let y = y_of_line(d.line) + m.line_h / 2.0;
                         painter.circle_filled(egui::pos2(clip.min.x + 6.0, y), 3.0, severity_color(p, d.severity));
+                    }
+                }
+                // Breakpoints, the debugger's current line, and a hint where to click.
+                for &b in doc.breakpoints.range(first..last) {
+                    if !fm.is_hidden(b) {
+                        let y = y_of_line(b) + m.line_h / 2.0;
+                        painter.circle_filled(
+                            egui::pos2(clip.min.x + 8.0, y),
+                            5.0,
+                            Color32::from_rgb(0xe5, 0x48, 0x4d),
+                        );
+                    }
+                }
+                if let Some(l) = doc.debug_line.filter(|l| *l >= first && *l < last && !fm.is_hidden(*l)) {
+                    let y = y_of_line(l) + m.line_h / 2.0;
+                    let x = clip.min.x + 8.0;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![egui::pos2(x - 5.0, y - 5.0), egui::pos2(x + 6.0, y), egui::pos2(x - 5.0, y + 5.0)],
+                        p.warning,
+                        Stroke::new(1.0_f32, p.bg),
+                    ));
+                }
+                if let Some(h) = resp.hover_pos().filter(|h| h.x < clip.min.x + 16.0) {
+                    let row =
+                        (((h.y - rect.min.y) / m.line_h).floor().max(0.0) as usize).min(total_rows.saturating_sub(1));
+                    let l = fm.line_at(row);
+                    if !doc.breakpoints.contains(&l) && fm.row_cols(row).0 == 0 {
+                        let y = rect.min.y + row as f32 * m.line_h + m.line_h / 2.0;
+                        painter.circle_filled(
+                            egui::pos2(clip.min.x + 8.0, y),
+                            5.0,
+                            Color32::from_rgb(0xe5, 0x48, 0x4d).gamma_multiply(0.35),
+                        );
                     }
                 }
                 let gutter_hovered = resp.hover_pos().is_some_and(|h| h.x < clip.min.x + gutter_w);

@@ -5,6 +5,7 @@ mod app;
 mod changeset;
 mod commands;
 mod conflicts;
+mod debug;
 mod diff_view;
 mod document;
 mod editor_view;
