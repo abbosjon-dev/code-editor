@@ -167,6 +167,10 @@ pub struct Session {
     pub extra_roots: Vec<PathBuf>,
     /// Breakpoint lines (0-based) per file.
     pub breakpoints: Vec<(PathBuf, Vec<usize>)>,
+    /// Breakpoints with a condition / log message / hit count / disabled.
+    pub breakpoint_details: Vec<(PathBuf, usize, crate::debug::Bp)>,
+    /// Debugger watch expressions.
+    pub watches: Vec<String>,
 }
 
 impl Session {

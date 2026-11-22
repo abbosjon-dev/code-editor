@@ -810,7 +810,7 @@ fn normal_cmd(st: &mut VimState, b: &mut Buffer, c: Command, explicit: bool, fx:
                 } else {
                     m
                 };
-                let cw = c.op == Some('c') && matches!(m, 'e' | 'E') && matches!(arg, None);
+                let cw = c.op == Some('c') && matches!(m, 'e' | 'E') && arg.is_none();
                 let Some((t, kind)) = (if cw {
                     // End of the current word, then `n - 1` more word ends.
                     let big = m == 'E';

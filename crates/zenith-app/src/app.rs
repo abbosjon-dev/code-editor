@@ -74,6 +74,9 @@ enum InputKind {
     /// Rename the symbol at this char index (LSP).
     RenameSymbol(usize),
     NewBranch,
+    Watch,
+    /// Edit an option of the breakpoint at (document id, line).
+    Breakpoint(u64, usize, crate::editor_view::BpField),
 }
 
 enum Dialog {
@@ -150,7 +153,7 @@ pub struct ZenithApp {
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
     /// Breakpoints of files that aren't open.
-    bp_store: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    bp_store: std::collections::BTreeMap<PathBuf, crate::debug::Breakpoints>,
     changes_refreshed: Option<Instant>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
@@ -723,8 +726,13 @@ impl ZenithApp {
         self.session.cursors =
             self.docs.iter().filter_map(|d| d.path().map(|p| (p.to_path_buf(), d.buffer.sel.head))).collect();
         self.session.active = self.active;
-        self.session.breakpoints =
-            self.all_breakpoints().into_iter().map(|(p, l)| (p, l.into_iter().collect())).collect();
+        let all = self.all_breakpoints();
+        self.session.breakpoints = all.iter().map(|(p, l)| (p.clone(), l.keys().copied().collect())).collect();
+        self.session.breakpoint_details = all
+            .iter()
+            .flat_map(|(p, l)| l.iter().filter(|(_, b)| !b.is_plain()).map(|(&n, b)| (p.clone(), n, b.clone())))
+            .collect();
+        self.session.watches = self.debugger.watches.clone();
         self.session.show_sidebar = Some(self.show_sidebar);
         self.session.sidebar = match self.sidebar {
             SidebarView::Explorer => "explorer".into(),
@@ -760,7 +768,7 @@ impl ZenithApp {
 
     /// Re-apply carets, panels, terminals and agents from the saved session.
     /// Breakpoints of every file: open documents and closed ones.
-    fn all_breakpoints(&self) -> std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>> {
+    fn all_breakpoints(&self) -> std::collections::BTreeMap<PathBuf, crate::debug::Breakpoints> {
         let mut all = self.bp_store.clone();
         for d in &self.docs {
             if let (Some(p), false) = (d.path(), d.breakpoints.is_empty()) {
@@ -771,8 +779,15 @@ impl ZenithApp {
     }
 
     fn restore_session_state(&mut self, sess: &Session) {
+        self.debugger.watches = sess.watches.clone();
         for (path, lines) in &sess.breakpoints {
-            let set: std::collections::BTreeSet<usize> = lines.iter().copied().collect();
+            let set: crate::debug::Breakpoints = lines
+                .iter()
+                .map(|&l| {
+                    let detail = sess.breakpoint_details.iter().find(|(p, n, _)| p == path && *n == l);
+                    (l, detail.map(|(_, _, b)| b.clone()).unwrap_or_default())
+                })
+                .collect();
             match self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {
                 Some(d) => {
                     d.breakpoints = set;
@@ -3754,6 +3769,30 @@ impl ZenithApp {
         for a in actions {
             match a {
                 EditorAction::Notify(m) => self.toast(m, NotifyLevel::Warning),
+                EditorAction::EditBreakpoint { line, field } => {
+                    use crate::editor_view::BpField;
+                    let Some(doc) = self.docs.get(self.active) else { continue };
+                    let b = doc.breakpoints.get(&line).cloned().unwrap_or_default();
+                    let (title, value) = match field {
+                        BpField::Condition => ("Breakpoint condition (stop when true)", b.condition),
+                        BpField::Log => ("Log message — {expression} is replaced", b.log),
+                        BpField::Hit => ("Hit count (e.g. 5)", b.hit),
+                    };
+                    self.dialog = Some(Dialog::Input {
+                        title: title.into(),
+                        value,
+                        kind: InputKind::Breakpoint(doc.id, line, field),
+                        focus: true,
+                    });
+                }
+                EditorAction::DebugHover { idx } => {
+                    if let Some(doc) = self.docs.get(self.active) {
+                        if let Some(expr) = crate::debug::expression_at(&doc.buffer, idx) {
+                            let id = doc.id;
+                            self.debugger.evaluate_hover(id, idx, expr);
+                        }
+                    }
+                }
                 EditorAction::AskAgent { question } => {
                     let prompt = self.selection_prompt(&question);
                     self.send_to_agent(prompt, true, None);
@@ -4184,7 +4223,7 @@ impl ZenithApp {
                 });
                 if submit {
                     let name = value.trim();
-                    if !name.is_empty() {
+                    if !name.is_empty() || matches!(kind, InputKind::Breakpoint(..)) {
                         self.apply_input(kind, name.to_string());
                     }
                 } else if keep {
@@ -4501,6 +4540,25 @@ impl ZenithApp {
             InputKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(&name)),
             InputKind::NewBranch => {
                 self.git_switch(&name, true);
+                return;
+            }
+            InputKind::Watch => {
+                self.debugger.watches.push(name);
+                self.debugger.evaluate_watches();
+                self.save_session();
+                return;
+            }
+            InputKind::Breakpoint(id, line, field) => {
+                use crate::editor_view::BpField;
+                if let Some(doc) = self.docs.iter_mut().find(|d| d.id == *id) {
+                    let b = doc.breakpoints.entry(*line).or_default();
+                    match field {
+                        BpField::Condition => b.condition = name,
+                        BpField::Log => b.log = name,
+                        BpField::Hit => b.hit = name,
+                    }
+                    doc.breakpoints_gen += 1;
+                }
                 return;
             }
             InputKind::RenameSymbol(idx) => {
@@ -4847,6 +4905,20 @@ impl ZenithApp {
                 }
                 crate::debug::DebugEvent::Ended => self.clear_debug_lines(),
                 crate::debug::DebugEvent::Message(m) => self.toast(m, NotifyLevel::Warning),
+                crate::debug::DebugEvent::HoverValue(id, idx, text) => {
+                    if let Some(d) = self.docs.iter_mut().find(|d| d.id == id) {
+                        if d.debug_value.as_ref().is_some_and(|(i, _)| *i == idx) {
+                            d.debug_value = Some((idx, text));
+                        }
+                    }
+                }
+            }
+        }
+        let paused = self.debugger.stopped_thread().is_some();
+        for d in &mut self.docs {
+            if d.debug_paused != paused {
+                d.debug_paused = paused;
+                d.debug_value = None;
             }
         }
         if self.debugger.active() && self.debugger.stopped_thread().is_none() {
@@ -4982,12 +5054,55 @@ impl ZenithApp {
         let mut remove_bp: Option<(PathBuf, usize)> = None;
         let mut open_bp: Option<(PathBuf, usize)> = None;
         let mut eval: Option<String> = None;
+        let mut add_watch = false;
+        let mut remove_watch: Option<usize> = None;
         let ws = self.workspace.clone();
         let bps = self.all_breakpoints();
         let avail = ui.available_height();
         egui::ScrollArea::vertical().id_salt("debug-scroll").max_height(avail * 0.62).auto_shrink([false, true]).show(
             ui,
             |ui| {
+                // Watch expressions (evaluated whenever the debugger stops).
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("WATCH").size(11.0).strong().color(p.text_dim));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("+").on_hover_text("Add expression").clicked() {
+                            add_watch = true;
+                        }
+                    });
+                });
+                for (i, w) in self.debugger.watches.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        let f = |c: Color32, mono: bool| egui::TextFormat {
+                            font_id: if mono { FontId::monospace(12.0) } else { FontId::proportional(12.5) },
+                            color: c,
+                            ..Default::default()
+                        };
+                        job.append(w, 0.0, f(p.accent, false));
+                        match self.debugger.watch_values.get(i).cloned().flatten() {
+                            Some(Ok(v)) => {
+                                job.append(": ", 0.0, f(p.text_dim, false));
+                                job.append(&v.chars().take(120).collect::<String>(), 0.0, f(p.text, true));
+                            }
+                            Some(Err(e)) => {
+                                job.append(": ", 0.0, f(p.text_dim, false));
+                                job.append(&e.chars().take(80).collect::<String>(), 0.0, f(p.text_faint, false));
+                            }
+                            None => {}
+                        }
+                        ui.add(egui::Label::new(job).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("✕").clicked() {
+                                remove_watch = Some(i);
+                            }
+                        });
+                    });
+                }
+                if self.debugger.watches.is_empty() {
+                    ui.label(RichText::new("Add expressions to watch with +").small().color(p.text_faint));
+                }
+                ui.add_space(6.0);
                 if let Some(s) = &self.debugger.session {
                     if !s.frames.is_empty() {
                         ui.label(RichText::new("VARIABLES").size(11.0).strong().color(p.text_dim));
@@ -5076,16 +5191,34 @@ impl ZenithApp {
                         Some(r) => r.to_string_lossy().into_owned(),
                         None => path.to_string_lossy().into_owned(),
                     };
-                    for &l in lines {
+                    for (&l, b) in lines {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("●").color(Color32::from_rgb(0xe5, 0x48, 0x4d)));
-                            if ui
-                                .add(
-                                    egui::Label::new(RichText::new(format!("{rel}:{}", l + 1)).size(12.5))
-                                        .sense(Sense::click()),
-                                )
-                                .clicked()
-                            {
+                            let (sym, color) = if b.disabled {
+                                ("○", p.text_faint)
+                            } else if !b.log.trim().is_empty() {
+                                ("◆", Color32::from_rgb(0xe5, 0x48, 0x4d))
+                            } else {
+                                ("●", Color32::from_rgb(0xe5, 0x48, 0x4d))
+                            };
+                            ui.label(RichText::new(sym).color(color));
+                            let mut detail = vec![];
+                            if !b.condition.trim().is_empty() {
+                                detail.push(format!("if {}", b.condition.trim()));
+                            }
+                            if !b.hit.trim().is_empty() {
+                                detail.push(format!("hits {}", b.hit.trim()));
+                            }
+                            if !b.log.trim().is_empty() {
+                                detail.push(format!("log \"{}\"", b.log.trim()));
+                            }
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(format!("{rel}:{}", l + 1)).size(12.5))
+                                    .sense(Sense::click()),
+                            );
+                            if !detail.is_empty() {
+                                ui.label(RichText::new(detail.join(" · ")).size(11.0).color(p.text_dim));
+                            }
+                            if r.clicked() {
                                 open_bp = Some((path.clone(), l));
                             }
                             if ui.small_button("✕").clicked() {
@@ -5146,6 +5279,21 @@ impl ZenithApp {
         }
         if let Some(e) = eval {
             self.debugger.evaluate(e);
+        }
+        if add_watch {
+            self.dialog = Some(Dialog::Input {
+                title: "Add watch expression".into(),
+                value: String::new(),
+                kind: InputKind::Watch,
+                focus: true,
+            });
+        }
+        if let Some(i) = remove_watch {
+            self.debugger.watches.remove(i);
+            if i < self.debugger.watch_values.len() {
+                self.debugger.watch_values.remove(i);
+            }
+            self.save_session();
         }
         if let Some((path, l)) = remove_bp {
             match self.docs.iter_mut().find(|d| d.path() == Some(path.as_path())) {

@@ -95,10 +95,14 @@ pub struct Document {
     /// Vim mode state (when enabled in settings).
     pub vim: crate::vim::VimState,
     /// Breakpoint lines (0-based); `breakpoints_gen` changes on every edit of the set.
-    pub breakpoints: std::collections::BTreeSet<usize>,
+    pub breakpoints: crate::debug::Breakpoints,
     pub breakpoints_gen: u64,
     /// Line where the debugger is stopped.
     pub debug_line: Option<usize>,
+    /// The debugger is paused (hovering shows values).
+    pub debug_paused: bool,
+    /// Value of the expression under the mouse: (char index, "expr = value").
+    pub debug_value: Option<(usize, String)>,
     conflicts_version: Option<u64>,
     /// Pending review of a change made outside the editor (e.g. by an AI agent).
     pub review: Option<crate::review::Review>,
@@ -174,6 +178,8 @@ impl Document {
             breakpoints: Default::default(),
             breakpoints_gen: 0,
             debug_line: None,
+            debug_paused: false,
+            debug_value: None,
             conflicts_version: None,
             review: None,
             show_git_diff: false,
@@ -309,17 +315,18 @@ impl Document {
             // Breakpoints move with their lines too.
             if delta != 0 && !self.breakpoints.is_empty() && self.last_len_lines > 0 {
                 let removed_end = if delta < 0 { line as isize - delta } else { line as isize };
-                let moved: std::collections::BTreeSet<usize> = self
+                let moved: crate::debug::Breakpoints = self
                     .breakpoints
                     .iter()
-                    .filter_map(|&h| {
-                        if h <= line {
-                            Some(h)
+                    .filter_map(|(&h, b)| {
+                        let to = if h <= line {
+                            h
                         } else if (h as isize) <= removed_end {
-                            None
+                            return None;
                         } else {
-                            Some((h as isize + delta) as usize)
-                        }
+                            (h as isize + delta) as usize
+                        };
+                        Some((to, b.clone()))
                     })
                     .collect();
                 if moved != self.breakpoints {
@@ -355,8 +362,8 @@ impl Document {
     // ---------- debugging ----------
 
     pub fn toggle_breakpoint(&mut self, line: usize) {
-        if !self.breakpoints.remove(&line) {
-            self.breakpoints.insert(line);
+        if self.breakpoints.remove(&line).is_none() {
+            self.breakpoints.insert(line, Default::default());
         }
         self.breakpoints_gen += 1;
     }

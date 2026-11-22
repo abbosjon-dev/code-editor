@@ -38,6 +38,22 @@ pub enum EditorAction {
     SignatureHelp,
     /// Show a message (e.g. an unknown Vim `:` command).
     Notify(String),
+    /// Edit a breakpoint's condition (`log` = logpoint message, `hit` = hit count).
+    EditBreakpoint {
+        line: usize,
+        field: BpField,
+    },
+    /// Evaluate the expression at this char index in the debugger.
+    DebugHover {
+        idx: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BpField {
+    Condition,
+    Log,
+    Hit,
 }
 
 struct Metrics {
@@ -302,8 +318,54 @@ pub fn editor_ui(
                 }
                 if resp.secondary_clicked() {
                     ui.memory_mut(|mem| mem.request_focus(id));
+                    // Right-click in the breakpoint column: remember the line.
+                    let bp_line = resp.interact_pointer_pos().filter(|p| p.x < clip.min.x + 16.0).map(|p| {
+                        let row = (((p.y - rect.min.y) / m.line_h).floor().max(0.0) as usize)
+                            .min(total_rows.saturating_sub(1));
+                        fm.line_at(row)
+                    });
+                    ui.data_mut(|d| d.insert_temp(id.with("bp-menu"), bp_line));
                 }
+                let bp_menu: Option<usize> = ui.data(|d| d.get_temp(id.with("bp-menu"))).flatten();
                 resp.context_menu(|ui| {
+                    if let Some(line) = bp_menu {
+                        let existing = doc.breakpoints.get(&line).cloned();
+                        ui.label(egui::RichText::new(format!("Breakpoint · line {}", line + 1)).small().weak());
+                        let item = |ui: &mut egui::Ui, label: &str| ui.button(label).clicked();
+                        match &existing {
+                            None => {
+                                if item(ui, "Add Breakpoint") {
+                                    doc.toggle_breakpoint(line);
+                                    ui.close_menu();
+                                }
+                            }
+                            Some(b) => {
+                                if item(ui, "Remove Breakpoint") {
+                                    doc.toggle_breakpoint(line);
+                                    ui.close_menu();
+                                }
+                                if item(ui, if b.disabled { "Enable Breakpoint" } else { "Disable Breakpoint" }) {
+                                    if let Some(b) = doc.breakpoints.get_mut(&line) {
+                                        b.disabled = !b.disabled;
+                                    }
+                                    doc.breakpoints_gen += 1;
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                        ui.separator();
+                        for (label, field) in [
+                            ("Condition…", BpField::Condition),
+                            ("Log Message (logpoint)…", BpField::Log),
+                            ("Hit Count…", BpField::Hit),
+                        ] {
+                            if item(ui, label) {
+                                actions.push(EditorAction::EditBreakpoint { line, field });
+                                ui.close_menu();
+                            }
+                        }
+                        return;
+                    }
                     let has_sel = !doc.buffer.sel.is_empty();
                     if ui.add_enabled(has_sel, egui::Button::new("Cut")).clicked() {
                         ui.ctx().copy_text(doc.buffer.selected_text());
@@ -757,14 +819,33 @@ pub fn editor_ui(
                     }
                 }
                 // Breakpoints, the debugger's current line, and a hint where to click.
-                for &b in doc.breakpoints.range(first..last) {
-                    if !fm.is_hidden(b) {
-                        let y = y_of_line(b) + m.line_h / 2.0;
-                        painter.circle_filled(
-                            egui::pos2(clip.min.x + 8.0, y),
-                            5.0,
-                            Color32::from_rgb(0xe5, 0x48, 0x4d),
-                        );
+                let red = Color32::from_rgb(0xe5, 0x48, 0x4d);
+                for (&b, bp) in doc.breakpoints.range(first..last) {
+                    if fm.is_hidden(b) {
+                        continue;
+                    }
+                    let c = egui::pos2(clip.min.x + 8.0, y_of_line(b) + m.line_h / 2.0);
+                    let color = if bp.disabled { p.text_faint } else { red };
+                    if !bp.log.trim().is_empty() {
+                        // Logpoint: a diamond.
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![
+                                c + egui::vec2(0.0, -5.5),
+                                c + egui::vec2(5.5, 0.0),
+                                c + egui::vec2(0.0, 5.5),
+                                c + egui::vec2(-5.5, 0.0),
+                            ],
+                            color,
+                            Stroke::NONE,
+                        ));
+                    } else {
+                        painter.circle_filled(c, 5.0, color);
+                        if !bp.condition.trim().is_empty() || !bp.hit.trim().is_empty() {
+                            // Conditional: two bars ("=") inside the dot.
+                            for dy in [-1.6_f32, 1.6] {
+                                painter.hline(c.x - 2.5..=c.x + 2.5, c.y + dy, Stroke::new(1.2_f32, p.bg));
+                            }
+                        }
                     }
                 }
                 if let Some(l) = doc.debug_line.filter(|l| *l >= first && *l < last && !fm.is_hidden(*l)) {
@@ -780,7 +861,7 @@ pub fn editor_ui(
                     let row =
                         (((h.y - rect.min.y) / m.line_h).floor().max(0.0) as usize).min(total_rows.saturating_sub(1));
                     let l = fm.line_at(row);
-                    if !doc.breakpoints.contains(&l) && fm.row_cols(row).0 == 0 {
+                    if !doc.breakpoints.contains_key(&l) && fm.row_cols(row).0 == 0 {
                         let y = rect.min.y + row as f32 * m.line_h + m.line_h / 2.0;
                         painter.circle_filled(
                             egui::pos2(clip.min.x + 8.0, y),
@@ -861,8 +942,20 @@ pub fn editor_ui(
                 if !same && doc.lsp_active {
                     actions.push(EditorAction::Hover { idx });
                 }
-                let info =
+                // While debugging: the value of the expression under the mouse.
+                if doc.debug_paused && doc.debug_value.as_ref().is_none_or(|(i, _)| *i != idx) {
+                    doc.debug_value = Some((idx, String::new()));
+                    actions.push(EditorAction::DebugHover { idx });
+                }
+                let value =
+                    doc.debug_value.as_ref().filter(|(i, v)| *i == idx && !v.is_empty()).map(|(_, v)| v.clone());
+                let lsp =
                     doc.hover.as_ref().filter(|h| h.idx == idx).and_then(|h| h.text.clone()).filter(|t| !t.is_empty());
+                let info = match (value, lsp) {
+                    (Some(v), Some(l)) => Some(format!("{v}\n\n{l}")),
+                    (Some(v), None) => Some(v),
+                    (None, l) => l,
+                };
                 if !diag.is_empty() || info.is_some() {
                     hover_popup(ui, p, pos, &diag, info.as_deref(), id);
                 }

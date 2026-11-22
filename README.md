@@ -133,6 +133,9 @@ Breakpoint — qator raqamining chap tomonini bosing yoki `F9` (sessiyada saqlan
 `F5` boshlash / davom ettirish, `F10` step over, `F11` step into, `Shift+F11` step out, `F6` pauza, `Shift+F5` to'xtatish.
 To'xtaganda: joriy qator belgilanadi, **o'zgaruvchilar** daraxti (ichiga kirish mumkin), **call stack** (bosib kadrni
 tanlash), **debug console** — dastur chiqishi va ifodalarni hisoblash.
+Breakpoint ustida o'ng tugma: **shart** (`t.baho == 3` bo'lganda to'xtash), **logpoint** (to'xtamasdan
+`{ifoda}` bilan xabar chiqarish, ◆ belgisi), **hit count**, o'chirib qo'yish. **WATCH** bo'limi — har to'xtashda
+hisoblanadigan ifodalar; to'xtab turganda o'zgaruvchi ustiga sichqonchani olib borsangiz qiymati ko'rinadi.
 
 ![Debugger](docs/debugger.png)
 

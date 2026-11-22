@@ -1,7 +1,9 @@
 //! Debugger front end: runs a debug session over [`zenith_dap`] and keeps
 //! the state the Run & Debug panel shows (call stack, variables, console).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -9,6 +11,28 @@ use std::thread;
 
 use serde_json::{json, Value};
 use zenith_dap::{DapClient, DapMessage, LaunchConfig, StackFrame, Variable};
+
+/// Options of one breakpoint (all empty = a plain breakpoint).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bp {
+    /// Stop only when this expression is true.
+    pub condition: String,
+    /// Logpoint: print this message (`{expr}` is interpolated) instead of stopping.
+    pub log: String,
+    /// Stop after this many hits (e.g. "5", ">= 3").
+    pub hit: String,
+    pub disabled: bool,
+}
+
+impl Bp {
+    pub fn is_plain(&self) -> bool {
+        *self == Bp::default()
+    }
+}
+
+/// Breakpoints of one file: 0-based line → options.
+pub type Breakpoints = BTreeMap<usize, Bp>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -25,6 +49,8 @@ pub enum DebugEvent {
     /// The session ended: clear the stop markers.
     Ended,
     Message(String),
+    /// Value of an expression under the mouse (document id, char index, text).
+    HoverValue(u64, usize, String),
 }
 
 #[derive(Debug)]
@@ -37,6 +63,8 @@ enum Req {
     Scopes,
     Variables(i64),
     Evaluate,
+    Watch(usize),
+    Hover(u64, usize, String),
     Other,
 }
 
@@ -68,11 +96,14 @@ pub struct Debugger {
     build_rx: Option<Receiver<Result<(), String>>>,
     waker: Arc<dyn Fn() + Send + Sync>,
     /// Breakpoints per file as last sent to the adapter.
-    sent: HashMap<PathBuf, BTreeSet<usize>>,
+    sent: HashMap<PathBuf, Breakpoints>,
     /// Selected launch configuration (index into the current list).
     pub selected: usize,
     /// The last output line has no newline yet.
     open_line: bool,
+    /// Watch expressions and their values in the selected frame.
+    pub watches: Vec<String>,
+    pub watch_values: Vec<Option<Result<String, String>>>,
 }
 
 const MAX_OUTPUT: usize = 2000;
@@ -91,6 +122,8 @@ impl Debugger {
             sent: HashMap::new(),
             selected: 0,
             open_line: false,
+            watches: vec![],
+            watch_values: vec![],
         }
     }
 
@@ -299,7 +332,7 @@ impl Debugger {
     }
 
     /// Send breakpoints for files whose set changed (all files once configured).
-    pub fn sync_breakpoints(&mut self, all: &BTreeMap<PathBuf, BTreeSet<usize>>) {
+    pub fn sync_breakpoints(&mut self, all: &BTreeMap<PathBuf, Breakpoints>) {
         let configured = self.session.as_ref().is_some_and(|s| s.client.is_some() && s.configured);
         if !configured {
             return;
@@ -315,8 +348,24 @@ impl Debugger {
         }
     }
 
-    fn send_breakpoints(&mut self, path: &Path, lines: &BTreeSet<usize>) {
-        let bps: Vec<Value> = lines.iter().map(|l| json!({ "line": l + 1 })).collect();
+    fn send_breakpoints(&mut self, path: &Path, lines: &Breakpoints) {
+        let bps: Vec<Value> = lines
+            .iter()
+            .filter(|(_, b)| !b.disabled)
+            .map(|(l, b)| {
+                let mut v = json!({ "line": l + 1 });
+                if !b.condition.trim().is_empty() {
+                    v["condition"] = json!(b.condition.trim());
+                }
+                if !b.log.trim().is_empty() {
+                    v["logMessage"] = json!(b.log.trim());
+                }
+                if !b.hit.trim().is_empty() {
+                    v["hitCondition"] = json!(b.hit.trim());
+                }
+                v
+            })
+            .collect();
         self.request(
             "setBreakpoints",
             json!({ "source": { "path": path, "name": path.file_name().map(|n| n.to_string_lossy()) }, "breakpoints": bps }),
@@ -329,9 +378,36 @@ impl Debugger {
         }
     }
 
+    /// Re-evaluate every watch expression in the selected frame.
+    pub fn evaluate_watches(&mut self) {
+        self.watch_values = vec![None; self.watches.len()];
+        let Some(frame_id) = self.session.as_ref().and_then(|s| s.frames.get(s.frame)).map(|f| f.id) else {
+            return;
+        };
+        for (i, w) in self.watches.clone().into_iter().enumerate() {
+            self.request(
+                "evaluate",
+                json!({ "expression": w, "context": "watch", "frameId": frame_id }),
+                Req::Watch(i),
+            );
+        }
+    }
+
+    /// Evaluate the expression under the mouse (shown in the hover popup).
+    pub fn evaluate_hover(&mut self, doc: u64, idx: usize, expr: String) {
+        let Some(frame_id) = self.session.as_ref().and_then(|s| s.frames.get(s.frame)).map(|f| f.id) else {
+            return;
+        };
+        self.request(
+            "evaluate",
+            json!({ "expression": expr, "context": "hover", "frameId": frame_id }),
+            Req::Hover(doc, idx, expr),
+        );
+    }
+
     /// Handle adapter messages; `breakpoints` is used when the adapter asks
     /// for its configuration.
-    pub fn poll(&mut self, breakpoints: &BTreeMap<PathBuf, BTreeSet<usize>>) -> Vec<DebugEvent> {
+    pub fn poll(&mut self, breakpoints: &BTreeMap<PathBuf, Breakpoints>) -> Vec<DebugEvent> {
         let mut out = vec![];
         if let Some(rx) = &self.build_rx {
             if let Ok(r) = rx.try_recv() {
@@ -369,7 +445,7 @@ impl Debugger {
     }
 
     /// Send breakpoints and `configurationDone` once the adapter is ready.
-    fn maybe_configure(&mut self, breakpoints: &BTreeMap<PathBuf, BTreeSet<usize>>) {
+    fn maybe_configure(&mut self, breakpoints: &BTreeMap<PathBuf, Breakpoints>) {
         let Some(s) = &mut self.session else { return };
         let ready = !s.configured
             && s.initialized_at.is_some_and(|t| s.launched || t.elapsed() > std::time::Duration::from_millis(400));
@@ -387,7 +463,7 @@ impl Debugger {
         &mut self,
         event: &str,
         body: &Value,
-        breakpoints: &BTreeMap<PathBuf, BTreeSet<usize>>,
+        breakpoints: &BTreeMap<PathBuf, Breakpoints>,
         out: &mut Vec<DebugEvent>,
     ) {
         match event {
@@ -443,6 +519,15 @@ impl Debugger {
     ) {
         if !success {
             let m = message.unwrap_or_else(|| "failed".into());
+            if let Some(Req::Watch(i)) = kind {
+                if let Some(slot) = self.watch_values.get_mut(i) {
+                    *slot = Some(Err(m));
+                }
+                return;
+            }
+            if matches!(kind, Some(Req::Hover(..))) {
+                return;
+            }
             if matches!(kind, Some(Req::Evaluate)) {
                 self.log_line("stderr", m);
             } else if !matches!(kind, Some(Req::Variables(_)) | Some(Req::Scopes) | Some(Req::ConfigurationDone)) {
@@ -489,6 +574,7 @@ impl Debugger {
                 }
             }
             Some(Req::Scopes) => {
+                self.evaluate_watches();
                 let scopes: Vec<Variable> = zenith_dap::parse_variables(body);
                 let auto: Vec<i64> = scopes
                     .iter()
@@ -512,6 +598,21 @@ impl Debugger {
             Some(Req::Evaluate) => {
                 let v = body.get("result").and_then(Value::as_str).unwrap_or_default().to_string();
                 self.log_line("result", v);
+            }
+            Some(Req::Watch(i)) => {
+                let mut v = body.get("result").and_then(Value::as_str).unwrap_or_default().to_string();
+                if v.is_empty() && body.get("variablesReference").and_then(Value::as_i64).unwrap_or(0) > 0 {
+                    v = "{…}".into(); // a struct: gdb gives no summary
+                }
+                if let Some(slot) = self.watch_values.get_mut(i) {
+                    *slot = Some(Ok(v));
+                }
+            }
+            Some(Req::Hover(doc, idx, expr)) => {
+                let v = body.get("result").and_then(Value::as_str).unwrap_or_default();
+                if !v.is_empty() {
+                    out.push(DebugEvent::HoverValue(doc, idx, format!("{expr} = {v}")));
+                }
             }
             _ => {}
         }
@@ -563,6 +664,62 @@ fn run_build(cmd: &str, root: &Path, tx: &Sender<DapMessage>) -> Result<(), Stri
     } else {
         Err(format!("`{cmd}` exited with {status}"))
     }
+}
+
+/// The expression under the mouse for a hover value: the identifier at
+/// `idx` with the `a.b` / `a::b` / `a->b` chain before it.
+pub fn expression_at(buf: &zenith_core::Buffer, idx: usize) -> Option<String> {
+    let pos = buf.char_to_pos(idx);
+    let line: Vec<char> = buf.line_text(pos.line).chars().collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut e = pos.col;
+    if e >= line.len() || !word(line[e]) {
+        return None;
+    }
+    while e < line.len() && word(line[e]) {
+        e += 1;
+    }
+    let mut s = pos.col;
+    loop {
+        while s > 0 && word(line[s - 1]) {
+            s -= 1;
+        }
+        // Continue through member access.
+        if s >= 1 && line[s - 1] == '.' && s >= 2 && word(line[s - 2]) {
+            s -= 1;
+        } else if s >= 2 && ((line[s - 2] == ':' && line[s - 1] == ':') || (line[s - 2] == '-' && line[s - 1] == '>')) {
+            s -= 2;
+        } else {
+            break;
+        }
+    }
+    let expr: String = line[s..e].iter().collect();
+    // Keywords and numbers aren't worth evaluating.
+    if expr.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || matches!(
+            expr.as_str(),
+            "fn" | "let"
+                | "mut"
+                | "pub"
+                | "def"
+                | "for"
+                | "in"
+                | "if"
+                | "else"
+                | "return"
+                | "while"
+                | "match"
+                | "struct"
+                | "impl"
+                | "use"
+                | "self"
+                | "import"
+                | "class"
+        )
+    {
+        return None;
+    }
+    Some(expr)
 }
 
 // ------------------------------------------------------------------ configurations
@@ -657,6 +814,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hover_expressions() {
+        let b = zenith_core::Buffer::from_str("let x = foo.bar.baz + t.ism;\nstd::env::args(); p->next 42");
+        let at = |line: usize, col: usize| expression_at(&b, b.pos_to_char(zenith_core::Position::new(line, col)));
+        assert_eq!(at(0, 17).as_deref(), Some("foo.bar.baz")); // on "baz"
+        assert_eq!(at(0, 13).as_deref(), Some("foo.bar")); // on "bar"
+        assert_eq!(at(0, 8).as_deref(), Some("foo"));
+        assert_eq!(at(0, 25).as_deref(), Some("t.ism"));
+        assert_eq!(at(0, 0), None); // keyword
+        assert_eq!(at(0, 6), None); // "="
+        assert_eq!(at(1, 6).as_deref(), Some("std::env"));
+        assert_eq!(at(1, 21).as_deref(), Some("p->next"));
+        assert_eq!(at(1, 27), None); // number
+    }
+
+    #[test]
     fn output_pieces_join_into_lines() {
         let mut d = Debugger::new(Arc::new(|| {}));
         d.log("stdout", "jami:");
@@ -685,7 +857,7 @@ mod tests {
         assert!(ok.is_ok_and(|s| s.success()));
         let src = src.canonicalize().unwrap();
         let mut d = Debugger::new(Arc::new(|| {}));
-        let bps = BTreeMap::from([(src.clone(), BTreeSet::from([1usize]))]);
+        let bps = BTreeMap::from([(src.clone(), Breakpoints::from([(1usize, Bp::default())]))]);
         d.start(
             LaunchConfig { name: "t".into(), adapter: "gdb".into(), program: "app".into(), ..Default::default() },
             dir.clone(),
