@@ -1310,6 +1310,27 @@ fn vim_keys(ui: &mut egui::Ui, doc: &mut Document, actions: &mut Vec<EditorActio
     use crate::vim::{Effect, VKey};
     let modal = !doc.vim.is_insert() || doc.vim.cmdline.is_some();
     let mut keys = vec![];
+    if !modal {
+        // Insert mode: the editor types, Vim only records (for `.` and macros).
+        let typed: Vec<VKey> = ui.input(|i| {
+            i.events
+                .iter()
+                .flat_map(|e| match e {
+                    Event::Text(t) => t.chars().map(VKey::Char).collect::<Vec<_>>(),
+                    Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                        vec![VKey::Enter]
+                    }
+                    Event::Key { key: Key::Backspace, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                        vec![VKey::Backspace]
+                    }
+                    _ => vec![],
+                })
+                .collect()
+        });
+        for k in typed {
+            doc.vim.note_insert(k);
+        }
+    }
     ui.input_mut(|i| {
         i.events.retain(|e| match e {
             Event::Text(t) if modal => {

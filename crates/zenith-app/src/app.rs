@@ -3865,7 +3865,11 @@ impl ZenithApp {
                     let v = &doc.vim;
                     let text = match &v.cmdline {
                         Some(c) => format!(":{c}▏"),
-                        None => format!("-- {} --  {}", v.mode.label(), v.pending_text()),
+                        None => {
+                            let rec =
+                                v.macro_rec.as_ref().map(|(r, _)| format!("  recording @{r}")).unwrap_or_default();
+                            format!("-- {} --{rec}  {}", v.mode.label(), v.pending_text())
+                        }
                     };
                     let color = match v.mode {
                         crate::vim::Mode::Insert => p.success,

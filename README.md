@@ -190,7 +190,8 @@ menyu va palitradagi yozuvlar ham yangilanadi:
 **Vim rejimi** (Sozlamalar → Editor → Vim mode yoki *Preferences: Toggle Vim Mode*): Normal / Insert / Visual /
 Visual Line; `h j k l w b e W B E 0 ^ $ gg G f t F T { }`, sonlar (`3j`, `d2w`), operatorlar `d c y > <` harakatlar va
 matn obyektlari bilan (`ciw`, `da(`, `ci"`, `yi{`), `dd yy cc x X D C s S r ~ J p P u Ctrl+R o O i a I A v V`,
-`/ n N *`, `:w :q :wq :x :<qator>`. Rejim status qatorida, Normal rejimda blok kursor.
+`/ n N *`, `.` (oxirgi o'zgarishni takrorlash), makroslar `q<r>` … `q`, `@<r>`, `@@`, almashtirish
+`:s/eski/yangi/`, `:%s/…/…/gi`, `:2,5s/…`, `:'<,'>s/…` (`\1`, `&` guruhlar), `:w :q :wq :x :<qator>`. Rejim status qatorida, Normal rejimda blok kursor.
 
 | Amal | Windows / Linux | macOS |
 |---|---|---|

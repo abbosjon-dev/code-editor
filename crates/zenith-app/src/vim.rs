@@ -65,6 +65,20 @@ pub struct VimState {
     head: usize,
     /// `:` command line being typed.
     pub cmdline: Option<String>,
+    /// Keys of the last change (for `.`), and the change being recorded.
+    last_change: Vec<VKey>,
+    change_rec: Option<Vec<VKey>>,
+    /// Macro being recorded (`q<r>`), recorded macros, last one played.
+    pub macro_rec: Option<(char, Vec<VKey>)>,
+    macros: std::collections::HashMap<char, Vec<VKey>>,
+    last_macro: Option<char>,
+    /// Replaying keys (`.` / `@`): insert-mode keys are applied here, and
+    /// nothing is recorded again. Value = nesting depth.
+    replaying: u32,
+    /// Lines of the last visual selection (for `:'<,'>`).
+    visual_lines: Option<(usize, usize)>,
+    /// A motion failed (e.g. `j` on the last line): stops a running macro.
+    failed: bool,
 }
 
 impl VimState {
@@ -83,6 +97,19 @@ impl VimState {
     /// Visual mode: the character the block caret is on.
     pub fn visual_head(&self) -> Option<usize> {
         matches!(self.mode, Mode::Visual | Mode::VisualLine).then_some(self.head)
+    }
+
+    /// The editor typed a key in insert mode (recorded for `.` and macros).
+    pub fn note_insert(&mut self, key: VKey) {
+        if self.replaying > 0 {
+            return;
+        }
+        if let Some(r) = &mut self.change_rec {
+            r.push(key);
+        }
+        if let Some((_, keys)) = &mut self.macro_rec {
+            keys.push(key);
+        }
     }
 
     pub fn is_insert(&self) -> bool {
@@ -402,7 +429,7 @@ fn parse(keys: &[VKey], visual: bool) -> Parse {
         Parse::Done(t) => Parse::Done(Command { count: count.max(1), ..t }),
         Parse::Invalid => {
             // Not a motion: a stand-alone command, some take one more key.
-            if matches!(c, 'r' | 'g' | 'z') {
+            if matches!(c, 'r' | 'g' | 'z' | 'q' | '@') {
                 let Some(&k) = it.next() else { return Parse::Incomplete };
                 let VKey::Char(arg) = k else { return Parse::Invalid };
                 return Parse::Done(Command {
@@ -508,6 +535,22 @@ fn motion(b: &Buffer, i: usize, m: char, arg: Option<char>, count: usize, explic
 
 pub fn feed(st: &mut VimState, b: &mut Buffer, key: VKey) -> Vec<Effect> {
     let mut fx = vec![];
+    // `q` in normal mode (no command pending) stops macro recording.
+    if st.replaying == 0 && st.macro_rec.is_some() {
+        let stops = key == VKey::Char('q') && st.mode == Mode::Normal && st.pending.is_empty() && st.cmdline.is_none();
+        if stops {
+            if let Some((r, keys)) = st.macro_rec.take() {
+                st.macros.insert(r, keys);
+            }
+            return fx;
+        }
+        // Typed text in insert mode arrives through `note_insert`; Esc comes here.
+        if st.mode != Mode::Insert || matches!(key, VKey::Esc | VKey::Ctrl('[') | VKey::Ctrl('c')) {
+            if let Some((_, keys)) = &mut st.macro_rec {
+                keys.push(key);
+            }
+        }
+    }
     if let Some(cmd) = &mut st.cmdline {
         match key {
             VKey::Esc => st.cmdline = None,
@@ -518,7 +561,7 @@ pub fn feed(st: &mut VimState, b: &mut Buffer, key: VKey) -> Vec<Effect> {
             }
             VKey::Enter => {
                 let c = st.cmdline.take().unwrap_or_default();
-                run_ex(c.trim(), b, &mut fx);
+                run_ex(st, c.trim(), b, &mut fx);
             }
             VKey::Char(c) => cmd.push(c),
             VKey::Ctrl(_) => {}
@@ -526,7 +569,24 @@ pub fn feed(st: &mut VimState, b: &mut Buffer, key: VKey) -> Vec<Effect> {
         return fx;
     }
     if st.mode == Mode::Insert {
-        if matches!(key, VKey::Esc | VKey::Ctrl('[') | VKey::Ctrl('c')) {
+        let esc = matches!(key, VKey::Esc | VKey::Ctrl('[') | VKey::Ctrl('c'));
+        if st.replaying > 0 && !esc {
+            // Replayed typing: the editor isn't involved, apply it here.
+            match key {
+                VKey::Char(c) => b.insert(&c.to_string()),
+                VKey::Enter => b.newline(),
+                VKey::Backspace => b.backspace(),
+                _ => {}
+            }
+            return fx;
+        }
+        if esc {
+            if st.replaying == 0 {
+                if let Some(mut r) = st.change_rec.take() {
+                    r.push(VKey::Esc);
+                    st.last_change = r;
+                }
+            }
             st.mode = Mode::Normal;
             let i = b.sel.head;
             let line = line_of(b, i);
@@ -555,15 +615,74 @@ pub fn feed(st: &mut VimState, b: &mut Buffer, key: VKey) -> Vec<Effect> {
         Parse::Invalid => st.pending.clear(),
         Parse::Done(c) => {
             let explicit = st.pending.iter().any(|k| matches!(k, VKey::Char('1'..='9')));
-            st.pending.clear();
+            let keys = std::mem::take(&mut st.pending);
             if visual {
                 visual_cmd(st, b, c, explicit, &mut fx);
+            } else if let Some(('.', _)) = c.action {
+                let last = st.last_change.clone();
+                for _ in 0..c.count {
+                    replay(st, b, &last, &mut fx);
+                }
+            } else if let Some(('@', Some(r))) = c.action {
+                let r = if r == '@' { st.last_macro.unwrap_or('@') } else { r };
+                st.last_macro = Some(r);
+                let keys = st.macros.get(&r).cloned().unwrap_or_default();
+                st.failed = false;
+                for _ in 0..c.count {
+                    if st.failed {
+                        break;
+                    }
+                    replay(st, b, &keys, &mut fx);
+                }
+            } else if let Some(('q', Some(r))) = c.action {
+                if st.replaying == 0 && r.is_ascii_alphanumeric() {
+                    st.macro_rec = Some((r, vec![]));
+                }
             } else {
+                let change = is_change(&c);
                 normal_cmd(st, b, c, explicit, &mut fx);
+                if change && st.replaying == 0 {
+                    if st.mode == Mode::Insert {
+                        st.change_rec = Some(keys);
+                    } else {
+                        st.last_change = keys;
+                    }
+                }
             }
         }
     }
     fx
+}
+
+/// Does this command change the text (so `.` repeats it)?
+fn is_change(c: &Command) -> bool {
+    match (c.op, c.action) {
+        (Some(op), _) => op != 'y',
+        (None, Some((a, _))) => "xXsSDCpPr~JoOiaIA".contains(a),
+        _ => false,
+    }
+}
+
+/// Feed recorded keys again (`.` and macros).
+fn replay(st: &mut VimState, b: &mut Buffer, keys: &[VKey], fx: &mut Vec<Effect>) {
+    if st.replaying > 20 || keys.is_empty() {
+        return; // a macro calling itself
+    }
+    if st.replaying == 0 {
+        st.failed = false;
+    }
+    st.replaying += 1;
+    for &k in keys {
+        if st.failed {
+            break;
+        }
+        fx.extend(feed(st, b, k));
+    }
+    // A replay that ended in insert mode (e.g. `cw` without Esc) stops typing.
+    if st.mode == Mode::Insert && st.replaying == 1 {
+        let _ = feed(st, b, VKey::Esc);
+    }
+    st.replaying -= 1;
 }
 
 fn move_to(st: &mut VimState, b: &mut Buffer, i: usize) {
@@ -691,8 +810,29 @@ fn normal_cmd(st: &mut VimState, b: &mut Buffer, c: Command, explicit: bool, fx:
                 } else {
                     m
                 };
-                let Some((t, kind)) = motion(b, i, m, arg, n, explicit) else { return };
+                let cw = c.op == Some('c') && matches!(m, 'e' | 'E') && matches!(arg, None);
+                let Some((t, kind)) = (if cw {
+                    // End of the current word, then `n - 1` more word ends.
+                    let big = m == 'E';
+                    let cls = class(ch(b, i), big);
+                    let mut j = i;
+                    while j + 1 < b.len_chars() && class(ch(b, j + 1), big) == cls {
+                        j += 1;
+                    }
+                    for _ in 1..n {
+                        j = word_end(b, j, big);
+                    }
+                    Some((j, Kind::Inclusive))
+                } else {
+                    motion(b, i, m, arg, n, explicit)
+                }) else {
+                    return;
+                };
                 let Some(op) = c.op else {
+                    let line = line_of(b, i);
+                    if (m == 'j' && line + 1 >= b.len_lines()) || (m == 'k' && line == 0) {
+                        st.failed = true;
+                    }
                     move_to(st, b, t);
                     return;
                 };
@@ -974,12 +1114,138 @@ fn visual_cmd(st: &mut VimState, b: &mut Buffer, c: Command, explicit: bool, fx:
                 fx,
             );
         }
-        ':' => st.cmdline = Some(String::new()),
+        ':' => {
+            let (l1, l2) = (line_of(b, s), line_of(b, e.saturating_sub(1).max(s)));
+            st.visual_lines = Some((l1, l2));
+            exit(st);
+            b.set_cursor(clamp_normal(b, s), false);
+            st.cmdline = Some("'<,'>".into());
+        }
         _ => {}
     }
 }
 
-fn run_ex(cmd: &str, b: &mut Buffer, fx: &mut Vec<Effect>) {
+/// Parse `[range]s/pat/rep/[flags]`: (first line, last line, pattern, replacement, flags).
+fn parse_substitute(
+    cmd: &str,
+    cur: usize,
+    last: usize,
+    visual: Option<(usize, usize)>,
+) -> Option<(usize, usize, String, String, String)> {
+    let (range, rest) = match cmd.find('s') {
+        Some(i)
+            if cmd[i..].len() > 1 && !cmd[i + 1..].starts_with(|c: char| c.is_alphanumeric() || c.is_whitespace()) =>
+        {
+            (&cmd[..i], &cmd[i + 1..])
+        }
+        _ => return None,
+    };
+    let (l1, l2) = match range.trim() {
+        "" | "." => (cur, cur),
+        "%" => (0, last),
+        "'<,'>" => visual.unwrap_or((cur, cur)),
+        r => {
+            let num = |x: &str| -> Option<usize> {
+                match x.trim() {
+                    "." => Some(cur),
+                    "$" => Some(last),
+                    n => n.parse::<usize>().ok().map(|n| n.saturating_sub(1)),
+                }
+            };
+            match r.split_once(',') {
+                Some((a, z)) => (num(a)?, num(z)?),
+                None => (num(r)?, num(r)?),
+            }
+        }
+    };
+    let delim = rest.chars().next()?;
+    // Split on unescaped delimiters.
+    let mut parts = vec![String::new()];
+    let mut chars = rest[delim.len_utf8()..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&delim) {
+            parts.last_mut()?.push(delim);
+            chars.next();
+        } else if c == delim {
+            parts.push(String::new());
+        } else {
+            parts.last_mut()?.push(c);
+        }
+    }
+    let pat = parts.first()?.clone();
+    if pat.is_empty() {
+        return None;
+    }
+    let rep = parts.get(1).cloned().unwrap_or_default();
+    let flags = parts.get(2).cloned().unwrap_or_default();
+    Some((l1.min(l2), l1.max(l2).min(last), pat, rep, flags))
+}
+
+/// Vim replacement syntax → regex crate syntax: `&` / `\0` whole match, `\1` groups.
+fn vim_replacement(rep: &str) -> String {
+    let mut out = String::new();
+    let mut it = rep.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.next() {
+                Some(d @ '0'..='9') => out.push_str(&format!("${{{d}}}")),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('&') => out.push('&'),
+                Some(o) => out.push(o),
+                None => out.push('\\'),
+            },
+            '&' => out.push_str("${0}"),
+            '$' => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn substitute(st: &mut VimState, cmd: &str, b: &mut Buffer, fx: &mut Vec<Effect>) -> bool {
+    let cur = line_of(b, b.sel.head);
+    let last = b.len_lines().saturating_sub(1);
+    let Some((l1, l2, pat, rep, flags)) = parse_substitute(cmd, cur, last, st.visual_lines) else { return false };
+    // Vim's \( \) \| groups → plain regex groups; keep everything else.
+    let pat = pat.replace("\\(", "(").replace("\\)", ")").replace("\\|", "|");
+    let re = match regex::RegexBuilder::new(&pat).case_insensitive(flags.contains('i')).build() {
+        Ok(r) => r,
+        Err(e) => {
+            fx.push(Effect::Message(format!("Bad pattern: {}", e.to_string().lines().last().unwrap_or(""))));
+            return true;
+        }
+    };
+    let rep = vim_replacement(&rep);
+    let global = flags.contains('g');
+    let (s, e) = (line_start(b, l1), line_end(b, l2));
+    let old: String = b.rope().slice(s..e).to_string();
+    let mut count = 0;
+    let new: Vec<String> = old
+        .split('\n')
+        .map(|line| {
+            let n = if global { re.find_iter(line).count() } else { usize::from(re.is_match(line)) };
+            count += n;
+            if global {
+                re.replace_all(line, rep.as_str()).into_owned()
+            } else {
+                re.replace(line, rep.as_str()).into_owned()
+            }
+        })
+        .collect();
+    if count == 0 {
+        fx.push(Effect::Message(format!("Pattern not found: {pat}")));
+        return true;
+    }
+    b.apply_edits(vec![(s, e, new.join("\n"))]);
+    b.set_cursor(first_nonblank(b, l2.min(b.len_lines().saturating_sub(1))), false);
+    true
+}
+
+fn run_ex(st: &mut VimState, cmd: &str, b: &mut Buffer, fx: &mut Vec<Effect>) {
+    if substitute(st, cmd, b, fx) {
+        return;
+    }
     match cmd {
         "" => {}
         "w" | "write" => fx.push(Effect::Save),
@@ -1015,6 +1281,7 @@ mod tests {
             if st.mode == Mode::Insert && !matches!(k, VKey::Esc) {
                 if let VKey::Char(c) = k {
                     b.insert(&c.to_string());
+                    st.note_insert(k);
                 }
                 continue;
             }
@@ -1079,6 +1346,33 @@ mod tests {
         assert_eq!(b.sel.head, 0);
         assert_eq!(run("abc", "$p").0.text(), "abc"); // empty register
         assert_eq!(run("abc", "xp").0.text(), "bac");
+    }
+
+    #[test]
+    fn dot_repeat_and_macros() {
+        assert_eq!(run("a b c d", "dw..").0.text(), "d");
+        assert_eq!(run("a\nb\nc\nd", "dd.").0.text(), "c\nd");
+        assert_eq!(run("x x x", "cwy⎋w.w.").0.text(), "y y y");
+        assert_eq!(run("one\ntwo", "A;⎋j.").0.text(), "one;\ntwo;");
+        assert_eq!(run("abcdef", "x2.").0.text(), "def");
+        // Macro: append "!" and go down; replay twice.
+        assert_eq!(run("a\nb\nc", "qaA!⎋jq@a@@").0.text(), "a!\nb!\nc!");
+        assert_eq!(run("1\n2\n3\n4", "qqddjq2@q").0.text(), "2\n4");
+        // `yw` isn't a change: `.` still repeats the earlier `x`.
+        assert_eq!(run("abc def", "xyw.").0.text(), "c def");
+    }
+
+    #[test]
+    fn substitute() {
+        assert_eq!(run("foo foo\nfoo", ":s/foo/bar/⏎").0.text(), "bar foo\nfoo");
+        assert_eq!(run("foo foo\nfoo", ":%s/foo/bar/g⏎").0.text(), "bar bar\nbar");
+        assert_eq!(run("a1 b2\nc3", ":%s/(\\w)(\\d)/\\2\\1/g⏎").0.text(), "1a 2b\n3c");
+        assert_eq!(run("Ab ab", ":s/ab/x/gi⏎").0.text(), "x x");
+        assert_eq!(run("x\nx\nx\nx", ":2,3s/x/y/⏎").0.text(), "x\ny\ny\nx");
+        assert_eq!(run("x\nx\nx", "jVj:s/x/z/⏏").0.text(), "x\nx\nx"); // not run until Enter
+        assert_eq!(run("x\nx\nx", "jVj:s/x/z/⏎").0.text(), "x\nz\nz");
+        assert_eq!(run("a.b", ":s#\\.#/#⏎").0.text(), "a/b");
+        assert_eq!(run("hi", ":s/hi/& &/⏎").0.text(), "hi hi");
     }
 
     #[test]
