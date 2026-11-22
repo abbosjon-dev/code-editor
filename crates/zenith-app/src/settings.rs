@@ -31,6 +31,8 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// Vim-style modal editing (normal / insert / visual modes).
     pub vim_mode: bool,
+    /// Tree-sitter highlighting and folding for supported languages.
+    pub tree_sitter: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
     /// Custom shell for new terminals (empty = system default).
@@ -70,6 +72,7 @@ impl Default for Settings {
             inlay_hints: true,
             cursor_blink: true,
             vim_mode: false,
+            tree_sitter: true,
             auto_save: false,
             format_trim_trailing_whitespace: false,
             shell: String::new(),

@@ -488,7 +488,13 @@ impl Document {
     // ---------- folding ----------
 
     pub fn fold_map(&mut self) -> std::sync::Arc<crate::folding::FoldMap> {
-        let key = (self.buffer.version(), self.folds_gen);
+        // Syntax fold ranges change when the tree is reparsed.
+        let ranges_id = if self.folds.is_empty() {
+            0
+        } else {
+            self.syntax_folds().map_or(0, |r| std::sync::Arc::as_ptr(&r) as u64)
+        };
+        let key = (self.buffer.version(), self.folds_gen.wrapping_mul(31).wrapping_add(ranges_id));
         if let Some((v, g, m)) = &self.fold_cache {
             if (*v, *g) == key
                 && m.wrap_cols
@@ -501,13 +507,26 @@ impl Document {
                 return m.clone();
             }
         }
-        let m = std::sync::Arc::new(crate::folding::FoldMap::build(&self.buffer, &self.folds, self.wrap_cols));
+        let sf = if self.folds.is_empty() { None } else { self.syntax_folds() };
+        let m = std::sync::Arc::new(crate::folding::FoldMap::build(
+            &self.buffer,
+            &self.folds,
+            self.wrap_cols,
+            sf.as_deref(),
+        ));
         self.fold_cache = Some((key.0, key.1, m.clone()));
         m
     }
 
+    /// Fold ranges from the syntax tree, when it matches the current text.
+    pub fn syntax_folds(&self) -> Option<std::sync::Arc<crate::folding::Ranges>> {
+        self.highlight.syntax_folds(&self.buffer)
+    }
+
     pub fn toggle_fold(&mut self, header: usize) {
-        if !self.folds.remove(&header) && crate::folding::is_foldable(&self.buffer, header) {
+        if !self.folds.remove(&header)
+            && crate::folding::is_foldable(&self.buffer, header, self.syntax_folds().as_deref())
+        {
             self.folds.insert(header);
             self.move_cursor_out_of_folds();
         }
@@ -516,10 +535,11 @@ impl Document {
 
     pub fn fold_at_cursor(&mut self) {
         let line = self.buffer.cursor_pos().line;
+        let sf = self.syntax_folds();
         // Fold the innermost unfolded region around the caret.
         let mut l = line;
         loop {
-            match crate::folding::enclosing_header(&self.buffer, l) {
+            match crate::folding::enclosing_header(&self.buffer, l, sf.as_deref()) {
                 Some(h) if self.folds.contains(&h) && h > 0 => l = h - 1,
                 Some(h) if !self.folds.contains(&h) => {
                     self.folds.insert(h);
@@ -536,7 +556,7 @@ impl Document {
         let line = self.buffer.cursor_pos().line;
         let before = self.folds.len();
         self.folds.remove(&line);
-        if let Some(h) = crate::folding::enclosing_header(&self.buffer, line) {
+        if let Some(h) = crate::folding::enclosing_header(&self.buffer, line, self.syntax_folds().as_deref()) {
             self.folds.remove(&h);
         }
         if self.folds.len() != before {
@@ -545,7 +565,13 @@ impl Document {
     }
 
     pub fn fold_all(&mut self) {
-        self.folds = (0..self.buffer.len_lines()).filter(|&l| crate::folding::is_foldable(&self.buffer, l)).collect();
+        let sf = self.syntax_folds();
+        self.folds = match &sf {
+            Some(r) => r.keys().copied().collect(),
+            None => {
+                (0..self.buffer.len_lines()).filter(|&l| crate::folding::is_foldable(&self.buffer, l, None)).collect()
+            }
+        };
         self.folds_gen += 1;
         self.move_cursor_out_of_folds();
     }
@@ -566,7 +592,9 @@ impl Document {
             return;
         }
         let buf = &self.buffer;
-        self.folds.retain(|&h| !(h < line && crate::folding::fold_end(buf, h).is_some_and(|e| e >= line)));
+        let sf = self.highlight.syntax_folds(buf);
+        self.folds
+            .retain(|&h| !(h < line && crate::folding::fold_end(buf, h, sf.as_deref()).is_some_and(|e| e >= line)));
         self.folds_gen += 1;
     }
 
@@ -873,6 +901,55 @@ fn is_subsequence(needle: &str, hay: &str) -> bool {
 mod perf {
     use super::*;
     use std::time::Instant;
+
+    /// Tree-sitter keystroke cost on the largest file it handles.
+    #[test]
+    #[ignore]
+    fn perf_tree_sitter_keystroke() {
+        let line = "    let value = compute(alpha, beta, gamma) + other_function(delta); // comment\n";
+        let mut text = String::new();
+        for i in 0..1_900 {
+            text.push_str(&format!("fn f{i}() {{\n"));
+            text.push_str(&line.repeat(8));
+            text.push_str("}\n");
+        }
+        let dir = std::env::temp_dir().join("zenith-perf-ts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mid.rs");
+        std::fs::write(&path, &text).unwrap();
+        let mut doc = Document::open(1, &path, highlight::load_theme("OneHalfDark"), 4).unwrap();
+        println!("lines: {}", doc.buffer.len_lines());
+        doc.goto_line(9_000);
+        doc.sync();
+        let t = Instant::now();
+        doc.highlight.ensure(&doc.buffer, 9_000, 9_060);
+        println!("first parse + highlight: {:?}", t.elapsed());
+        assert!(doc.highlight.tree_sitter_name().is_some());
+        let n = 30;
+        let t = Instant::now();
+        for i in 0..n {
+            doc.buffer.type_char(if i % 2 == 0 { 'x' } else { 'y' });
+            doc.sync();
+            doc.fold_map();
+            doc.highlight.ensure(&doc.buffer, 9_000, 9_060);
+        }
+        let per = t.elapsed() / n;
+        println!("tree-sitter per keystroke: {per:?}");
+        assert!(per.as_millis() < 16, "keystroke too slow: {per:?}");
+        // With folds in the file, fold ranges are needed after every edit.
+        doc.fold_all();
+        doc.unfold_at_cursor();
+        let t = Instant::now();
+        for i in 0..n {
+            doc.buffer.type_char(if i % 2 == 0 { 'x' } else { 'y' });
+            doc.sync();
+            doc.highlight.ensure(&doc.buffer, 9_000, 9_060);
+            doc.fold_map();
+        }
+        let per = t.elapsed() / n;
+        println!("tree-sitter per keystroke with folds: {per:?}");
+        assert!(per.as_millis() < 16, "keystroke too slow with folds: {per:?}");
+    }
 
     /// Per-keystroke work on a large file. Run with:
     /// `cargo test --release -p zenith-app perf -- --ignored --nocapture`

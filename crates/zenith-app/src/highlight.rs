@@ -112,7 +112,14 @@ pub struct HighlightCache {
     /// used while the exact pass hasn't reached it yet.
     approx: Option<(usize, u64, Vec<Vec<Span>>)>,
     pub enabled: bool,
+    /// Tree-sitter tree for languages with a bundled grammar.
+    ts: Option<crate::treesitter::SyntaxTree>,
+    /// The tree drove the last `ensure` (so `line` reads from it).
+    ts_active: bool,
 }
+
+/// Use tree-sitter where available (Settings → Editor).
+pub static TREE_SITTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 const MAX_HIGHLIGHT_LINE: usize = 4_000;
 const FRAME_BUDGET: Duration = Duration::from_millis(6);
@@ -132,6 +139,8 @@ impl HighlightCache {
             dirty_until: 0,
             approx: None,
             enabled: true,
+            ts: None,
+            ts_active: false,
         };
         c.reset();
         c
@@ -151,12 +160,33 @@ impl HighlightCache {
         self.reset();
     }
 
+    /// Name of the tree-sitter grammar in use, if any.
+    pub fn tree_sitter_name(&self) -> Option<&'static str> {
+        self.ts.as_ref().filter(|_| self.ts_active).map(|t| t.lang_name())
+    }
+
+    /// Shifted fold ranges are in use; they'll be recomputed after a pause.
+    pub fn folds_pending(&self) -> bool {
+        self.ts.as_ref().is_some_and(|t| self.ts_active && t.folds_pending())
+    }
+
+    /// Fold ranges from the syntax tree, if it is current for `buf`.
+    pub fn syntax_folds(&self, buf: &Buffer) -> Option<Arc<crate::folding::Ranges>> {
+        self.ts.as_ref().filter(|t| self.ts_active && t.is_current(buf)).map(|t| t.folds())
+    }
+
     fn initial_state(&self) -> (ParseState, HighlightState) {
         let hl = Highlighter::new(&self.theme);
         (ParseState::new(self.syntax), HighlightState::new(&hl, ScopeStack::new()))
     }
 
     fn reset(&mut self) {
+        self.ts = if TREE_SITTER.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::treesitter::SyntaxTree::new(&self.syntax.name)
+        } else {
+            None
+        };
+        self.ts_active = false;
         self.states = vec![self.initial_state()];
         self.lines.clear();
         self.dirty_from = None;
@@ -235,6 +265,17 @@ impl HighlightCache {
             return true;
         }
         let n = buf.len_lines();
+        // Tree-sitter: exact, incremental, and cheap for the visible lines.
+        if let Some(ts) = &mut self.ts {
+            if n <= crate::treesitter::MAX_LINES {
+                ts.set_theme(&self.theme);
+                ts.update(buf);
+                ts.ensure(first, upto.min(n));
+                self.ts_active = true;
+                return true;
+            }
+        }
+        self.ts_active = false;
         let upto = upto.min(n);
         let start = Instant::now();
         let theme = self.theme.clone();
@@ -312,6 +353,9 @@ impl HighlightCache {
     }
 
     pub fn line(&self, i: usize) -> Option<&[Span]> {
+        if self.ts_active {
+            return self.ts.as_ref().and_then(|t| t.line(i));
+        }
         if let Some(l) = self.lines.get(i) {
             return Some(l.as_slice());
         }

@@ -166,6 +166,15 @@ fn editor(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= checkbox(ui, &mut s.auto_save, "Auto save", "Save modified files every few seconds");
     c.any |= checkbox(ui, &mut s.format_trim_trailing_whitespace, "Trim trailing whitespace", "On save");
     c.any |= checkbox(ui, &mut s.format_on_save, "Format on save", "Uses the language server");
+    if checkbox(
+        ui,
+        &mut s.tree_sitter,
+        "Tree-sitter",
+        "Syntax-tree highlighting and folding (Rust, Python, JS/TS, Go, C/C++, JSON, Bash, HTML, CSS)",
+    ) {
+        c.syntax_theme = true;
+        c.any = true;
+    }
     c.any |=
         checkbox(ui, &mut s.vim_mode, "Vim mode", "Modal editing: Normal / Insert / Visual, motions, operators, :w :q");
     row_label(ui, "Keyboard shortcuts", "Rebind any command in keybindings.toml");

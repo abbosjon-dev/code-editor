@@ -25,8 +25,15 @@ fn indent_of(buf: &Buffer, line: usize) -> Option<usize> {
     Some(v)
 }
 
-/// Can `line` be folded (the next non-blank line is indented deeper)?
-pub fn is_foldable(buf: &Buffer, line: usize) -> bool {
+/// Fold ranges from a syntax tree: header line → last hidden line.
+pub type Ranges = std::collections::BTreeMap<usize, usize>;
+
+/// Can `line` be folded? Syntax ranges when known, else indentation (the
+/// next non-blank line is indented deeper).
+pub fn is_foldable(buf: &Buffer, line: usize, ranges: Option<&Ranges>) -> bool {
+    if let Some(r) = ranges {
+        return r.contains_key(&line);
+    }
     let Some(base) = indent_of(buf, line) else { return false };
     let n = buf.len_lines();
     for l in line + 1..n.min(line + 200) {
@@ -38,7 +45,10 @@ pub fn is_foldable(buf: &Buffer, line: usize) -> bool {
 }
 
 /// Last line hidden by folding `header`, if foldable.
-pub fn fold_end(buf: &Buffer, header: usize) -> Option<usize> {
+pub fn fold_end(buf: &Buffer, header: usize, ranges: Option<&Ranges>) -> Option<usize> {
+    if let Some(r) = ranges {
+        return r.get(&header).copied();
+    }
     let base = indent_of(buf, header)?;
     let mut end = None;
     for l in header + 1..buf.len_lines() {
@@ -52,14 +62,21 @@ pub fn fold_end(buf: &Buffer, header: usize) -> Option<usize> {
 }
 
 /// Innermost foldable header containing `line` (or `line` itself).
-pub fn enclosing_header(buf: &Buffer, line: usize) -> Option<usize> {
-    if is_foldable(buf, line) {
+pub fn enclosing_header(buf: &Buffer, line: usize, ranges: Option<&Ranges>) -> Option<usize> {
+    if let Some(r) = ranges {
+        if r.contains_key(&line) {
+            return Some(line);
+        }
+        // Innermost range around the line: the nearest header above that reaches it.
+        return r.range(..line).rev().find(|(_, &e)| e >= line).map(|(&h, _)| h);
+    }
+    if is_foldable(buf, line, None) {
         return Some(line);
     }
     let base = (0..=line).rev().find_map(|l| indent_of(buf, l))?;
     (0..line)
         .rev()
-        .find(|&l| indent_of(buf, l).is_some_and(|i| i < base) && fold_end(buf, l).is_some_and(|e| e >= line))
+        .find(|&l| indent_of(buf, l).is_some_and(|i| i < base) && fold_end(buf, l, None).is_some_and(|e| e >= line))
 }
 
 /// Mapping between document lines and visible rows (folding + soft wrap).
@@ -115,14 +132,14 @@ pub fn wrap_points(chars: &[char], wrap_cols: usize, tab: usize) -> Vec<usize> {
 }
 
 impl FoldMap {
-    pub fn build(buf: &Buffer, folds: &BTreeSet<usize>, wrap_cols: usize) -> Self {
+    pub fn build(buf: &Buffer, folds: &BTreeSet<usize>, wrap_cols: usize, ranges: Option<&Ranges>) -> Self {
         let n = buf.len_lines();
         let wrap_cols = if n > MAX_WRAP_LINES { 0 } else { wrap_cols };
         if folds.is_empty() && wrap_cols == 0 {
             return Self { rows: vec![], total_lines: n, wrap_cols };
         }
         let mut hidden: Vec<(usize, usize)> =
-            folds.iter().filter(|&&h| h < n).filter_map(|&h| fold_end(buf, h).map(|e| (h + 1, e))).collect();
+            folds.iter().filter(|&&h| h < n).filter_map(|&h| fold_end(buf, h, ranges).map(|e| (h + 1, e))).collect();
         hidden.sort_unstable();
         let tab = buf.tab_size.max(1);
         let mut rows = Vec::with_capacity(n);
@@ -241,27 +258,27 @@ mod tests {
     #[test]
     fn foldable_and_ends() {
         let b = Buffer::from_str(SRC);
-        assert!(is_foldable(&b, 0));
-        assert_eq!(fold_end(&b, 0), Some(5));
-        assert_eq!(fold_end(&b, 3), Some(4));
-        assert!(!is_foldable(&b, 7));
-        assert_eq!(enclosing_header(&b, 4), Some(3));
-        assert_eq!(enclosing_header(&b, 1), Some(0));
+        assert!(is_foldable(&b, 0, None));
+        assert_eq!(fold_end(&b, 0, None), Some(5));
+        assert_eq!(fold_end(&b, 3, None), Some(4));
+        assert!(!is_foldable(&b, 7, None));
+        assert_eq!(enclosing_header(&b, 4, None), Some(3));
+        assert_eq!(enclosing_header(&b, 1, None), Some(0));
     }
 
     #[test]
     fn map_rows() {
         let b = Buffer::from_str(SRC);
-        let m = FoldMap::build(&b, &BTreeSet::from([0]), 0);
+        let m = FoldMap::build(&b, &BTreeSet::from([0]), 0, None);
         // Lines 1..=5 hidden.
         assert_eq!(m.row_count(), b.len_lines() - 5);
         assert_eq!(m.line_at(1), 6);
         assert_eq!(m.row_of(3), 0);
         assert!(m.is_hidden(4));
         assert!(!m.is_hidden(6));
-        let nested = FoldMap::build(&b, &BTreeSet::from([0, 3]), 0);
+        let nested = FoldMap::build(&b, &BTreeSet::from([0, 3]), 0, None);
         assert_eq!(nested.row_count(), m.row_count());
-        let id = FoldMap::build(&b, &BTreeSet::new(), 0);
+        let id = FoldMap::build(&b, &BTreeSet::new(), 0, None);
         assert!(id.is_identity());
         assert_eq!(id.row_of(4), 4);
     }
@@ -279,7 +296,7 @@ mod tests {
     #[test]
     fn wrapped_rows() {
         let b = Buffer::from_str("short\nhello world this is long\nend");
-        let m = FoldMap::build(&b, &BTreeSet::new(), 10);
+        let m = FoldMap::build(&b, &BTreeSet::new(), 10, None);
         assert_eq!(m.row_count(), 6);
         assert_eq!(m.row_of(1), 1);
         assert_eq!(m.last_row_of(1), 4);

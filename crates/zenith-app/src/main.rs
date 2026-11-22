@@ -23,6 +23,7 @@ mod settings;
 mod settings_ui;
 mod terminal_view;
 mod theme;
+mod treesitter;
 mod vim;
 mod workspace;
 

@@ -223,6 +223,7 @@ impl ZenithApp {
         theme::install_fonts(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let (settings, settings_err) = Settings::load();
+        crate::highlight::TREE_SITTER.store(settings.tree_sitter, std::sync::atomic::Ordering::Relaxed);
         let colors = Palette::by_name(&settings.theme);
         theme::apply_style(&cc.egui_ctx, &colors, settings.ui_font_size);
         let ctx = cc.egui_ctx.clone();
@@ -632,7 +633,8 @@ impl ZenithApp {
             self.toast(e, NotifyLevel::Error);
             return;
         }
-        let theme_changed = s.syntax_theme != self.settings.syntax_theme;
+        let theme_changed = s.syntax_theme != self.settings.syntax_theme || s.tree_sitter != self.settings.tree_sitter;
+        crate::highlight::TREE_SITTER.store(s.tree_sitter, std::sync::atomic::Ordering::Relaxed);
         self.settings = s;
         self.colors = Palette::by_name(&self.settings.theme);
         self.agents = merge_agents(&self.settings.agents);
@@ -4039,7 +4041,11 @@ impl ZenithApp {
                 if let Some(doc) = self.docs.get(self.active) {
                     let pos = doc.buffer.cursor_pos();
                     let lang = doc.language().to_string();
-                    if ui.add(egui::Label::new(small(lang)).sense(Sense::click())).clicked() {
+                    let engine = match doc.highlight.tree_sitter_name() {
+                        Some(g) => format!("Highlighting: tree-sitter ({g}) — click to change language"),
+                        None => "Highlighting: TextMate grammar — click to change language".into(),
+                    };
+                    if ui.add(egui::Label::new(small(lang)).sense(Sense::click())).on_hover_text(engine).clicked() {
                         cmd = Some(Cmd::SelectLanguage);
                     }
                     ui.label(small(doc.buffer.line_ending.label().into()));
@@ -4706,6 +4712,7 @@ impl ZenithApp {
             }
         }
         if c.syntax_theme {
+            crate::highlight::TREE_SITTER.store(self.settings.tree_sitter, std::sync::atomic::Ordering::Relaxed);
             let name = self.settings.syntax_theme.clone();
             self.set_syntax_theme(name);
         }

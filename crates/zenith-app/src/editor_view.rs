@@ -189,6 +189,10 @@ pub fn editor_ui(
         0
     };
     let fm = doc.fold_map();
+    if !doc.folds.is_empty() && doc.highlight.folds_pending() {
+        // Recompute syntax folds once typing pauses.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(550));
+    }
     let total_rows = fm.row_count();
     let wrapping = fm.wrap_cols > 0;
     let mut cursor_screen: Option<Pos2> = None;
@@ -930,6 +934,7 @@ pub fn editor_ui(
                     }
                 }
                 let gutter_hovered = resp.hover_pos().is_some_and(|h| h.x < clip.min.x + gutter_w);
+                let syntax_folds = if gutter_hovered { doc.syntax_folds() } else { None };
                 for row in first_row..last_row {
                     let line = fm.line_at(row);
                     let y = rect.min.y + row as f32 * m.line_h + m.line_h / 2.0;
@@ -938,7 +943,9 @@ pub fn editor_ui(
                     }
                     let active = line == cursor.line;
                     let folded = doc.folds.contains(&line);
-                    if folded || (gutter_hovered && crate::folding::is_foldable(&doc.buffer, line)) {
+                    if folded
+                        || (gutter_hovered && crate::folding::is_foldable(&doc.buffer, line, syntax_folds.as_deref()))
+                    {
                         painter.text(
                             egui::pos2(clip.min.x + gutter_w - 13.0, y),
                             Align2::CENTER_CENTER,

@@ -43,7 +43,8 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [ ] Ustun bo'yicha (blok) belgilash: Shift+Alt+sudrash
 - [x] LSP: rename, find references, formatting / format on save
 - [x] LSP: signature help, code actions (quick fix), document symbols
-- [ ] LSP: inlay hints, workspace symbols, semantic tokens
+- [x] LSP: inlay hints, workspace symbols
+- [ ] LSP: semantic tokens
 - [x] Git: yonma-yon diff ko'rinishi, branch almashtirish
 - [x] Git: hunk'ni qaytarish (gutter), inline blame
 - [x] Git: stash, merge konfliktlarini hal qilish UI
@@ -51,11 +52,11 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] Debugger (DAP): gdb, lldb-dap, debugpy; breakpoint, step, o'zgaruvchilar, call stack, console
 - [x] Sozlanadigan tugmalar (keybindings.toml) va Vim rejimi
 - [x] Agent o'zgarishlarini ko'p faylli ko'rib chiqish (checkpoint), terminalni bo'lish
-- [ ] Shartli breakpoint'lar, logpoint'lar, watch ifodalari
+- [x] Shartli breakpoint'lar, logpoint'lar, watch ifodalari, hover qiymatlari
 
 **v0.3**
 - [x] Kod bloklarini yig'ish (chekinish asosida, barcha tillar uchun)
-- [ ] Tree-sitter asosida ranglash va sintaktik folding
+- [x] Tree-sitter asosida ranglash va sintaktik folding (11 til)
 - [ ] MCP serverlarini sozlash UI
 - [ ] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
 - [x] Plugin yon panellari (`[[panels]]`, `set_panel`)
