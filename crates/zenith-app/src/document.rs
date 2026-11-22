@@ -92,6 +92,8 @@ pub struct Document {
     git_hunks_version: Option<u64>,
     /// Git merge conflicts (marker lines) in the buffer.
     pub conflicts: Vec<crate::conflicts::Conflict>,
+    /// Vim mode state (when enabled in settings).
+    pub vim: crate::vim::VimState,
     conflicts_version: Option<u64>,
     /// Pending review of a change made outside the editor (e.g. by an AI agent).
     pub review: Option<crate::review::Review>,
@@ -163,6 +165,7 @@ impl Document {
             git_hunks: vec![],
             git_hunks_version: None,
             conflicts: vec![],
+            vim: Default::default(),
             conflicts_version: None,
             review: None,
             show_git_diff: false,

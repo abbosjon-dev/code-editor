@@ -1,6 +1,11 @@
 //! Built-in commands (shown in the command palette and menus).
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
+static LABELS: LazyLock<RwLock<HashMap<Cmd, String>>> = LazyLock::new(Default::default);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cmd {
     NewFile,
     OpenFile,
@@ -33,6 +38,8 @@ pub enum Cmd {
     SelectLanguage,
     OpenSettings,
     OpenSettingsFile,
+    OpenKeybindings,
+    ToggleVimMode,
     OpenPluginsFolder,
     ReloadPlugins,
     AskAgent,
@@ -101,6 +108,8 @@ impl Cmd {
             SelectLanguage,
             OpenSettings,
             OpenSettingsFile,
+            OpenKeybindings,
+            ToggleVimMode,
             OpenPluginsFolder,
             ReloadPlugins,
             AskAgent,
@@ -189,6 +198,8 @@ impl Cmd {
             SelectLanguage => "Editor: Change Language Mode",
             OpenSettings => "Preferences: Open Settings",
             OpenSettingsFile => "Preferences: Open Settings (TOML)",
+            OpenKeybindings => "Preferences: Keyboard Shortcuts (TOML)",
+            ToggleVimMode => "Preferences: Toggle Vim Mode",
             OpenPluginsFolder => "Plugins: Open Plugins Folder",
             ReloadPlugins => "Plugins: Reload Plugins",
             AskAgent => "AI: Ask Agent About Selection…",
@@ -203,7 +214,43 @@ impl Cmd {
         }
     }
 
-    pub fn shortcut(self) -> &'static str {
+    /// Stable id used in keybindings.toml: the variant name in snake_case.
+    pub fn id(self) -> String {
+        let name = format!("{self:?}");
+        let mut out = String::new();
+        for (i, c) in name.chars().enumerate() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    pub fn from_id(id: &str) -> Option<Cmd> {
+        Cmd::all().iter().copied().find(|c| c.id() == id)
+    }
+
+    /// Shortcut shown in menus and the palette (user bindings included).
+    pub fn shortcut(self) -> String {
+        if let Some(s) = LABELS.read().ok().and_then(|m| m.get(&self).cloned()) {
+            return s;
+        }
+        self.default_shortcut().to_string()
+    }
+
+    /// Replace the shown shortcuts after keybindings.toml changed.
+    pub fn set_labels(labels: HashMap<Cmd, String>) {
+        if let Ok(mut m) = LABELS.write() {
+            *m = labels;
+        }
+    }
+
+    pub fn default_shortcut(self) -> &'static str {
         use Cmd::*;
         let mac = cfg!(target_os = "macos");
         macro_rules! k {

@@ -143,6 +143,24 @@ standart AI agent, terminal shell va boshqalar. O'zgarishlar darhol qo'llanadi v
 
 ## Klaviatura
 
+**O'z tugmalaringiz:** *Preferences: Keyboard Shortcuts (TOML)* (yoki Sozlamalar → Editor → "Edit keybindings.toml")
+`keybindings.toml`ni ochadi — unda barcha buyruqlar ID'lari ro'yxati bor. Saqlash bilan darhol qo'llanadi,
+menyu va palitradagi yozuvlar ham yangilanadi:
+
+```toml
+[bindings]
+"Ctrl+Shift+D" = "split_editor"          # buyruqqa tugma
+"Alt+T" = "plugin:todo-tree.ask-ai"      # plugin buyrug'iga tugma
+"Ctrl+B" = ""                            # standart tugmani o'chirish
+```
+
+`Mod` — Linux/Windows'da Ctrl, macOS'da ⌘. Pluginlar ham `plugin.toml`da `keybinding = "..."` bera oladi.
+
+**Vim rejimi** (Sozlamalar → Editor → Vim mode yoki *Preferences: Toggle Vim Mode*): Normal / Insert / Visual /
+Visual Line; `h j k l w b e W B E 0 ^ $ gg G f t F T { }`, sonlar (`3j`, `d2w`), operatorlar `d c y > <` harakatlar va
+matn obyektlari bilan (`ciw`, `da(`, `ci"`, `yi{`), `dd yy cc x X D C s S r ~ J p P u Ctrl+R o O i a I A v V`,
+`/ n N *`, `:w :q :wq :x :<qator>`. Rejim status qatorida, Normal rejimda blok kursor.
+
 | Amal | Windows / Linux | macOS |
 |---|---|---|
 | Buyruqlar palitrasi | `Ctrl+Shift+P` / `F1` | `⌘⇧P` |

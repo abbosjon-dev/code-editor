@@ -11,6 +11,7 @@ mod file_tree;
 mod folding;
 mod git;
 mod highlight;
+mod keymap;
 mod lsp;
 mod mention;
 mod palette;
@@ -20,6 +21,7 @@ mod settings;
 mod settings_ui;
 mod terminal_view;
 mod theme;
+mod vim;
 mod workspace;
 
 use eframe::egui;

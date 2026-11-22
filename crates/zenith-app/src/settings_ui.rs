@@ -14,6 +14,7 @@ pub struct Changes {
     pub syntax_theme: bool,
     pub lsp: bool,
     pub open_file: bool,
+    pub open_keybindings: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -164,6 +165,13 @@ fn editor(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= checkbox(ui, &mut s.auto_save, "Auto save", "Save modified files every few seconds");
     c.any |= checkbox(ui, &mut s.format_trim_trailing_whitespace, "Trim trailing whitespace", "On save");
     c.any |= checkbox(ui, &mut s.format_on_save, "Format on save", "Uses the language server");
+    c.any |=
+        checkbox(ui, &mut s.vim_mode, "Vim mode", "Modal editing: Normal / Insert / Visual, motions, operators, :w :q");
+    row_label(ui, "Keyboard shortcuts", "Rebind any command in keybindings.toml");
+    if ui.button("Edit keybindings.toml").clicked() {
+        c.open_keybindings = true;
+    }
+    ui.end_row();
     c.any |= checkbox(
         ui,
         &mut s.review_external_changes,

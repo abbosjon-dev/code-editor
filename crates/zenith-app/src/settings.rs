@@ -27,6 +27,8 @@ pub struct Settings {
     /// Show who last changed the caret's line (git blame) at its end.
     pub inline_blame: bool,
     pub cursor_blink: bool,
+    /// Vim-style modal editing (normal / insert / visual modes).
+    pub vim_mode: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
     /// Custom shell for new terminals (empty = system default).
@@ -64,6 +66,7 @@ impl Default for Settings {
             inline_diagnostics: true,
             inline_blame: true,
             cursor_blink: true,
+            vim_mode: false,
             auto_save: false,
             format_trim_trailing_whitespace: false,
             shell: String::new(),

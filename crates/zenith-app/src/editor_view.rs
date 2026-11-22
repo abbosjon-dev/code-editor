@@ -36,6 +36,8 @@ pub enum EditorAction {
     Run(crate::commands::Cmd),
     /// Ask for parameter hints at the caret.
     SignatureHelp,
+    /// Show a message (e.g. an unknown Vim `:` command).
+    Notify(String),
 }
 
 struct Metrics {
@@ -124,12 +126,15 @@ pub fn editor_ui(
         ui.memory_mut(|mem| {
             mem.set_focus_lock_filter(
                 id,
-                egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false },
+                egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: s.vim_mode },
             )
         });
         let page = (viewport_h / m.line_h).max(1.0) as isize - 1;
+        if s.vim_mode {
+            moved |= vim_keys(ui, doc, &mut actions);
+        }
         let (m2, acts) = handle_keys(ui, doc, page);
-        moved = m2;
+        moved |= m2;
         actions.extend(acts);
     }
     doc.refilter_completion();
@@ -629,18 +634,32 @@ pub fn editor_ui(
                     let seg_s = fm.row_cols(row).0.min(col);
                     (text_x + (vc[col] - vc[seg_s]) as f32 * m.char_w, rect.min.y + row as f32 * m.line_h)
                 };
-                let (cx, cy) = caret_xy(doc, cursor.line, cursor.col);
+                let caret = match doc.vim.visual_head().filter(|_| s.vim_mode) {
+                    Some(h) => doc.buffer.char_to_pos(h),
+                    None => cursor,
+                };
+                let (cx, cy) = caret_xy(doc, caret.line, caret.col);
                 if let Some(l) = doc.hunk_popup {
                     hunk_anchor = Some(egui::pos2(text_x, y_of_line(l.min(total_lines.saturating_sub(1))) + m.line_h));
                 }
-                let cursor_rect = Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0));
+                // Vim normal / visual mode: a block caret over the character.
+                let block = s.vim_mode && !doc.vim.is_insert();
+                let cursor_rect = if block {
+                    Rect::from_min_size(egui::pos2(cx, cy + 1.0), egui::vec2(m.char_w, m.line_h - 2.0))
+                } else {
+                    Rect::from_min_size(egui::pos2(cx - 1.0, cy + 2.0), egui::vec2(2.0, m.line_h - 4.0))
+                };
                 cursor_screen = Some(egui::pos2(cx, cy + m.line_h));
                 cursor_top = Some(egui::pos2(cx, cy));
                 if has_focus {
                     let t = ui.input(|i| i.time) - cursor_epoch;
-                    let visible = !s.cursor_blink || (t % 1.1) < 0.65;
+                    let visible = !s.cursor_blink || block || (t % 1.1) < 0.65;
                     if visible {
-                        painter.rect_filled(cursor_rect, 1.0, p.cursor);
+                        painter.rect_filled(
+                            cursor_rect,
+                            1.0,
+                            if block { p.cursor.gamma_multiply(0.55) } else { p.cursor },
+                        );
                         for extra in &doc.buffer.extra {
                             let ep = doc.buffer.char_to_pos(extra.head);
                             if ep.line < first || ep.line >= last {
@@ -1243,6 +1262,89 @@ fn matching_bracket(doc: &Document) -> Option<(usize, usize)> {
 }
 
 /// Returns true if the caret moved (so the view should follow it).
+/// Vim mode: turn key events into Vim keys and remove the ones it used, so
+/// the normal editing code below never sees them. Returns whether the caret moved.
+fn vim_keys(ui: &mut egui::Ui, doc: &mut Document, actions: &mut Vec<EditorAction>) -> bool {
+    use crate::vim::{Effect, VKey};
+    let modal = !doc.vim.is_insert() || doc.vim.cmdline.is_some();
+    let mut keys = vec![];
+    ui.input_mut(|i| {
+        i.events.retain(|e| match e {
+            Event::Text(t) if modal => {
+                keys.extend(t.chars().map(VKey::Char));
+                false
+            }
+            Event::Key { key, pressed, modifiers, .. } => {
+                let cmd = modifiers.command || modifiers.ctrl;
+                let vk = match key {
+                    Key::Escape if !cmd => Some(VKey::Esc),
+                    Key::OpenBracket if modifiers.ctrl => Some(VKey::Esc),
+                    _ if !modal => None,
+                    Key::Enter if !cmd => Some(VKey::Enter),
+                    Key::Backspace if !cmd => Some(VKey::Backspace),
+                    Key::R if modifiers.ctrl => Some(VKey::Ctrl('r')),
+                    Key::ArrowLeft if modifiers.is_none() => Some(VKey::Char('h')),
+                    Key::ArrowRight if modifiers.is_none() => Some(VKey::Char('l')),
+                    Key::ArrowUp if modifiers.is_none() => Some(VKey::Char('k')),
+                    Key::ArrowDown if modifiers.is_none() => Some(VKey::Char('j')),
+                    // Letters arrive as Text; drop their key events.
+                    _ if !cmd && !matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End) => {
+                        return false;
+                    }
+                    _ => None,
+                };
+                match vk {
+                    Some(k) => {
+                        if *pressed {
+                            keys.push(k);
+                        }
+                        false
+                    }
+                    None => true,
+                }
+            }
+            _ => true,
+        })
+    });
+    if keys.is_empty() {
+        return false;
+    }
+    let before = doc.buffer.sel;
+    for k in keys {
+        if k == VKey::Esc && doc.completion.is_some() {
+            doc.completion = None;
+        }
+        for fx in crate::vim::feed(&mut doc.vim, &mut doc.buffer, k) {
+            match fx {
+                Effect::Copy(t) => ui.ctx().copy_text(t),
+                Effect::Save => actions.push(EditorAction::Run(crate::commands::Cmd::Save)),
+                Effect::Quit => actions.push(EditorAction::Run(crate::commands::Cmd::CloseTab)),
+                Effect::SaveQuit => {
+                    actions.push(EditorAction::Run(crate::commands::Cmd::Save));
+                    actions.push(EditorAction::Run(crate::commands::Cmd::CloseTab));
+                }
+                Effect::Find(q) => {
+                    if let Some(q) = q {
+                        doc.find.query = q;
+                        doc.update_find();
+                        doc.find_step(true);
+                    } else {
+                        doc.find.open = true;
+                        doc.find.focus_query = true;
+                    }
+                }
+                Effect::FindNext(fwd) => {
+                    doc.update_find();
+                    doc.find_step(fwd);
+                }
+                Effect::Message(m) => actions.push(EditorAction::Notify(m)),
+            }
+        }
+    }
+    doc.scroll_to_cursor = true;
+    doc.buffer.sel != before
+}
+
 fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec<EditorAction>) {
     let events = ui.input(|i| i.events.clone());
     let mac = cfg!(target_os = "macos");

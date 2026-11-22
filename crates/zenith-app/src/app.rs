@@ -136,6 +136,8 @@ pub struct ZenithApp {
     mention_cache: Option<(String, Vec<crate::mention::Candidate>)>,
     /// Plugin panel contents keyed by `plugin/panel`.
     panel_data: HashMap<String, PanelData>,
+    /// keybindings.toml.
+    user_keys: Vec<crate::keymap::UserBinding>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
     commit_message: String,
@@ -225,6 +227,7 @@ impl ZenithApp {
             extra_gits: vec![],
             mention_cache: None,
             panel_data: HashMap::new(),
+            user_keys: vec![],
             scm_repo: 0,
             commit_message: String::new(),
             docs: vec![],
@@ -271,6 +274,7 @@ impl ZenithApp {
             focus_right: false,
         };
         app.load_plugins();
+        app.load_keymap();
         if let Some(e) = settings_err {
             app.toast(e, NotifyLevel::Error);
         }
@@ -552,6 +556,11 @@ impl ZenithApp {
                         || p == &settings::settings_path()
                     {
                         self.reload_settings();
+                    }
+                    if p == &crate::keymap::path() || p.canonicalize().ok() == crate::keymap::path().canonicalize().ok()
+                    {
+                        self.load_keymap();
+                        self.toast("Keyboard shortcuts reloaded", NotifyLevel::Info);
                     }
                     self.plugins.emit("file_saved", serde_json::json!({ "path": p }));
                     let rx = self.git_for(p).and_then(|g| g.blame_async(p));
@@ -1143,6 +1152,25 @@ impl ZenithApp {
                 };
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
+            }
+            Cmd::OpenKeybindings => {
+                let p = crate::keymap::path();
+                if !p.exists() {
+                    if let Some(dir) = p.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&p, crate::keymap::template());
+                }
+                self.open_file(&p);
+            }
+            Cmd::ToggleVimMode => {
+                self.settings.vim_mode = !self.settings.vim_mode;
+                self.write_settings();
+                for d in &mut self.docs {
+                    d.vim = Default::default();
+                }
+                let on = if self.settings.vim_mode { "on" } else { "off" };
+                self.toast(format!("Vim mode {on}"), NotifyLevel::Info);
             }
             Cmd::ToggleWordWrap => {
                 self.settings.word_wrap = !self.settings.word_wrap;
@@ -2282,15 +2310,13 @@ impl ZenithApp {
     // Shortcuts
     // ------------------------------------------------------------------
 
-    fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Cmd> {
+    /// Built-in shortcuts: (mods, key, command, allowed while a terminal has focus).
+    fn default_shortcuts() -> Vec<(Modifiers, Key, Cmd, bool)> {
         let cmd = Modifiers::COMMAND;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
         let ca = Modifiers::COMMAND | Modifiers::ALT;
         let ctrl = Modifiers::CTRL;
         let mac = cfg!(target_os = "macos");
-        // When a terminal has focus on Linux/Windows, plain Ctrl+letter must
-        // reach the shell, so only Ctrl+Shift / special combos are global.
-        let term = self.terminal_focused && !mac;
         let mut table: Vec<(Modifiers, Key, Cmd, bool)> = vec![
             // (mods, key, command, allowed while terminal focused)
             (cs, Key::P, Cmd::CommandPalette, true),
@@ -2338,18 +2364,78 @@ impl ZenithApp {
             table.retain(|(_, k, _, _)| *k != Key::H); // Cmd+H hides the app on macOS
             table.push((ca, Key::F, Cmd::Replace, false));
         }
+        table
+    }
+
+    /// Load keybindings.toml and update the shortcut labels in menus.
+    fn load_keymap(&mut self) {
+        let (bindings, errors) = crate::keymap::load();
+        for e in errors {
+            self.toast(e, NotifyLevel::Error);
+        }
+        let mut labels = HashMap::new();
+        for b in &bindings {
+            if let Some(crate::keymap::Target::Cmd(c)) = &b.target {
+                labels.entry(*c).or_insert_with(|| crate::keymap::format_chord(b.mods, b.key));
+            }
+        }
+        for b in bindings.iter().filter(|b| b.target.is_none()) {
+            for (m, k, c, _) in Self::default_shortcuts() {
+                if same_chord(m, b.mods) && k == b.key {
+                    labels.entry(c).or_insert_with(String::new);
+                }
+            }
+        }
+        Cmd::set_labels(labels);
+        self.user_keys = bindings;
+    }
+
+    fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<PaletteAction> {
+        use crate::keymap::Target;
+        let mac = cfg!(target_os = "macos");
+        // When a terminal has focus on Linux/Windows, plain Ctrl+letter must
+        // reach the shell, so only Ctrl+Shift / special combos are global.
+        let term = self.terminal_focused && !mac;
+        let mut table: Vec<(Modifiers, Key, Target, bool)> =
+            Self::default_shortcuts().into_iter().map(|(m, k, c, t)| (m, k, Target::Cmd(c), t)).collect();
+        // Plugin commands with a `keybinding` in plugin.toml, then the user's
+        // own bindings, each replacing whatever used the same keys.
+        let plugin_keys: Vec<(Modifiers, Key, Option<Target>)> = self
+            .plugins
+            .commands()
+            .into_iter()
+            .filter_map(|(_, c)| {
+                let (m, k) = crate::keymap::parse_chord(c.keybinding.as_deref()?)?;
+                Some((m, k, Some(Target::Plugin(c.id.clone()))))
+            })
+            .collect();
+        let user = self.user_keys.iter().map(|b| (b.mods, b.key, b.target.clone()));
+        for (m, k, target) in plugin_keys.into_iter().chain(user) {
+            table.retain(|(m2, k2, _, _)| !(same_chord(*m2, m) && *k2 == k));
+            if let Some(t) = target {
+                let ctrl_only = (m.ctrl || m.command) && !m.shift && !m.alt;
+                table.push((m, k, t, !ctrl_only));
+            }
+        }
+        // egui matches shortcuts "logically" (extra Shift is ignored), so
+        // combinations with more modifiers must be tried first.
+        let weight = |m: &Modifiers| u8::from(m.shift) + u8::from(m.alt) + u8::from(m.ctrl || m.command);
+        table.sort_by_key(|(m, ..)| std::cmp::Reverse(weight(m)));
         let mut out = vec![];
         ctx.input_mut(|i| {
-            for (m, k, c, in_term) in table {
+            for (m, k, t, in_term) in table {
                 if term && !in_term {
                     continue;
                 }
                 if i.consume_shortcut(&KeyboardShortcut::new(m, k)) {
-                    out.push(c);
+                    out.push(match t {
+                        Target::Cmd(c) => PaletteAction::Command(c),
+                        Target::Plugin(id) => PaletteAction::PluginCommand(id),
+                    });
                 }
             }
             if i.consume_key(Modifiers::NONE, Key::F1) {
-                out.push(Cmd::CommandPalette);
+                out.push(PaletteAction::Command(Cmd::CommandPalette));
             }
             // Some platforms also send the typed character for Alt/Ctrl
             // combinations; it must not reach the editor once handled.
@@ -3516,6 +3602,7 @@ impl ZenithApp {
         };
         for a in actions {
             match a {
+                EditorAction::Notify(m) => self.toast(m, NotifyLevel::Warning),
                 EditorAction::AskAgent { question } => {
                     let prompt = self.selection_prompt(&question);
                     self.send_to_agent(prompt, true, None);
@@ -3620,6 +3707,21 @@ impl ZenithApp {
                 let r = ui.add(egui::Label::new(small(format!("⎇ {b}"))).sense(Sense::click()));
                 if r.on_hover_text("Switch branch").clicked() {
                     cmd = Some(Cmd::GitSwitchBranch);
+                }
+            }
+            if self.settings.vim_mode {
+                if let Some(doc) = self.docs.get(self.active) {
+                    let v = &doc.vim;
+                    let text = match &v.cmdline {
+                        Some(c) => format!(":{c}▏"),
+                        None => format!("-- {} --  {}", v.mode.label(), v.pending_text()),
+                    };
+                    let color = match v.mode {
+                        crate::vim::Mode::Insert => p.success,
+                        crate::vim::Mode::Normal => p.accent,
+                        _ => p.warning,
+                    };
+                    ui.label(RichText::new(text.trim_end()).size(12.0).monospace().color(color));
                 }
             }
             if self.index.indexing {
@@ -4239,6 +4341,9 @@ impl ZenithApp {
         if c.any {
             self.write_settings();
         }
+        if c.open_keybindings {
+            self.run(ctx, Cmd::OpenKeybindings);
+        }
         if c.open_file {
             self.show_settings = false;
             self.run(ctx, Cmd::OpenSettingsFile);
@@ -4322,8 +4427,8 @@ impl eframe::App for ZenithApp {
 
         // Global shortcuts (skipped while a modal dialog/palette has focus).
         if self.dialog.is_none() && !self.palette.open {
-            for c in self.shortcuts(ctx) {
-                self.run(ctx, c);
+            for a in self.shortcuts(ctx) {
+                self.handle_palette(ctx, a);
             }
         } else if self.palette.open {
             ctx.input_mut(|i| {
@@ -4447,4 +4552,16 @@ impl eframe::App for ZenithApp {
             self.save_session();
         }
     }
+}
+
+/// Two modifier sets name the same chord (Ctrl and Cmd are one on Linux/Windows).
+fn same_chord(a: Modifiers, b: Modifiers) -> bool {
+    let norm = |m: Modifiers| {
+        if cfg!(target_os = "macos") {
+            (m.shift, m.alt, m.ctrl, m.command || m.mac_cmd)
+        } else {
+            (m.shift, m.alt, m.ctrl || m.command, false)
+        }
+    };
+    norm(a) == norm(b)
 }
