@@ -78,9 +78,6 @@ pub fn ui(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, font_size: f32) ->
         });
     });
 
-    let font = FontId::monospace(font_size);
-    let row_h = (font_size * 1.45).round();
-    let char_w = crate::theme::mono_metrics(ui, &font).0;
     let id = ui.make_persistent_id(("git-diff", doc.id));
     let current_top = ui.data(|d| d.get_temp::<usize>(id)).unwrap_or(0);
     if let Some(dir) = jump {
@@ -91,8 +88,29 @@ pub fn ui(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, font_size: f32) ->
         };
         doc.git_diff.jump_to = target.map(|&c| c.saturating_sub(3));
     }
+    rows_ui(ui, id, &rows, &changes, &old_lines, &new_lines, p, font_size, doc.git_diff.jump_to.take());
+    action
+}
+
+/// Paint aligned rows side by side (old left, new right) in a scroll area
+/// with `id`; the first visible row is stored under `id` in temp data.
+#[allow(clippy::too_many_arguments)]
+pub fn rows_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    rows: &[DiffRow],
+    changes: &[usize],
+    old_lines: &[&str],
+    new_lines: &[&str],
+    p: &Palette,
+    font_size: f32,
+    jump_to: Option<usize>,
+) {
+    let font = FontId::monospace(font_size);
+    let row_h = (font_size * 1.45).round();
+    let char_w = crate::theme::mono_metrics(ui, &font).0;
     let mut area = egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]);
-    if let Some(r) = doc.git_diff.jump_to.take() {
+    if let Some(r) = jump_to {
         area = area.vertical_scroll_offset(r as f32 * row_h);
     }
     let digits = rows.len().max(10).to_string().len();
@@ -152,7 +170,7 @@ pub fn ui(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, font_size: f32) ->
     // Overview of change positions on the right edge.
     let bar = Rect::from_min_max(egui::pos2(out.inner_rect.max.x - 6.0, out.inner_rect.min.y), out.inner_rect.max);
     if !rows.is_empty() {
-        for &c in &changes {
+        for &c in changes {
             let y = bar.min.y + bar.height() * c as f32 / rows.len() as f32;
             ui.painter().rect_filled(
                 Rect::from_min_size(egui::pos2(bar.min.x, y), egui::vec2(4.0, 3.0)),
@@ -161,5 +179,4 @@ pub fn ui(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, font_size: f32) ->
             );
         }
     }
-    action
 }

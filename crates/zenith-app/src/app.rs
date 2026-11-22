@@ -142,6 +142,10 @@ pub struct ZenithApp {
     panel_data: HashMap<String, PanelData>,
     /// keybindings.toml.
     user_keys: Vec<crate::keymap::UserBinding>,
+    /// Files changed since the first agent started (multi-file review).
+    changes: crate::changeset::ChangeSet,
+    show_changes: bool,
+    changes_refreshed: Option<Instant>,
     /// Repository shown in Source Control (0 = main folder).
     scm_repo: usize,
     commit_message: String,
@@ -232,6 +236,9 @@ impl ZenithApp {
             mention_cache: None,
             panel_data: HashMap::new(),
             user_keys: vec![],
+            changes: Default::default(),
+            show_changes: false,
+            changes_refreshed: None,
             scm_repo: 0,
             commit_message: String::new(),
             docs: vec![],
@@ -830,6 +837,12 @@ impl ZenithApp {
             return None;
         }
         self.installed.insert(agent.id.clone(), true);
+        // Checkpoint the workspace so everything the agent changes can be reviewed.
+        if self.changes.base.is_none() && !self.changes.busy() {
+            if let Some(root) = self.git.as_ref().map(|g| g.root.clone()) {
+                self.changes.start(root);
+            }
+        }
         let id = self.id();
         let mut args = agent.args.clone();
         if resume {
@@ -1156,6 +1169,25 @@ impl ZenithApp {
                 };
                 ctx.set_zoom_factor(nz);
                 self.session.zoom = nz;
+            }
+            Cmd::ReviewAgentChanges => {
+                if self.changes.base.is_none() && !self.changes.busy() {
+                    match self.git.as_ref().map(|g| g.root.clone()) {
+                        Some(root) => {
+                            self.changes.start(root);
+                            self.toast(
+                                "Checkpoint taken: changes made from now on will be listed here",
+                                NotifyLevel::Info,
+                            );
+                        }
+                        None => {
+                            self.toast("Reviewing agent changes needs a Git repository", NotifyLevel::Warning);
+                            return;
+                        }
+                    }
+                }
+                self.show_changes = true;
+                self.changes_refreshed = None;
             }
             Cmd::SplitTerminal => {
                 if self.bottom.split_index().is_some() {
@@ -3822,6 +3854,9 @@ impl ZenithApp {
 
         let mut close = None;
         let mut split_new = false;
+        let changes_ready = self.changes.base.is_some();
+        let changes_n = self.changes.changes.len();
+        let mut open_changes = false;
         let split_idx = panel.split_index();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
@@ -3861,6 +3896,17 @@ impl ZenithApp {
                     && ui.add(egui::Button::new("🗑").frame(false)).on_hover_text("Kill active session").clicked()
                 {
                     close = Some(panel.active);
+                }
+                if ai && changes_ready {
+                    let n = changes_n;
+                    let label = if n > 0 { format!("⧉ Changes ({n})") } else { "⧉ Changes".to_string() };
+                    if ui
+                        .add(egui::Button::new(label).frame(false))
+                        .on_hover_text("Review everything the agents changed since they started")
+                        .clicked()
+                    {
+                        open_changes = true;
+                    }
                 }
                 if ai {
                     ui.menu_button("+ Agent ▾", |ui| {
@@ -3956,6 +4002,9 @@ impl ZenithApp {
         }
         if new_shell {
             self.new_terminal(None);
+        }
+        if open_changes {
+            self.run(ui.ctx(), Cmd::ReviewAgentChanges);
         }
         if split_new {
             let keep = self.bottom.active;
@@ -4426,6 +4475,212 @@ impl ZenithApp {
         }
     }
 
+    /// One window with every file the agents changed: list, side-by-side
+    /// diff of the selected file, keep / revert per file or all at once.
+    fn changes_window(&mut self, ctx: &egui::Context) {
+        if !self.show_changes {
+            return;
+        }
+        let p = self.colors.clone();
+        let font_size = self.settings.editor_font_size * 0.92;
+        let mut open = true;
+        let mut keep: Option<usize> = None;
+        let mut revert: Option<usize> = None;
+        let mut keep_all = false;
+        let mut revert_all = false;
+        let mut open_path: Option<PathBuf> = None;
+        let screen = ctx.screen_rect();
+        let cs = &mut self.changes;
+        let root = cs.root.clone().unwrap_or_default();
+        egui::Window::new("✳ Agent changes")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([screen.width() * 0.85, screen.height() * 0.8])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let n = cs.changes.len();
+                    ui.label(
+                        RichText::new(if cs.base.is_none() {
+                            "Taking checkpoint…".to_string()
+                        } else if n == 0 {
+                            "No changes since the agent started.".to_string()
+                        } else {
+                            format!("{n} file(s) changed since the agent started")
+                        })
+                        .color(p.text_dim),
+                    );
+                    if let Some(e) = &cs.error {
+                        ui.label(RichText::new(e).color(p.error));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(n > 0, egui::Button::new(RichText::new("↺ Revert all").color(p.error)))
+                            .clicked()
+                        {
+                            revert_all = true;
+                        }
+                        if ui
+                            .add_enabled(n > 0, egui::Button::new("✓ Keep all"))
+                            .on_hover_text("Accept everything and start a new checkpoint")
+                            .clicked()
+                        {
+                            keep_all = true;
+                        }
+                    });
+                });
+                ui.separator();
+                let avail = ui.available_size();
+                ui.horizontal_top(|ui| {
+                    // File list.
+                    ui.vertical(|ui| {
+                        ui.set_width(260.0);
+                        ui.set_min_height(avail.y);
+                        egui::ScrollArea::vertical().id_salt("changes-list").show(ui, |ui| {
+                            for (i, c) in cs.changes.iter().enumerate() {
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(256.0, 24.0), Sense::click());
+                                if i == cs.selected {
+                                    ui.painter().rect_filled(rect, 4.0, p.bg_active);
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 4.0, p.bg_hover);
+                                }
+                                let (dir, name) = c.rel.rsplit_once('/').unwrap_or(("", &c.rel));
+                                let color = match c.status {
+                                    'A' => p.success,
+                                    'D' => p.error,
+                                    _ => p.warning,
+                                };
+                                let painter = ui.painter().with_clip_rect(rect);
+                                let r = painter.text(
+                                    egui::pos2(rect.min.x + 8.0, rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    name,
+                                    FontId::proportional(13.0),
+                                    p.text,
+                                );
+                                painter.text(
+                                    egui::pos2(r.max.x + 6.0, rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    dir,
+                                    FontId::proportional(11.0),
+                                    p.text_dim,
+                                );
+                                ui.painter().text(
+                                    rect.right_center() - egui::vec2(8.0, 0.0),
+                                    Align2::RIGHT_CENTER,
+                                    c.status.to_string(),
+                                    FontId::monospace(12.0),
+                                    color,
+                                );
+                                if resp.clicked() {
+                                    cs.selected = i;
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    // Diff of the selected file.
+                    ui.vertical(|ui| {
+                        let Some(c) = cs.changes.get(cs.selected).cloned() else { return };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&c.rel).strong());
+                            ui.label(
+                                RichText::new(match c.status {
+                                    'A' => "new file",
+                                    'D' => "deleted",
+                                    _ => "modified",
+                                })
+                                .small()
+                                .color(p.text_dim),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(RichText::new("↺ Revert").color(p.error)).clicked() {
+                                    revert = Some(cs.selected);
+                                }
+                                if ui.button("✓ Keep").clicked() {
+                                    keep = Some(cs.selected);
+                                }
+                                if c.status != 'D' && ui.button("Open file").clicked() {
+                                    open_path = Some(root.join(&c.rel));
+                                }
+                            });
+                        });
+                        let stale = cs.diff.as_ref().is_none_or(|d| d.0 != c.rel || d.1 != c.new_blob);
+                        if stale {
+                            let base = cs
+                                .base
+                                .as_deref()
+                                .and_then(|b| crate::changeset::base_bytes(&root, b, &c.rel))
+                                .map(|b| String::from_utf8_lossy(&b).replace("\r\n", "\n"))
+                                .unwrap_or_default();
+                            let cur = std::fs::read(root.join(&c.rel))
+                                .map(|b| String::from_utf8_lossy(&b).replace("\r\n", "\n"))
+                                .unwrap_or_default();
+                            let rows = std::rc::Rc::new(crate::git::side_by_side(&base, &cur));
+                            cs.diff = Some((c.rel.clone(), c.new_blob.clone(), rows, base, cur));
+                        }
+                        if let Some((rel, _, rows, base, cur)) = &cs.diff {
+                            let changes: Vec<usize> = rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, r)| r.changed && (*i == 0 || !rows[i - 1].changed))
+                                .map(|(i, _)| i)
+                                .collect();
+                            let old: Vec<&str> = base.lines().collect();
+                            let new: Vec<&str> = cur.lines().collect();
+                            let id = ui.make_persistent_id(("agent-diff", rel));
+                            crate::diff_view::rows_ui(ui, id, rows, &changes, &old, &new, &p, font_size, None);
+                        }
+                    });
+                });
+            });
+        if !open {
+            self.show_changes = false;
+        }
+        let mut touched: Vec<PathBuf> = vec![];
+        if let Some(i) = keep {
+            self.changes.keep(i);
+        }
+        if let Some(i) = revert {
+            match self.changes.revert(i) {
+                Ok(p) => touched.push(p),
+                Err(e) => self.toast(e, NotifyLevel::Error),
+            }
+        }
+        if revert_all {
+            while !self.changes.changes.is_empty() {
+                match self.changes.revert(0) {
+                    Ok(p) => touched.push(p),
+                    Err(e) => {
+                        self.toast(e, NotifyLevel::Error);
+                        break;
+                    }
+                }
+            }
+        }
+        if keep_all {
+            if let Some(root) = self.changes.root.clone() {
+                self.changes.start(root);
+            }
+        }
+        if !touched.is_empty() {
+            // Reverted files: open clean buffers follow the disk silently.
+            for d in &mut self.docs {
+                if d.path().is_some_and(|p| touched.iter().any(|t| t == p)) && !d.buffer.is_dirty() {
+                    let _ = d.reload_from_disk();
+                    d.review = None;
+                }
+            }
+            self.refresh_trees();
+            self.toast(format!("Reverted {} file(s)", touched.len()), NotifyLevel::Info);
+        }
+        if let Some(path) = open_path {
+            self.show_changes = false;
+            self.open_file(&path);
+        }
+    }
+
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
@@ -4495,6 +4750,16 @@ impl eframe::App for ZenithApp {
         self.retry_failed_resumes();
         self.handle_lsp();
         self.handle_git();
+        if self.changes.poll() {
+            ctx.request_repaint();
+        }
+        if self.show_changes
+            && self.changes.base.is_some()
+            && self.changes_refreshed.is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+        {
+            self.changes.refresh();
+            self.changes_refreshed = Some(Instant::now());
+        }
 
         // Keystrokes reset the caret blink so it stays visible while typing.
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)))) {
@@ -4611,6 +4876,7 @@ impl eframe::App for ZenithApp {
             self.handle_palette(ctx, action);
         }
         self.dialogs(ctx);
+        self.changes_window(ctx);
         self.settings_window(ctx);
         self.toasts_ui(ctx);
 

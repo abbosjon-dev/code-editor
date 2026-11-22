@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn conflicts_are_their_own_group() {
-        let st = parse_status(Path::new("/r"), "UU a.rs AA b.rs M  c.rs ");
+        let st = parse_status(Path::new("/r"), "UU a.rs\0AA b.rs\0M  c.rs\0");
         let a = &st[0];
         assert!(a.is_conflicted() && !a.is_staged() && !a.is_unstaged());
         assert_eq!(a.letter(), '!');
