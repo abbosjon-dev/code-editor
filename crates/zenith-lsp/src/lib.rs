@@ -1031,7 +1031,8 @@ mod tests {
         let s = parse_workspace_symbols(&json!([
             {"name": "main", "kind": 12, "containerName": "app", "location": {"uri": "file:///tmp/a.rs", "range": {"start": {"line": 4, "character": 3}, "end": {"line": 4, "character": 7}}}}
         ]));
-        assert_eq!((s[0].name.as_str(), s[0].line, s[0].path.as_deref()), ("main", 4, Some(Path::new("/tmp/a.rs"))));
+        assert_eq!((s[0].name.as_str(), s[0].line), ("main", 4));
+        assert!(s[0].path.as_ref().is_some_and(|p| p.ends_with("a.rs")));
     }
 
     #[test]

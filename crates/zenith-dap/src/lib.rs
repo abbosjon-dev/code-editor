@@ -394,7 +394,8 @@ mod tests {
         )
         .unwrap();
         let a = launch_arguments(&cfgs[0], Path::new("/ws"));
-        assert_eq!(a["program"], "/ws/target/debug/app");
+        let expected = Path::new("/ws").join("target/debug/app");
+        assert_eq!(a["program"], expected.to_string_lossy().as_ref());
         assert_eq!(a["args"][0], "-v");
         assert_eq!(a["foo"], 1);
         assert_eq!(cfgs[0].build, "cargo build");
