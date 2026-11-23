@@ -76,6 +76,9 @@ pub fn fetch_latest() -> Result<Option<Release>, String> {
     }
 }
 
+/// Result of an update check.
+pub type CheckResult = Result<Option<Release>, String>;
+
 /// Run [`fetch_latest`] in the background.
 pub fn check_async(waker: impl Fn() + Send + 'static) -> Receiver<Result<Option<Release>, String>> {
     let (tx, rx) = channel();

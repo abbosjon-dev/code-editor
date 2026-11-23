@@ -172,7 +172,7 @@ pub struct ZenithApp {
     /// MCP servers section (workspace `.mcp.json`).
     mcp: crate::mcp_ui::McpPanel,
     /// Update check in flight (manual = report every result), and a newer release.
-    update_rx: Option<(std::sync::mpsc::Receiver<Result<Option<crate::update::Release>, String>>, bool)>,
+    update_rx: Option<(std::sync::mpsc::Receiver<crate::update::CheckResult>, bool)>,
     update_available: Option<crate::update::Release>,
     /// Plugin status bar items keyed by (plugin, item id).
     status_items: std::collections::BTreeMap<(String, String), StatusItem>,
