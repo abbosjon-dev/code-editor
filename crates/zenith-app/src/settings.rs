@@ -192,6 +192,11 @@ pub struct Session {
     pub breakpoint_details: Vec<(PathBuf, usize, crate::debug::Bp)>,
     /// Debugger watch expressions.
     pub watches: Vec<String>,
+    /// Remote folder (SSH) the workspace mirrors, and the host time of its last sync.
+    pub remote: Option<crate::remote::RemoteSpec>,
+    pub remote_since: i64,
+    /// Recently opened remote folders ("host:/path").
+    pub recent_remotes: Vec<String>,
     /// When updates were last checked (Unix seconds).
     pub last_update_check: u64,
 }

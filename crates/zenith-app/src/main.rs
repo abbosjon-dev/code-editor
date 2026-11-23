@@ -18,6 +18,7 @@ mod lsp;
 mod mcp_ui;
 mod mention;
 mod palette;
+mod remote;
 mod review;
 mod sample_plugin;
 mod settings;

@@ -18,6 +18,7 @@ macOS, Windows va Linux'da ishlaydi.
 | 🌳 **Tree-sitter** | Rust, Python, JavaScript/TypeScript (JSX/TSX), Go, C/C++, JSON, Bash, HTML, CSS uchun sintaksis daraxti asosida aniq ranglash va **sintaktik yig'ish** (folding) — har tahrirda inkremental qayta tahlil (20 ming qatorgacha bo'lgan faylda bir tugma ~5 ms). Boshqa tillar uchun TextMate grammatikalari (syntect). Sozlamalar → Editor → Tree-sitter. |
 | 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`), havolalarni topish (`Shift+F12`), nomni hamma joyda o'zgartirish (`F2`), formatlash (`Shift+Alt+F`, ixtiyoriy saqlashda formatlash), parametr maslahatlari, tezkor tuzatishlar (`Ctrl+.` / 💡), fayldagi belgiga o'tish (`Ctrl+T`), butun loyihadagi belgilar (`Ctrl+Shift+T`), **inlay hints** — o'zgaruvchi turlari va parametr nomlari qator ichida. **Semantik ranglash** — til serveri belgining nima ekanini aytadi (parametr, maydon, tur, makros…) va rang shunga qarab tanlanadi. O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
 | ⎇ **Git** | Gutter'da o'zgarish belgilari (qo'shilgan / o'zgargan / o'chirilgan), Source Control paneli (`Ctrl+Shift+G`): stage/unstage, commit (`Ctrl+Enter`), push/pull, stash, merge konfliktlarini hal qilish, fayl daraxtida rangli holat. **✳ Commit with AI** — agent diff'ni ko'rib, commit'ni o'zi yozadi. |
+| 🌐 **SSH orqali ishlash** | *File → Open Remote Folder (SSH)…* — uzoq serverdagi papkani ochish: fayllar mahalliy nusxada tez tahrirlanadi, saqlash serverga yuklanadi, terminal va AI agentlar serverning o'zida ishlaydi. |
 | 🗂 **Bir nechta papka** | Bir oynada bir nechta loyiha papkasi (multi-root): Explorer, tezkor ochish va fayllarda qidirish hammasini qamraydi; har bir papka o'z Git repo'si (Source Control'da repo tanlash, gutter/blame/branch) va o'z til serveriga ega; sessiyada saqlanadi. |
 | 🔍 **Navigatsiya** | Buyruqlar palitrasi (`Ctrl+Shift+P`), fuzzy fayl qidirish (`Ctrl+P`), fayllar ichida qidirish va almashtirish (`Ctrl+Shift+F`: regex, butun so'z, katta-kichik harf, `$1` guruhlar, oldindan ko'rish; `.gitignore`'ni hisobga oladi), qatorga o'tish. |
 | 🎨 **Chiroyli UI** | Zenith Midnight (qorong'i) va Daylight (yorug') temalari, 30+ sintaksis temasi, JetBrains Mono + Inter shriftlari. |
@@ -221,6 +222,23 @@ repo) va **Connect**. **⬆ Push** — `settings.toml`, `keybindings.toml` va `p
 boshqa kompyuterda **⬇ Pull** — ularni oladi (oldingi fayllar `sync-backup/` ga saqlanadi), sozlamalar, tugmalar va
 pluginlar darhol qayta yuklanadi. Push hech narsani o'chirmaydi; boshqa kompyuterdagi o'zgarishlar bilan to'qnashsa,
 avval Pull qilishni so'raydi. "Pull on startup" — har ishga tushganda olish. Palitrada: *Settings Sync: Push / Pull*.
+
+## Uzoqdan ishlash (SSH)
+
+*File → Open Remote Folder (SSH)…* (palitrada *Remote: Open Folder over SSH*) — manzilni kiriting:
+`user@host:/path/to/project`, `host:~/project` yoki `ssh://user@host:2222/path`. `~/.ssh/config` dagi
+taxalluslar ham ishlaydi. Tizimdagi `ssh` ishlatiladi, shuning uchun kalit yoki ssh-agent orqali parolsiz kirish
+sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`, `tar` va `find` kifoya).
+
+- Papka mahalliy nusxaga (`<config>/remote/<host>/…`) yuklanadi — tahrirlash, qidirish, LSP va tree-sitter
+  tarmoqni kutmaydi. **Saqlash**, yangi fayl/papka, nomini o'zgartirish va o'chirish darhol serverga yuboriladi.
+- **Terminal va AI agentlar serverda** ishga tushadi (`ssh -t host 'cd papka && …'`) — `cargo`, `npm`, `claude`
+  va boshqalar serverdagi muhitda ishlaydi.
+- Serverdagi o'zgarishlar (agent yoki terminal qilgan) har 4 soniyada olinadi; ochiq fayl o'zgarsa, odatdagi diff
+  banneri chiqadi (**Keep / Revert** — Revert ham serverga yoziladi).
+- Status qatorida **SSH host**: bossangiz — hoziroq yangilaydi; ulanish uzilsa qizil "(offline)" ko'rinadi.
+- Source Control paneli faqat o'qish uchun: commit/push uchun serverdagi terminalda `git` ishlating.
+- Oxirgi ulanishlar eslab qolinadi; Zenith qayta ochilganda uzoq papka avtomatik qayta ulanadi.
 
 ## Klaviatura
 

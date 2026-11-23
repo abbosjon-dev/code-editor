@@ -68,3 +68,6 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] .msi (WiX), AppImage, kod imzosi va notarizatsiya (secret'lar bo'lsa), yangilanishni tekshirish
 - [x] Yangilanishni yuklab olib o'rnatish (SHA-256 tekshiruvi bilan, foydalanuvchi so'raganda)
 - [x] Sozlamalar oynasi
+- [x] Sozlamalarni Git repo orqali sinxronlash
+- [x] Test paneli (cargo test, pytest)
+- [x] SSH orqali uzoqdan ishlash (mahalliy nusxa + serverda terminal/agentlar)

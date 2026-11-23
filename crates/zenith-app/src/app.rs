@@ -93,6 +93,8 @@ enum InputKind {
     RenameSymbol(usize),
     NewBranch,
     Watch,
+    /// `user@host:/path` of a folder to open over SSH.
+    RemoteFolder,
     /// Edit an option of the breakpoint at (document id, line).
     Breakpoint(u64, usize, crate::editor_view::BpField),
 }
@@ -191,6 +193,9 @@ pub struct ZenithApp {
     install_rx: Option<std::sync::mpsc::Receiver<Result<crate::update::Outcome, String>>>,
     restart_exe: Option<PathBuf>,
     pending_update_version: String,
+    /// Open remote folder (SSH), and a connection in progress.
+    remote: Option<crate::remote::Session>,
+    remote_connecting: Option<crate::remote::Connecting>,
     /// Settings Sync operation in flight.
     sync_rx: Option<std::sync::mpsc::Receiver<crate::sync_ui::SyncResult>>,
     /// Test explorer.
@@ -312,6 +317,8 @@ impl ZenithApp {
             mcp: Default::default(),
             tests: Default::default(),
             sync_rx: None,
+            remote: None,
+            remote_connecting: None,
             install_rx: None,
             restart_exe: None,
             pending_update_version: String::new(),
@@ -401,6 +408,14 @@ impl ZenithApp {
                     }
                     app.active = saved.active.min(app.docs.len().saturating_sub(1));
                     app.restore_session_state(&saved);
+                    // Reattach the remote folder this workspace mirrors (fetches what changed meanwhile).
+                    if let (Some(spec), Some(ws)) = (saved.remote.clone(), app.workspace.clone()) {
+                        if crate::remote::cache_dir(&settings::config_dir(), &spec) == ws {
+                            let mut s = crate::remote::Session::new(spec, ws, saved.remote_since, app.waker.clone());
+                            s.pull_now();
+                            app.remote = Some(s);
+                        }
+                    }
                 }
             }
         }
@@ -423,6 +438,10 @@ impl ZenithApp {
 
     fn open_workspace(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
+        // A different folder ends the remote session (re-set by the caller when connecting).
+        if self.remote.as_ref().is_some_and(|r| r.cache != path) {
+            self.remote = None;
+        }
         self.index = FileIndex::build(&path);
         self.git = Git::open(&path);
         self.problems.clear();
@@ -433,7 +452,10 @@ impl ZenithApp {
         self.mcp.reset();
         self.scm_repo = 0;
         self.session.recent_workspaces.retain(|p| p != &path);
-        self.session.recent_workspaces.insert(0, path.clone());
+        // Remote copies are reopened with Remote: Open Folder over SSH, not from here.
+        if !path.starts_with(settings::config_dir().join("remote")) {
+            self.session.recent_workspaces.insert(0, path.clone());
+        }
         self.session.recent_workspaces.truncate(10);
         self.workspace = Some(path);
         self.lsp.restart(&mut self.docs);
@@ -648,6 +670,9 @@ impl ZenithApp {
         match result {
             Ok(()) => {
                 let path = doc.path().map(Path::to_path_buf);
+                if let (Some(r), Some(p)) = (&self.remote, &path) {
+                    r.upload(p);
+                }
                 if let Some(p) = &path {
                     if let Some(parent) = p.parent() {
                         for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
@@ -812,6 +837,8 @@ impl ZenithApp {
             .flat_map(|(p, l)| l.iter().filter(|(_, b)| !b.is_plain()).map(|(&n, b)| (p.clone(), n, b.clone())))
             .collect();
         self.session.watches = self.debugger.watches.clone();
+        self.session.remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.session.remote_since = self.remote.as_ref().map_or(0, |r| r.since);
         self.session.show_sidebar = Some(self.show_sidebar);
         self.session.sidebar = match self.sidebar {
             SidebarView::Explorer => "explorer".into(),
@@ -940,6 +967,11 @@ impl ZenithApp {
             CommandSpec::program(parts.next().unwrap_or_default(), parts.collect())
         };
         spec.cwd = cwd.or_else(|| self.workspace.clone());
+        if let Some(r) = &self.remote {
+            // The shell runs on the host, in the remote folder.
+            spec = CommandSpec::program("ssh".to_string(), crate::remote::shell_args(&r.spec))
+                .with_cwd(Some(r.cache.clone()));
+        }
         let tab = TermTab::spawn(id, TermKind::Shell, spec, self.waker.clone());
         self.bottom.tabs.push(tab);
         self.bottom.active = self.bottom.tabs.len() - 1;
@@ -987,8 +1019,13 @@ impl ZenithApp {
         if resume {
             args.extend(agent.resume_args.iter().cloned());
         }
-        let mut spec = CommandSpec::program(agent.command.clone(), args).with_cwd(self.workspace.clone());
+        let mut spec = CommandSpec::program(agent.command.clone(), args.clone()).with_cwd(self.workspace.clone());
         spec.env = agent.env.clone();
+        if let Some(r) = &self.remote {
+            // Agents work on the host's files; their edits are fetched back.
+            spec = CommandSpec::program("ssh".to_string(), crate::remote::program_args(&r.spec, &agent.command, &args))
+                .with_cwd(Some(r.cache.clone()));
+        }
         let mut tab = TermTab::spawn(
             id,
             TermKind::Agent { id: agent.id.clone(), name: agent.name.clone(), icon: agent.icon.clone() },
@@ -1655,6 +1692,19 @@ impl ZenithApp {
             }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::CheckForUpdates => self.start_update_check(true),
+            Cmd::OpenRemoteFolder => {
+                let value = self.session.recent_remotes.first().cloned().unwrap_or_default();
+                self.dialog = Some(Dialog::Input {
+                    title: "Open folder over SSH (user@host:/path)".into(),
+                    value,
+                    kind: InputKind::RemoteFolder,
+                    focus: true,
+                });
+            }
+            Cmd::RemoteSyncNow => match &mut self.remote {
+                Some(r) => r.pull_now(),
+                None => self.toast("No remote folder is open", NotifyLevel::Info),
+            },
             Cmd::SyncPush => self.start_sync(crate::sync_ui::SyncOp::Push),
             Cmd::SyncPull => self.start_sync(crate::sync_ui::SyncOp::Pull),
             Cmd::ShowTests => {
@@ -2254,7 +2304,56 @@ impl ZenithApp {
             self.scm_repo = sel;
         }
         let root = roots.get(self.scm_repo).cloned();
+        if self.remote.is_some() {
+            self.remote_git_ui(ui, p);
+            return;
+        }
         self.with_repo(self.scm_repo, |app| app.git_repo_ui(ctx, ui, p, root));
+    }
+
+    /// Source Control for a remote folder: the copy's status, read-only (Git
+    /// commands belong on the host, in its terminal).
+    fn remote_git_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        Self::section_header(ui, p, "SOURCE CONTROL");
+        let Some(g) = &self.git else {
+            ui.label(RichText::new("The remote folder is not a Git repository.").color(p.text_dim));
+            return;
+        };
+        if let Some(b) = &g.branch {
+            ui.label(RichText::new(format!("⎇ {b}")).color(p.accent));
+        }
+        ui.label(
+            RichText::new("Remote folder: commit, push and pull in a terminal — it runs on the host.")
+                .small()
+                .color(p.text_dim),
+        );
+        let mut open_term = false;
+        let mut open = None;
+        if ui.button("Open terminal on host").clicked() {
+            open_term = true;
+        }
+        ui.add_space(6.0);
+        for e in &g.status {
+            let r = ui.add(
+                egui::Label::new(RichText::new(format!("{}  {}", e.letter(), e.rel)).size(12.5)).sense(Sense::click()),
+            );
+            if r.clicked() {
+                open = Some(e.path.clone());
+            }
+        }
+        if g.status.is_empty() {
+            ui.label(RichText::new("No changes.").color(p.text_dim));
+        }
+        if open_term {
+            self.new_terminal(None);
+        }
+        if let Some(path) = open {
+            if self.open_file(&path) {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    doc.show_git_diff = doc.git_base.is_some();
+                }
+            }
+        }
     }
 
     fn git_repo_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette, root: Option<PathBuf>) {
@@ -2856,6 +2955,7 @@ impl ZenithApp {
                 item(ui, Cmd::OpenFile, "Open File…");
                 item(ui, Cmd::OpenFolder, "Open Folder…");
                 item(ui, Cmd::AddFolderToWorkspace, "Add Folder to Workspace…");
+                item(ui, Cmd::OpenRemoteFolder, "Open Remote Folder (SSH)…");
                 ui.menu_button("Open Recent", |ui| {
                     for r in self.session.recent_workspaces.clone() {
                         if ui.button(r.display().to_string()).clicked() {
@@ -3938,8 +4038,14 @@ impl ZenithApp {
         if let Some(doc) = self.docs.get_mut(shown) {
             let act = crate::review::banner(ui, doc, &p, conflict);
             if let Some(a) = act {
-                if let Err(e) = crate::review::apply(doc, a) {
-                    self.toast(format!("{e}"), NotifyLevel::Error);
+                match crate::review::apply(doc, a) {
+                    // Reverts are written to disk: send them to the host too.
+                    Ok(()) => {
+                        if let (Some(r), Some(p)) = (&self.remote, doc.path()) {
+                            r.upload(p);
+                        }
+                    }
+                    Err(e) => self.toast(format!("{e}"), NotifyLevel::Error),
                 }
             }
         }
@@ -3958,8 +4064,13 @@ impl ZenithApp {
             let fs = self.settings.editor_font_size;
             if let Some(doc) = self.docs.get_mut(shown) {
                 if let Some(a) = crate::review::diff_view(ui, doc, &p, fs) {
-                    if let Err(e) = crate::review::apply(doc, a) {
-                        self.toast(format!("{e}"), NotifyLevel::Error);
+                    match crate::review::apply(doc, a) {
+                        Ok(()) => {
+                            if let (Some(r), Some(p)) = (&self.remote, doc.path()) {
+                                r.upload(p);
+                            }
+                        }
+                        Err(e) => self.toast(format!("{e}"), NotifyLevel::Error),
                     }
                 }
             }
@@ -4140,6 +4251,55 @@ impl ZenithApp {
         }
     }
 
+    fn connect_remote(&mut self, text: &str) {
+        let Some(spec) = crate::remote::RemoteSpec::parse(text) else {
+            self.toast("Use user@host:/path (or ssh://user@host:port/path)", NotifyLevel::Warning);
+            return;
+        };
+        if self.remote_connecting.is_some() {
+            return;
+        }
+        let cache = crate::remote::cache_dir(&settings::config_dir(), &spec);
+        self.session.recent_remotes.retain(|r| r != text.trim());
+        self.session.recent_remotes.insert(0, text.trim().to_string());
+        self.session.recent_remotes.truncate(10);
+        self.toast(format!("Connecting to {}…", spec.host), NotifyLevel::Info);
+        let w = self.waker.clone();
+        let rx = crate::remote::connect(spec.clone(), cache.clone(), move || w());
+        self.remote_connecting = Some((spec, cache, rx));
+    }
+
+    fn poll_remote(&mut self, ctx: &egui::Context) {
+        if let Some((_, _, rx)) = &self.remote_connecting {
+            if let Ok(r) = rx.try_recv() {
+                let (spec, cache, _) = self.remote_connecting.take().unwrap();
+                match r {
+                    Ok(since) => {
+                        self.remote = None;
+                        self.open_workspace(cache.clone());
+                        self.remote = Some(crate::remote::Session::new(spec.clone(), cache, since, self.waker.clone()));
+                        self.save_session();
+                        self.toast(format!("Opened {} over SSH", spec.label()), NotifyLevel::Info);
+                    }
+                    Err(e) => self.toast(format!("Couldn't open {}: {e}", spec.label()), NotifyLevel::Error),
+                }
+            }
+        }
+        let Some(r) = &mut self.remote else { return };
+        let (changed, errors) = r.poll();
+        for e in errors {
+            self.toast(e, NotifyLevel::Error);
+        }
+        if !changed.is_empty() {
+            self.refresh_trees();
+            if let Some(ws) = &self.workspace {
+                self.index = FileIndex::build(ws);
+            }
+            self.session.remote_since = self.remote.as_ref().map_or(0, |r| r.since);
+        }
+        ctx.request_repaint_after(crate::remote::PULL_EVERY);
+    }
+
     fn start_sync(&mut self, op: crate::sync_ui::SyncOp) {
         use crate::sync_ui::SyncOp;
         if self.sync_rx.is_some() {
@@ -4316,6 +4476,22 @@ impl ZenithApp {
             for (server, msg) in &self.lsp.progress {
                 let m: String = msg.chars().take(48).collect();
                 ui.label(small(format!("⟳ {server}: {m}")));
+            }
+            if let Some(r) = &self.remote {
+                let (text, color) = match &r.last_error {
+                    Some(_) => (format!("SSH {} (offline)", r.spec.host), p.error),
+                    None => (format!("SSH {}", r.spec.host), p.accent),
+                };
+                if ui
+                    .add(egui::Label::new(RichText::new(text).size(12.0).color(color)).sense(Sense::click()))
+                    .on_hover_text(format!(
+                        "Remote folder {}\nSaves go to the host; terminals and agents run there.\nClick to fetch changes now.",
+                        r.spec.label()
+                    ))
+                    .clicked()
+                {
+                    cmd = Some(Cmd::RemoteSyncNow);
+                }
             }
             if let Some(r) = &self.update_available {
                 let label = RichText::new(format!("⬆ Update {}", r.version)).size(12.0).color(p.success);
@@ -4683,6 +4859,9 @@ impl ZenithApp {
                             };
                             match res {
                                 Ok(()) => {
+                                    if let Some(r) = &self.remote {
+                                        r.remove(&path);
+                                    }
                                     self.docs.retain(|d| d.path().is_none_or(|p| !p.starts_with(&path)));
                                     self.active = self.active.min(self.docs.len().saturating_sub(1));
                                     self.refresh_trees();
@@ -5035,10 +5214,21 @@ impl ZenithApp {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| {
+                    if let Some(r) = &self.remote {
+                        r.upload(&path);
+                    }
                     self.open_file(&path);
                 })
             }
-            InputKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(&name)),
+            InputKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(&name)).map(|_| {
+                if let Some(r) = &self.remote {
+                    r.mkdir(&dir.join(&name));
+                }
+            }),
+            InputKind::RemoteFolder => {
+                self.connect_remote(&name);
+                return;
+            }
             InputKind::NewBranch => {
                 self.git_switch(&name, true);
                 return;
@@ -5072,6 +5262,9 @@ impl ZenithApp {
             InputKind::Rename(path) => {
                 let target = path.with_file_name(&name);
                 std::fs::rename(path, &target).map(|_| {
+                    if let Some(r) = &self.remote {
+                        r.rename(path, &target);
+                    }
                     for d in &mut self.docs {
                         if d.path() == Some(path.as_path()) {
                             d.buffer.set_path(target.clone());
@@ -5909,6 +6102,7 @@ impl eframe::App for ZenithApp {
         }
         self.handle_debugger();
         self.poll_update_check();
+        self.poll_remote(ctx);
         self.poll_update_install(ctx);
         self.poll_sync();
         if self.tests.poll() {
