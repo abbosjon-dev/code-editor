@@ -26,6 +26,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev
       - name: Test
         run: cargo test --workspace
+      - name: Install packaging tools
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            curl -fsSL -o "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            chmod +x "$RUNNER_TEMP/appimagetool"
+            echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+          elif [ "$RUNNER_OS" = Windows ]; then
+            dotnet tool install --global wix --version 5.0.2
+          fi
       - name: Build packages
         shell: bash
         run: bash packaging/package.sh

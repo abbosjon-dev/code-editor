@@ -65,5 +65,6 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 **v1.0**
 - [ ] Plugin marketplace / registry
 - [x] Paketlar: .dmg (macOS), .zip (Windows), .deb va .tar.gz (Linux)
-- [ ] Kod imzosi (Apple notarization, Windows Authenticode), .msi, AppImage, avtomatik yangilanish
+- [x] .msi (WiX), AppImage, kod imzosi va notarizatsiya (secret'lar bo'lsa), yangilanishni tekshirish
+- [ ] Avtomatik yuklab olib o'rnatish (hozircha faqat xabar)
 - [x] Sozlamalar oynasi

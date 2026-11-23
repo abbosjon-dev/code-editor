@@ -83,6 +83,7 @@ pub enum Cmd {
     ToggleBreakpoint,
     ShowDebug,
     OpenLaunchConfig,
+    CheckForUpdates,
     About,
     Quit,
 }
@@ -167,6 +168,7 @@ impl Cmd {
             ToggleBreakpoint,
             ShowDebug,
             OpenLaunchConfig,
+            CheckForUpdates,
             About,
             Quit,
         ]
@@ -251,6 +253,7 @@ impl Cmd {
             ToggleBreakpoint => "Debug: Toggle Breakpoint",
             ShowDebug => "View: Show Run and Debug",
             OpenLaunchConfig => "Debug: Open launch.toml",
+            CheckForUpdates => "Help: Check for Updates",
             About => "Help: About Zenith",
             Quit => "File: Quit",
         }

@@ -171,6 +171,9 @@ pub struct ZenithApp {
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
     /// MCP servers section (workspace `.mcp.json`).
     mcp: crate::mcp_ui::McpPanel,
+    /// Update check in flight (manual = report every result), and a newer release.
+    update_rx: Option<(std::sync::mpsc::Receiver<Result<Option<crate::update::Release>, String>>, bool)>,
+    update_available: Option<crate::update::Release>,
     /// Plugin status bar items keyed by (plugin, item id).
     status_items: std::collections::BTreeMap<(String, String), StatusItem>,
     /// Active document path last announced to plugins.
@@ -278,6 +281,8 @@ impl ZenithApp {
             bp_store: Default::default(),
             ws_symbols: Default::default(),
             status_items: Default::default(),
+            update_rx: None,
+            update_available: None,
             mcp: Default::default(),
             announced_editor: None,
             changes_refreshed: None,
@@ -328,6 +333,11 @@ impl ZenithApp {
         };
         app.load_plugins();
         app.load_keymap();
+        // Daily update check (notify only).
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if app.settings.check_for_updates && now.saturating_sub(app.session.last_update_check) > 24 * 3600 {
+            app.start_update_check(false);
+        }
         if let Some(e) = settings_err {
             app.toast(e, NotifyLevel::Error);
         }
@@ -1608,6 +1618,7 @@ impl ZenithApp {
                 self.focus_editor = true;
             }
             Cmd::About => self.dialog = Some(Dialog::About),
+            Cmd::CheckForUpdates => self.start_update_check(true),
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -2859,6 +2870,7 @@ impl ZenithApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                item(ui, Cmd::CheckForUpdates, "Check for Updates");
                 item(ui, Cmd::About, "About Zenith");
             });
 
@@ -4036,6 +4048,41 @@ impl ZenithApp {
         }
     }
 
+    /// Ask GitHub for the latest release (`manual`: also report "up to date").
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        let w = self.waker.clone();
+        self.update_rx = Some((crate::update::check_async(move || w()), manual));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.session.last_update_check = now;
+        if manual {
+            self.toast("Checking for updates…", NotifyLevel::Info);
+        }
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some((rx, manual)) = &self.update_rx else { return };
+        let manual = *manual;
+        let Ok(result) = rx.try_recv() else { return };
+        self.update_rx = None;
+        let current = env!("CARGO_PKG_VERSION");
+        match result {
+            Ok(Some(r)) if crate::update::is_newer(&r.version, current) => {
+                self.toast(
+                    format!("Zenith {} is available (you have {current}). Click ⬆ in the status bar.", r.version),
+                    NotifyLevel::Info,
+                );
+                self.update_available = Some(r);
+            }
+            Ok(Some(_)) if manual => self.toast(format!("Zenith {current} is the latest version."), NotifyLevel::Info),
+            Ok(None) if manual => self.toast("No releases have been published yet.", NotifyLevel::Info),
+            Err(e) if manual => self.toast(format!("Couldn't check for updates: {e}"), NotifyLevel::Warning),
+            _ => {}
+        }
+    }
+
     fn status_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let p = self.colors.clone();
         let mut cmd = None;
@@ -4089,6 +4136,16 @@ impl ZenithApp {
             for (server, msg) in &self.lsp.progress {
                 let m: String = msg.chars().take(48).collect();
                 ui.label(small(format!("⟳ {server}: {m}")));
+            }
+            if let Some(r) = &self.update_available {
+                let label = RichText::new(format!("⬆ Update {}", r.version)).size(12.0).color(p.success);
+                if ui
+                    .add(egui::Label::new(label).sense(Sense::click()))
+                    .on_hover_text("A newer Zenith is available — open the release page")
+                    .clicked()
+                {
+                    open_url(&r.url);
+                }
             }
             let running_agents = self.ai.tabs.iter().filter(|t| t.is_alive()).count();
             if running_agents > 0 {
@@ -5583,6 +5640,7 @@ impl eframe::App for ZenithApp {
             ctx.request_repaint();
         }
         self.handle_debugger();
+        self.poll_update_check();
         let active_path = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
         if active_path != self.announced_editor {
             self.announced_editor = active_path.clone();

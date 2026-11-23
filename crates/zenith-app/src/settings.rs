@@ -35,6 +35,8 @@ pub struct Settings {
     pub vim_mode: bool,
     /// Tree-sitter highlighting and folding for supported languages.
     pub tree_sitter: bool,
+    /// Look for a newer release on GitHub (at most once a day; notify only).
+    pub check_for_updates: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
     /// Custom shell for new terminals (empty = system default).
@@ -78,6 +80,7 @@ impl Default for Settings {
             cursor_blink: true,
             vim_mode: false,
             tree_sitter: true,
+            check_for_updates: true,
             auto_save: false,
             format_trim_trailing_whitespace: false,
             shell: String::new(),
@@ -183,6 +186,8 @@ pub struct Session {
     pub breakpoint_details: Vec<(PathBuf, usize, crate::debug::Bp)>,
     /// Debugger watch expressions.
     pub watches: Vec<String>,
+    /// When updates were last checked (Unix seconds).
+    pub last_update_check: u64,
 }
 
 impl Session {

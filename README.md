@@ -28,12 +28,24 @@ macOS, Windows va Linux'da ishlaydi.
 
 | OS | Fayl | O'rnatish |
 |---|---|---|
-| **macOS** (Apple Silicon / Intel) | `Zenith-…-macos-arm64.dmg` / `…-x86_64.dmg` | DMG'ni oching, Zenith'ni Applications'ga torting. Ilova imzolanmagan: birinchi marta **o'ng tugma → Open** (yoki `xattr -dr com.apple.quarantine /Applications/Zenith.app`). |
-| **Windows** | `zenith-…-windows-x86_64.zip` | Arxivni oching va `zenith.exe` ni ishga tushiring. |
+| **macOS** (Apple Silicon / Intel) | `Zenith-…-macos-arm64.dmg` / `…-x86_64.dmg` | DMG'ni oching, Zenith'ni Applications'ga torting. Imzo sertifikatisiz yig'ilgan bo'lsa: birinchi marta **o'ng tugma → Open** (yoki `xattr -dr com.apple.quarantine /Applications/Zenith.app`). |
+| **Windows** | `Zenith-…-x86_64.msi` yoki `zenith-…-windows-x86_64.zip` | MSI — o'rnatuvchi (Start menyu, `PATH`, o'chirish Sozlamalardan); ZIP — `zenith.exe` ni to'g'ridan-to'g'ri ishga tushiring. |
+| **Har qanday Linux** | `Zenith-…-x86_64.AppImage` | `chmod +x Zenith-*.AppImage && ./Zenith-*.AppImage` |
 | **Ubuntu / Debian** | `zenith_…_amd64.deb` | `sudo apt install ./zenith_…_amd64.deb` |
 | **Boshqa Linux** | `zenith-…-linux-x86_64.tar.gz` | Arxivni oching va `./install.sh` (foydalanuvchi uchun, `~/.local`ga). |
 
-Paketlarni o'zingiz yig'ish: `bash packaging/package.sh` (natija `dist/` papkasida).
+Paketlarni o'zingiz yig'ish: `bash packaging/package.sh` (natija `dist/` papkasida; AppImage uchun
+`appimagetool`, MSI uchun WiX — `dotnet tool install --global wix`).
+
+**Kod imzosi (ixtiyoriy).** Release workflow quyidagi repository secret'lari bo'lsa imzolaydi, bo'lmasa o'tkazib yuboradi:
+macOS — `APPLE_CERTIFICATE` (Developer ID .p12, base64), `APPLE_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`,
+notarizatsiya uchun `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`; Windows — `WINDOWS_CERTIFICATE` (.pfx, base64),
+`WINDOWS_CERTIFICATE_PASSWORD`. Mahalliy yig'ishda xuddi shu nomdagi muhit o'zgaruvchilari ishlatiladi
+(`packaging/package.sh` boshidagi izohga qarang).
+
+**Yangilanishlar.** Zenith kuniga bir marta GitHub'dagi oxirgi release'ni tekshiradi va yangi versiya chiqsa status
+qatorida **⬆ Update** ko'rsatadi (hech narsa avtomatik o'rnatilmaydi). *Help → Check for Updates* — qo'lda tekshirish;
+Sozlamalar → Advanced'da o'chirish mumkin.
 
 ## Manba koddan ishga tushirish
 

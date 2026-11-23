@@ -228,6 +228,12 @@ fn ai(ui: &mut egui::Ui, s: &mut Settings, agents: &[AgentProfile], c: &mut Chan
 }
 
 fn advanced(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
+    c.any |= checkbox(
+        ui,
+        &mut s.check_for_updates,
+        "Check for updates",
+        "Once a day, ask GitHub for a newer release and show a notice (nothing is installed)",
+    );
     if checkbox(ui, &mut s.lsp_enabled, "Language servers", "Completion, diagnostics, go to definition") {
         c.lsp = true;
         c.any = true;
