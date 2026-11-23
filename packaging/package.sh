@@ -156,6 +156,7 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
             -d Version="$VERSION" -d ExePath="$(cygpath -w "$W/zenith.exe")" \
             -d IconPath="$(cygpath -w packaging/icon.ico)" -d LicensePath="$(cygpath -w LICENSE)" \
             -o "$(cygpath -w "$MSI")"
+        rm -f "dist/Zenith-$VERSION-$ARCH.wixpdb" # debug symbols, not for users
         sign "$MSI"
     else
         echo "WiX not found: skipping the .msi" >&2
