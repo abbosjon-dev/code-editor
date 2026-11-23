@@ -15,6 +15,8 @@ pub struct Changes {
     pub lsp: bool,
     pub open_file: bool,
     pub open_keybindings: bool,
+    /// Settings Sync buttons.
+    pub sync: Option<crate::sync_ui::SyncOp>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -228,6 +230,30 @@ fn ai(ui: &mut egui::Ui, s: &mut Settings, agents: &[AgentProfile], c: &mut Chan
 }
 
 fn advanced(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
+    row_label(ui, "Settings Sync", "Git repository for settings, shortcuts and plugins");
+    ui.vertical(|ui| {
+        c.any |= ui
+            .add(
+                egui::TextEdit::singleline(&mut s.sync_repo)
+                    .hint_text("git@github.com:you/zenith-settings.git")
+                    .desired_width(300.0),
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            let connected = crate::sync::is_set_up(&crate::settings::config_dir());
+            if ui.button(if connected { "Reconnect" } else { "Connect" }).clicked() {
+                c.sync = Some(crate::sync_ui::SyncOp::Setup);
+            }
+            if ui.add_enabled(connected, egui::Button::new("⬆ Push")).clicked() {
+                c.sync = Some(crate::sync_ui::SyncOp::Push);
+            }
+            if ui.add_enabled(connected, egui::Button::new("⬇ Pull")).clicked() {
+                c.sync = Some(crate::sync_ui::SyncOp::Pull);
+            }
+        });
+    });
+    ui.end_row();
+    c.any |= checkbox(ui, &mut s.sync_on_startup, "Pull on startup", "Get synced settings when Zenith starts");
     c.any |= checkbox(
         ui,
         &mut s.check_for_updates,

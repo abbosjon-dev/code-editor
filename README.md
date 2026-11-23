@@ -211,6 +211,14 @@ standart AI agent, terminal shell va boshqalar. O'zgarishlar darhol qo'llanadi v
 
 ![Settings](docs/settings.png)
 
+## Sozlamalarni sinxronlash
+
+Sozlamalar → Advanced → **Settings Sync**: o'zingizning Git repo'ingiz manzilini kiriting (masalan, maxfiy GitHub
+repo) va **Connect**. **⬆ Push** — `settings.toml`, `keybindings.toml` va `plugins/` ni repo'ga yuklaydi;
+boshqa kompyuterda **⬇ Pull** — ularni oladi (oldingi fayllar `sync-backup/` ga saqlanadi), sozlamalar, tugmalar va
+pluginlar darhol qayta yuklanadi. Push hech narsani o'chirmaydi; boshqa kompyuterdagi o'zgarishlar bilan to'qnashsa,
+avval Pull qilishni so'raydi. "Pull on startup" — har ishga tushganda olish. Palitrada: *Settings Sync: Push / Pull*.
+
 ## Klaviatura
 
 **O'z tugmalaringiz:** *Preferences: Keyboard Shortcuts (TOML)* (yoki Sozlamalar → Editor → "Edit keybindings.toml")

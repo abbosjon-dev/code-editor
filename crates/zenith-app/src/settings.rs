@@ -37,6 +37,10 @@ pub struct Settings {
     pub tree_sitter: bool,
     /// Look for a newer release on GitHub (at most once a day; notify only).
     pub check_for_updates: bool,
+    /// Git repository for Settings Sync (empty = off).
+    pub sync_repo: String,
+    /// Pull synced settings when Zenith starts.
+    pub sync_on_startup: bool,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
     /// Custom shell for new terminals (empty = system default).
@@ -81,6 +85,8 @@ impl Default for Settings {
             vim_mode: false,
             tree_sitter: true,
             check_for_updates: true,
+            sync_repo: String::new(),
+            sync_on_startup: false,
             auto_save: false,
             format_trim_trailing_whitespace: false,
             shell: String::new(),

@@ -170,6 +170,8 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Settings Sync operation in flight.
+    sync_rx: Option<std::sync::mpsc::Receiver<crate::sync_ui::SyncResult>>,
     /// Test explorer.
     tests: crate::testing::Panel,
     /// MCP servers section (workspace `.mcp.json`).
@@ -288,6 +290,7 @@ impl ZenithApp {
             update_available: None,
             mcp: Default::default(),
             tests: Default::default(),
+            sync_rx: None,
             announced_editor: None,
             changes_refreshed: None,
             scm_repo: 0,
@@ -337,6 +340,9 @@ impl ZenithApp {
         };
         app.load_plugins();
         app.load_keymap();
+        if app.settings.sync_on_startup && crate::sync::is_set_up(&settings::config_dir()) {
+            app.start_sync(crate::sync_ui::SyncOp::Pull);
+        }
         // Daily update check (notify only).
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         if app.settings.check_for_updates && now.saturating_sub(app.session.last_update_check) > 24 * 3600 {
@@ -1625,6 +1631,8 @@ impl ZenithApp {
             }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::CheckForUpdates => self.start_update_check(true),
+            Cmd::SyncPush => self.start_sync(crate::sync_ui::SyncOp::Push),
+            Cmd::SyncPull => self.start_sync(crate::sync_ui::SyncOp::Pull),
             Cmd::ShowTests => {
                 self.sidebar = SidebarView::Tests;
                 self.show_sidebar = true;
@@ -4108,6 +4116,61 @@ impl ZenithApp {
         }
     }
 
+    fn start_sync(&mut self, op: crate::sync_ui::SyncOp) {
+        use crate::sync_ui::SyncOp;
+        if self.sync_rx.is_some() {
+            self.toast("Settings Sync is already running", NotifyLevel::Info);
+            return;
+        }
+        let config = settings::config_dir();
+        if op != SyncOp::Setup && !crate::sync::is_set_up(&config) {
+            self.toast("Set up Settings Sync first: Settings → Advanced → Settings Sync", NotifyLevel::Info);
+            self.show_settings = true;
+            return;
+        }
+        if op == SyncOp::Push {
+            // Push what's in the editor, not an older file.
+            self.write_settings();
+        }
+        let w = self.waker.clone();
+        self.sync_rx = Some(crate::sync_ui::start(op, config, self.settings.sync_repo.clone(), move || w()));
+        let what = match op {
+            SyncOp::Setup => "Connecting to the settings repository…",
+            SyncOp::Push => "Pushing settings…",
+            SyncOp::Pull => "Pulling settings…",
+        };
+        self.toast(what, NotifyLevel::Info);
+    }
+
+    fn poll_sync(&mut self) {
+        use crate::sync_ui::SyncOp;
+        let Some(rx) = &self.sync_rx else { return };
+        let Ok((op, result)) = rx.try_recv() else { return };
+        self.sync_rx = None;
+        match result {
+            Ok(msg) => {
+                self.toast(msg, NotifyLevel::Info);
+                match op {
+                    // Freshly connected: take the repository's settings if it has any.
+                    SyncOp::Setup => self.start_sync(SyncOp::Pull),
+                    SyncOp::Pull => {
+                        // Keep the repository URL from this machine.
+                        let url = self.settings.sync_repo.clone();
+                        self.reload_settings();
+                        if self.settings.sync_repo.is_empty() && !url.is_empty() {
+                            self.settings.sync_repo = url;
+                            self.write_settings();
+                        }
+                        self.load_keymap();
+                        self.load_plugins();
+                    }
+                    SyncOp::Push => {}
+                }
+            }
+            Err(e) => self.toast(format!("Settings Sync: {e}"), NotifyLevel::Error),
+        }
+    }
+
     /// Ask GitHub for the latest release (`manual`: also report "up to date").
     fn start_update_check(&mut self, manual: bool) {
         if self.update_rx.is_some() {
@@ -4933,6 +4996,9 @@ impl ZenithApp {
         if c.any {
             self.write_settings();
         }
+        if let Some(op) = c.sync {
+            self.start_sync(op);
+        }
         if c.open_keybindings {
             self.run(ctx, Cmd::OpenKeybindings);
         }
@@ -5701,6 +5767,7 @@ impl eframe::App for ZenithApp {
         }
         self.handle_debugger();
         self.poll_update_check();
+        self.poll_sync();
         if self.tests.poll() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
