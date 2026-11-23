@@ -26,7 +26,7 @@ name = "Text Tools"
 version = "0.1.0"
 description = "Matn bilan ishlash vositalari"
 run = ["python3", "main.py"]      # ishga tushirish buyrug'i (nisbiy yo'llar plugin papkasidan)
-events = ["file_saved"]           # ixtiyoriy: "file_opened", "file_saved"
+events = ["file_saved"]           # ixtiyoriy: "file_opened", "file_saved", "active_editor_changed"
 
 [[commands]]
 id = "text-tools.word-count"      # buyruq ID
@@ -88,6 +88,7 @@ stderr'ga yozilgan hamma narsa log hisoblanadi.
 | `run_in_terminal` | `command` | Yangi terminalda buyruqni bajaradi |
 | `send_to_agent` | `text`, `agent`? | AI agentga matn yuboradi (kerak bo'lsa ishga tushiradi) |
 | `set_panel` | `panel`, `items`, `message`?, `buttons`? | Plugin panelining tarkibini almashtiradi (pastga qarang) |
+| `set_status` | `id`, `text`, `tooltip`?, `command`?, `align`? (`left`/`right`), `color`? | Status qatoriga element qo'shadi/yangilaydi; bo'sh `text` — o'chiradi. Bosilganda `command` chaqiriladi |
 
 ## Yon panel (sidebar panel)
 
@@ -141,3 +142,14 @@ rl.on("line", (line) => {
   }
 });
 ```
+
+## Status qatori
+
+Plugin status qatoriga o'z elementini qo'yishi mumkin (masalan, so'zlar soni, build holati):
+
+```json
+{"method":"action","params":{"type":"set_status","id":"words","text":"42 words","align":"right","command":"text-tools.word-count"}}
+```
+
+`active_editor_changed` hodisasi (`{"path": ...}`) aktiv fayl almashganda keladi. Misol:
+[`plugins/examples/text-tools`](../plugins/examples/text-tools/main.py).

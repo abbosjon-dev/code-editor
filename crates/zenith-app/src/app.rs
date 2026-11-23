@@ -49,6 +49,15 @@ struct WsSymbols {
     results: Vec<zenith_lsp::Symbol>,
 }
 
+/// A plugin's status bar item.
+struct StatusItem {
+    text: String,
+    tooltip: String,
+    command: Option<String>,
+    right: bool,
+    color: String,
+}
+
 /// Contents of a plugin panel (from its last `set_panel`).
 #[derive(Default)]
 struct PanelData {
@@ -160,6 +169,10 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Plugin status bar items keyed by (plugin, item id).
+    status_items: std::collections::BTreeMap<(String, String), StatusItem>,
+    /// Active document path last announced to plugins.
+    announced_editor: Option<PathBuf>,
     /// Live "Go to Symbol in Workspace" state.
     ws_symbols: WsSymbols,
     /// Breakpoints of files that aren't open.
@@ -262,6 +275,8 @@ impl ZenithApp {
             debug_configs: None,
             bp_store: Default::default(),
             ws_symbols: Default::default(),
+            status_items: Default::default(),
+            announced_editor: None,
             changes_refreshed: None,
             scm_repo: 0,
             commit_message: String::new(),
@@ -1685,7 +1700,10 @@ impl ZenithApp {
                 PluginEventKind::Action(a) => self.apply_plugin_action(&ev.plugin_id, a),
                 PluginEventKind::Error(e) => self.toast(format!("[{}] {e}", ev.plugin_id), NotifyLevel::Error),
                 PluginEventKind::Log(l) => log::info!("[plugin {}] {l}", ev.plugin_id),
-                PluginEventKind::Exited => log::info!("plugin {} exited", ev.plugin_id),
+                PluginEventKind::Exited => {
+                    log::info!("plugin {} exited", ev.plugin_id);
+                    self.status_items.retain(|(p, _), _| *p != ev.plugin_id);
+                }
             }
         }
     }
@@ -1714,6 +1732,15 @@ impl ZenithApp {
             }
             Action::RunInTerminal { command } => self.run_in_terminal(&command),
             Action::SendToAgent { text, agent } => self.send_to_agent(text, true, agent),
+            Action::SetStatus { id, text, tooltip, command, align, color } => {
+                let key = (plugin.to_string(), id);
+                if text.is_empty() {
+                    self.status_items.remove(&key);
+                } else {
+                    let right = align == "right";
+                    self.status_items.insert(key, StatusItem { text, tooltip, command, right, color });
+                }
+            }
             Action::SetPanel { panel, items, message, buttons } => {
                 self.panel_data.insert(format!("{plugin}/{panel}"), PanelData { items, message, buttons });
             }
@@ -3983,6 +4010,7 @@ impl ZenithApp {
     fn status_bar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let p = self.colors.clone();
         let mut cmd = None;
+        let mut plugin_click: Option<String> = None;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let small = |t: String| RichText::new(t).size(12.0).color(p.text_dim);
@@ -4037,6 +4065,32 @@ impl ZenithApp {
             if running_agents > 0 {
                 ui.label(RichText::new(format!("✳ {running_agents} agent(s)")).size(12.0).color(p.accent));
             }
+            // Plugin items: left ones here, right ones before the file info.
+            let mut item_ui = |ui: &mut egui::Ui, (plugin, _): &(String, String), it: &StatusItem| {
+                let color = match it.color.as_str() {
+                    "accent" => p.accent,
+                    "success" => p.success,
+                    "warning" => p.warning,
+                    "error" => p.error,
+                    _ => p.text_dim,
+                };
+                let mut r =
+                    ui.add(
+                        egui::Label::new(RichText::new(&it.text).size(12.0).color(color))
+                            .sense(if it.command.is_some() { Sense::click() } else { Sense::hover() }),
+                    );
+                if !it.tooltip.is_empty() {
+                    r = r.on_hover_text(format!("{}\n— {plugin}", it.tooltip));
+                }
+                if r.clicked() {
+                    if let Some(c) = &it.command {
+                        plugin_click = Some(c.clone());
+                    }
+                }
+            };
+            for (k, it) in self.status_items.iter().filter(|(_, i)| !i.right) {
+                item_ui(ui, k, it);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(doc) = self.docs.get(self.active) {
                     let pos = doc.buffer.cursor_pos();
@@ -4070,10 +4124,19 @@ impl ZenithApp {
                         cmd = Some(Cmd::GotoLine);
                     }
                 }
+                for (k, it) in self.status_items.iter().filter(|(_, i)| i.right) {
+                    item_ui(ui, k, it);
+                }
             });
         });
         if let Some(c) = cmd {
             self.run(ctx, c);
+        }
+        if let Some(c) = plugin_click {
+            let ectx = self.editor_context();
+            if let Err(e) = self.plugins.execute(&c, &ectx) {
+                self.toast(format!("{e:#}"), NotifyLevel::Error);
+            }
         }
     }
 
@@ -5491,6 +5554,11 @@ impl eframe::App for ZenithApp {
             ctx.request_repaint();
         }
         self.handle_debugger();
+        let active_path = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
+        if active_path != self.announced_editor {
+            self.announced_editor = active_path.clone();
+            self.plugins.emit("active_editor_changed", serde_json::json!({ "path": active_path }));
+        }
         if self.show_changes
             && self.changes.base.is_some()
             && self.changes_refreshed.is_none_or(|t| t.elapsed() > Duration::from_secs(2))

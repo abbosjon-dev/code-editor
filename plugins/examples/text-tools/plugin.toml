@@ -5,7 +5,7 @@ description = "Example plugin: word count, sort lines, UPPER/lower case, ask AI 
 # Any executable works. Relative paths are resolved inside this folder.
 run = ["python3", "main.py"]
 # Editor events this plugin wants to receive.
-events = ["file_saved"]
+events = ["file_saved", "active_editor_changed"]
 
 [[commands]]
 id = "text-tools.word-count"

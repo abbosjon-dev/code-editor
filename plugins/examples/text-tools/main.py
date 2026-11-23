@@ -4,7 +4,8 @@
 Protocol: one JSON object per line on stdin/stdout.
   editor -> plugin: {"id": 1, "method": "execute", "params": {"command": "...", "context": {...}}}
   plugin -> editor: {"id": 1, "result": {"actions": [ ... ]}}
-Actions: notify, replace_selection, insert, set_text, open_file, run_in_terminal, send_to_agent.
+Actions: notify, replace_selection, insert, set_text, open_file, run_in_terminal, send_to_agent,
+set_panel, set_status (status bar item; empty text removes it).
 Print anything you like to stderr for logs.
 """
 import json
@@ -47,6 +48,24 @@ def handle(command, ctx):
     return [notify(f"Unknown command {command}", "error")]
 
 
+def status_word_count(path):
+    """Show the file's word count in the status bar (click = details)."""
+    text = ""
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            text = ""
+    words = len(text.split())
+    sys.stdout.write(json.dumps({"method": "action", "params": {
+        "type": "set_status", "id": "words", "align": "right",
+        "text": f"{words} words" if path else "",
+        "tooltip": "Word count of the saved file", "command": "text-tools.word-count",
+    }}) + "\n")
+    sys.stdout.flush()
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -64,7 +83,9 @@ def main():
             except Exception as e:  # never crash the plugin
                 reply(msg.get("id"), [notify(f"text-tools error: {e}", "error")])
         elif method == "event":
-            print(f"event: {params.get('event')} {params.get('data')}", file=sys.stderr)
+            data = params.get("data") or {}
+            if params.get("event") in ("active_editor_changed", "file_saved"):
+                status_word_count(data.get("path"))
         elif method == "shutdown":
             break
 

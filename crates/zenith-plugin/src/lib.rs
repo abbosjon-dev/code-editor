@@ -151,6 +151,23 @@ pub enum Action {
         #[serde(default)]
         buttons: Vec<PanelButton>,
     },
+    /// Add or update a status bar item (empty `text` removes it).
+    SetStatus {
+        id: String,
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        tooltip: String,
+        /// Plugin command run on click.
+        #[serde(default)]
+        command: Option<String>,
+        /// "left" (default) or "right".
+        #[serde(default)]
+        align: String,
+        /// "accent", "success", "warning", "error" or "" (normal).
+        #[serde(default)]
+        color: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -522,6 +539,15 @@ mod tests {
         assert!(matches!(&ev[0], PluginEventKind::Error(e) if e == "boom"));
         let ev = parse_line("not json");
         assert!(matches!(&ev[0], PluginEventKind::Log(_)));
+    }
+
+    #[test]
+    fn parses_status_items() {
+        let ev = parse_line(
+            r#"{"method":"action","params":{"type":"set_status","id":"wc","text":"42 words","command":"t.wc","align":"right"}}"#,
+        );
+        assert!(matches!(&ev[0], PluginEventKind::Action(Action::SetStatus { id, text, command: Some(c), align, .. })
+            if id == "wc" && text == "42 words" && c == "t.wc" && align == "right"));
     }
 
     #[test]
