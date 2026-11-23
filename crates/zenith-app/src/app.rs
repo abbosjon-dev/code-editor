@@ -1720,22 +1720,24 @@ impl ZenithApp {
                     self.tests.run(None, self.waker.clone());
                 }
             }
+            Cmd::DebugTestAtCursor => {
+                let name = self.test_name_at_cursor();
+                self.sidebar = SidebarView::Tests;
+                self.show_sidebar = true;
+                let ids = name.as_deref().map(|n| self.tests.ids_named(n)).unwrap_or_default();
+                match ids.first().and_then(|id| self.tests.item(id)).cloned() {
+                    Some(t) => self.debug_test(&t),
+                    None => {
+                        let msg = match name {
+                            Some(n) => format!("No test named `{n}` (discover tests with ⟳ first)"),
+                            None => "Put the caret inside a test function".into(),
+                        };
+                        self.toast(msg, NotifyLevel::Info);
+                    }
+                }
+            }
             Cmd::RunTestAtCursor => {
-                // The function the caret is in: the nearest `fn name(` / `def name(` above.
-                let name = self.docs.get(self.active).and_then(|d| {
-                    let line = d.buffer.cursor_pos().line;
-                    (0..=line).rev().find_map(|l| {
-                        let t = d.buffer.line_text(l);
-                        let t = t.trim_start();
-                        let rest = t
-                            .strip_prefix("fn ")
-                            .or_else(|| t.split_once(" fn ").map(|(_, r)| r))
-                            .or_else(|| t.strip_prefix("def "))
-                            .or_else(|| t.strip_prefix("async def "))?;
-                        let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                        (!n.is_empty()).then_some(n)
-                    })
-                });
+                let name = self.test_name_at_cursor();
                 self.sidebar = SidebarView::Tests;
                 self.show_sidebar = true;
                 let ids = name.as_deref().map(|n| self.tests.ids_named(n)).unwrap_or_default();
@@ -3253,12 +3255,16 @@ impl ZenithApp {
             SidebarView::Tests => {
                 let root = self.workspace.clone();
                 let waker = self.waker.clone();
-                if let Some(crate::testing::Action::Open(path, line)) = self.tests.ui(ui, &p, root.as_deref(), waker) {
-                    if self.open_file(&path) {
-                        if let Some(doc) = self.docs.get_mut(self.active) {
-                            doc.goto_line(line);
+                match self.tests.ui(ui, &p, root.as_deref(), waker) {
+                    Some(crate::testing::Action::Open(path, line)) => {
+                        if self.open_file(&path) {
+                            if let Some(doc) = self.docs.get_mut(self.active) {
+                                doc.goto_line(line);
+                            }
                         }
                     }
+                    Some(crate::testing::Action::Debug(t)) => self.debug_test(&t),
+                    None => {}
                 }
             }
             SidebarView::PluginPanel(i) => self.plugin_panel_ui(ui, &p, i),
@@ -5577,6 +5583,41 @@ impl ZenithApp {
         self.sidebar = SidebarView::Debug;
         self.show_sidebar = true;
         self.debugger.start(cfg, root);
+    }
+
+    /// The function the caret is in: the nearest `fn name(` / `def name(` above.
+    fn test_name_at_cursor(&self) -> Option<String> {
+        let d = self.docs.get(self.active)?;
+        let line = d.buffer.cursor_pos().line;
+        (0..=line).rev().find_map(|l| {
+            let t = d.buffer.line_text(l);
+            let t = t.trim_start();
+            let rest = t
+                .strip_prefix("fn ")
+                .or_else(|| t.split_once(" fn ").map(|(_, r)| r))
+                .or_else(|| t.strip_prefix("def "))
+                .or_else(|| t.strip_prefix("async def "))?;
+            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            (!n.is_empty()).then_some(n)
+        })
+    }
+
+    /// Run one test under the debugger (breakpoints in the test are hit).
+    fn debug_test(&mut self, t: &crate::testing::TestItem) {
+        let Some(root) = self.workspace.clone() else { return };
+        if self.remote.is_some() {
+            self.toast("Debugging isn't available for remote folders", NotifyLevel::Info);
+            return;
+        }
+        let dirty: Vec<usize> = (0..self.docs.len()).filter(|&i| self.docs[i].buffer.is_dirty()).collect();
+        for i in dirty {
+            if self.docs[i].path().is_some() {
+                self.save_doc(i, false);
+            }
+        }
+        self.sidebar = SidebarView::Debug;
+        self.show_sidebar = true;
+        self.debugger.start(crate::testing::debug_config(t), root);
     }
 
     fn clear_debug_lines(&mut self) {

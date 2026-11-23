@@ -509,6 +509,31 @@ mod tests {
         assert_eq!(locate(&dir, &items[1]).map(|(_, l)| l), Some(4));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn debug_configs_run_one_test() {
+        let t = TestItem {
+            group: "app · lib".into(),
+            name: "a::tests::b".into(),
+            kind: Kind::Cargo {
+                package: "app".into(),
+                target: "lib".into(),
+                exe: PathBuf::from("/w/target/debug/deps/app-1"),
+                cwd: PathBuf::from("/w/app"),
+            },
+            status: Status::Unknown,
+            output: String::new(),
+        };
+        let c = debug_config(&t);
+        assert_eq!(c.args[..2], ["a::tests::b".to_string(), "--exact".to_string()]);
+        assert_eq!(c.build, "cargo test --no-run --quiet -p app");
+        let t = TestItem { name: "t/test_x.py::test_y".into(), kind: Kind::Pytest, ..t };
+        let c = debug_config(&t);
+        let v = zenith_dap::launch_arguments(&c, Path::new("/w"));
+        assert_eq!(v["module"], "pytest");
+        assert!(v.get("program").is_none());
+        assert_eq!(v["args"][0], "t/test_x.py::test_y");
+    }
 }
 
 // ------------------------------------------------------------------ panel
@@ -516,6 +541,37 @@ mod tests {
 /// What the panel asks the app to do.
 pub enum Action {
     Open(PathBuf, usize),
+    /// Run this test under the debugger.
+    Debug(Box<TestItem>),
+}
+
+/// A debugger configuration that runs just this test.
+/// Rust: the libtest binary under gdb (or lldb-dap) with an exact filter;
+/// pytest: `python -m pytest <node id>` under debugpy.
+pub fn debug_config(t: &TestItem) -> zenith_dap::LaunchConfig {
+    match &t.kind {
+        Kind::Cargo { package, exe, cwd, .. } => {
+            let native = if zenith_dap::adapter("gdb").and_then(|a| a.resolve()).is_some() { "gdb" } else { "lldb" };
+            zenith_dap::LaunchConfig {
+                name: format!("Test: {}", t.name),
+                adapter: native.into(),
+                program: exe.to_string_lossy().into_owned(),
+                args: vec![t.name.clone(), "--exact".into(), "--nocapture".into(), "--test-threads=1".into()],
+                cwd: cwd.to_string_lossy().into_owned(),
+                // Rebuild so the binary matches the sources (same path for the same profile).
+                build: format!("cargo test --no-run --quiet -p {package}"),
+                env: [("RUST_BACKTRACE".to_string(), "0".to_string())].into(),
+                ..Default::default()
+            }
+        }
+        Kind::Pytest => zenith_dap::LaunchConfig {
+            name: format!("Test: {}", t.short()),
+            adapter: "debugpy".into(),
+            args: vec![t.name.clone(), "-q".into(), "-p".into(), "no:cacheprovider".into()],
+            extra: [("module".to_string(), toml::Value::String("pytest".into()))].into(),
+            ..Default::default()
+        },
+    }
 }
 
 #[derive(Default)]
@@ -565,6 +621,10 @@ impl Panel {
     }
 
     /// Ids of tests named `func` (last path segment).
+    pub fn item(&self, id: &str) -> Option<&TestItem> {
+        self.items.iter().find(|t| t.id() == id)
+    }
+
     pub fn ids_named(&self, func: &str) -> Vec<String> {
         self.items
             .iter()
@@ -790,12 +850,35 @@ impl Panel {
                                 {
                                     run_ids = Some(Some(vec![id.clone()]));
                                 }
+                                if ui
+                                    .add_enabled(!self.busy, egui::Button::new("▷").small().frame(false))
+                                    .on_hover_text("Debug this test")
+                                    .clicked()
+                                {
+                                    action = Some(Action::Debug(Box::new(t.clone())));
+                                }
                             });
                             r
                         });
                         if row.inner.clicked() {
                             self.selected = Some(id.clone());
                         }
+                        row.inner.context_menu(|ui| {
+                            if ui.add_enabled(!self.busy, egui::Button::new("Run Test")).clicked() {
+                                run_ids = Some(Some(vec![id.clone()]));
+                                ui.close_menu();
+                            }
+                            if ui.button("Debug Test").clicked() {
+                                action = Some(Action::Debug(Box::new(t.clone())));
+                                ui.close_menu();
+                            }
+                            if ui.button("Go to Test").clicked() {
+                                if let Some((path, line)) = root.and_then(|r| locate(r, t)) {
+                                    action = Some(Action::Open(path, line));
+                                }
+                                ui.close_menu();
+                            }
+                        });
                         if row.inner.double_clicked() {
                             if let Some((path, line)) = root.and_then(|r| locate(r, t)) {
                                 action = Some(Action::Open(path, line));
@@ -827,6 +910,11 @@ impl Panel {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Log").on_hover_text("Show the run log").clicked() {
                         self.selected = None;
+                    }
+                    if ui.small_button("Debug").on_hover_text("Run this test under the debugger").clicked() {
+                        if let Some(t) = sel {
+                            action = Some(Action::Debug(Box::new(t.clone())));
+                        }
                     }
                     if ui.small_button("Open").clicked() {
                         if let (Some(t), Some(r)) = (sel, root) {

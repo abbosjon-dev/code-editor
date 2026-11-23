@@ -69,5 +69,5 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] Yangilanishni yuklab olib o'rnatish (SHA-256 tekshiruvi bilan, foydalanuvchi so'raganda)
 - [x] Sozlamalar oynasi
 - [x] Sozlamalarni Git repo orqali sinxronlash
-- [x] Test paneli (cargo test, pytest)
+- [x] Test paneli (cargo test, pytest), testni debugger ostida ishga tushirish
 - [x] SSH orqali uzoqdan ishlash (mahalliy nusxa + serverda terminal/agentlar)

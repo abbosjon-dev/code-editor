@@ -141,6 +141,10 @@ holat belgilari (✓ o'tdi, ✕ yiqildi, ○ o'tkazib yuborildi), yiqilgan testn
 ishga tushirish (↻ Failed), filtr. Testni ikki marta bossangiz — kodi ochiladi. *Test: Run Test at Cursor* —
 kursor turgan test funksiyasini ishga tushiradi.
 
+**Testni debug qilish:** test yonidagi **▷** (yoki o'ng tugma → *Debug Test*, *Test: Debug Test at Cursor*) —
+faqat shu test debugger ostida ishga tushadi va testdagi breakpoint'da to'xtaydi. Rust testlari gdb / lldb-dap
+bilan (test binari avval qayta yig'iladi), pytest testlari debugpy bilan (`python -m pytest <test>`).
+
 ![Testing](docs/testing.png)
 
 ## Debugger

@@ -304,6 +304,12 @@ pub fn launch_arguments(cfg: &LaunchConfig, root: &Path) -> Value {
             v[k] = j;
         }
     }
+    // debugpy runs either a file or a module (`python -m pytest`), not both.
+    if cfg.extra.contains_key("module") && cfg.program.is_empty() {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("program");
+        }
+    }
     v
 }
 
