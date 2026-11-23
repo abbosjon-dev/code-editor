@@ -41,6 +41,17 @@ pub struct Signature {
     pub help: Option<zenith_lsp::SignatureHelp>,
 }
 
+/// A semantic token's color on `line`, chars `start..end`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub color: eframe::egui::Color32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
 /// An inlay hint placed before char `col` of `line`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlayView {
@@ -114,6 +125,11 @@ pub struct Document {
     pub inlay_request: Option<(u64, u64)>,
     /// Empty answers are retried (servers answer [] while indexing).
     pub inlay_retry: (u8, Option<std::time::Instant>),
+    /// Semantic token colors (sorted), their version and the request in flight.
+    pub semantic: Vec<SemSpan>,
+    pub semantic_version: Option<u64>,
+    pub semantic_request: Option<(u64, u64)>,
+    pub semantic_retry: (u8, Option<std::time::Instant>),
     /// The debugger is paused (hovering shows values).
     pub debug_paused: bool,
     /// Value of the expression under the mouse: (char index, "expr = value").
@@ -198,6 +214,10 @@ impl Document {
             inlay_version: None,
             inlay_request: None,
             inlay_retry: (0, None),
+            semantic: vec![],
+            semantic_version: None,
+            semantic_request: None,
+            semantic_retry: (0, None),
             debug_value: None,
             conflicts_version: None,
             review: None,
@@ -346,6 +366,20 @@ impl Document {
                     }
                 });
             }
+            // Semantic colors: same as inlay hints.
+            if !self.semantic.is_empty() {
+                let old_last = (last as isize - delta).max(line as isize);
+                self.semantic.retain_mut(|t| {
+                    if t.line < line {
+                        true
+                    } else if (t.line as isize) <= old_last {
+                        false
+                    } else {
+                        t.line = (t.line as isize + delta) as usize;
+                        true
+                    }
+                });
+            }
             // Breakpoints move with their lines too.
             if delta != 0 && !self.breakpoints.is_empty() && self.last_len_lines > 0 {
                 let removed_end = if delta < 0 { line as isize - delta } else { line as isize };
@@ -391,6 +425,13 @@ impl Document {
             Some(base) if self.buffer.len_lines() < 50_000 => crate::git::diff_hunks(base, &self.buffer.text()),
             _ => vec![],
         };
+    }
+
+    /// Semantic token colors on `line`.
+    pub fn semantic_on(&self, line: usize) -> &[SemSpan] {
+        let a = self.semantic.partition_point(|t| t.line < line);
+        let b = self.semantic.partition_point(|t| t.line <= line);
+        &self.semantic[a..b]
     }
 
     /// Inlay hints on `line`.

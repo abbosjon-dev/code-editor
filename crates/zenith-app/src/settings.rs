@@ -28,6 +28,8 @@ pub struct Settings {
     pub inline_blame: bool,
     /// Show inlay hints from the language server (types, parameter names).
     pub inlay_hints: bool,
+    /// Color symbols by meaning using the language server (semantic tokens).
+    pub semantic_highlighting: bool,
     pub cursor_blink: bool,
     /// Vim-style modal editing (normal / insert / visual modes).
     pub vim_mode: bool,
@@ -72,6 +74,7 @@ impl Default for Settings {
             inline_diagnostics: true,
             inline_blame: true,
             inlay_hints: true,
+            semantic_highlighting: true,
             cursor_blink: true,
             vim_mode: false,
             tree_sitter: true,

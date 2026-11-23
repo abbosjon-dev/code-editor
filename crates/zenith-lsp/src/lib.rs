@@ -195,6 +195,17 @@ pub struct Symbol {
     pub path: Option<PathBuf>,
 }
 
+/// A semantic token (absolute position, UTF-16 columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticToken {
+    pub line: u32,
+    pub start: u32,
+    pub length: u32,
+    /// Token type name from the server's legend (e.g. "function").
+    pub kind: String,
+    pub modifiers: Vec<String>,
+}
+
 /// An inlay hint: virtual text shown inside a line (types, parameter names).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlayHint {
@@ -289,6 +300,10 @@ pub enum LspEvent {
         request: u64,
         hints: Vec<InlayHint>,
     },
+    SemanticTokens {
+        request: u64,
+        tokens: Vec<SemanticToken>,
+    },
     /// The server asked us to apply an edit (e.g. after a code action command).
     ApplyEdit {
         edits: Vec<(PathBuf, Vec<TextEdit>)>,
@@ -323,6 +338,7 @@ enum Pending {
     Symbols,
     WorkspaceSymbols,
     InlayHints,
+    SemanticTokens,
     Other,
 }
 
@@ -331,6 +347,8 @@ struct Shared {
     queue: Vec<Value>,
     pending: HashMap<u64, Pending>,
     trigger_chars: Vec<String>,
+    /// Semantic token legend from the server: (token types, modifiers).
+    legend: Option<(Vec<String>, Vec<String>)>,
 }
 
 pub struct LspClient {
@@ -365,6 +383,7 @@ impl LspClient {
             queue: vec![],
             pending: HashMap::from([(1, Pending::Initialize)]),
             trigger_chars: vec![],
+            legend: None,
         }));
 
         // Reader thread.
@@ -437,7 +456,16 @@ impl LspClient {
                             "isPreferredSupport": true
                         },
                         "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
-                        "inlayHint": { "dynamicRegistration": false }
+                        "inlayHint": { "dynamicRegistration": false },
+                        "semanticTokens": {
+                            "dynamicRegistration": false,
+                            "requests": { "full": true, "range": false },
+                            "tokenTypes": ["namespace", "type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp", "operator", "decorator"],
+                            "tokenModifiers": ["declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"],
+                            "formats": ["relative"],
+                            "multilineTokenSupport": false,
+                            "overlappingTokenSupport": false
+                        }
                     }
                 }
             }
@@ -575,6 +603,19 @@ impl LspClient {
         self.request("workspace/symbol", json!({ "query": query }), Pending::WorkspaceSymbols)
     }
 
+    /// Does the server provide semantic tokens?
+    pub fn has_semantic_tokens(&self) -> bool {
+        self.shared.lock().is_ok_and(|s| s.legend.is_some())
+    }
+
+    pub fn semantic_tokens(&mut self, path: &Path) -> u64 {
+        self.request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": text::path_to_uri(path) } }),
+            Pending::SemanticTokens,
+        )
+    }
+
     /// Inlay hints for lines `start..=end` of a document (`end` must exist).
     pub fn inlay_hints(&mut self, path: &Path, start: u32, end: u32) -> u64 {
         self.request(
@@ -683,10 +724,20 @@ fn handle_message(
                         .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
                         .unwrap_or_default();
                     write_now(stdin, &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }));
+                    let legend = &result["capabilities"]["semanticTokensProvider"]["legend"];
+                    let strings = |v: &Value| -> Vec<String> {
+                        v.as_array()
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                            .unwrap_or_default()
+                    };
+                    let legend = legend
+                        .is_object()
+                        .then(|| (strings(&legend["tokenTypes"]), strings(&legend["tokenModifiers"])));
                     let queued = {
                         let mut sh = shared.lock().unwrap();
                         sh.ready = true;
                         sh.trigger_chars = chars;
+                        sh.legend = legend;
                         std::mem::take(&mut sh.queue)
                     };
                     for m in queued {
@@ -726,6 +777,11 @@ fn handle_message(
                 }
                 Some(Pending::WorkspaceSymbols) => {
                     out.push(LspEvent::WorkspaceSymbols { request: id, symbols: parse_workspace_symbols(&result) });
+                }
+                Some(Pending::SemanticTokens) => {
+                    let legend = shared.lock().ok().and_then(|s| s.legend.clone()).unwrap_or_default();
+                    let tokens = decode_semantic_tokens(&result["data"], &legend.0, &legend.1);
+                    out.push(LspEvent::SemanticTokens { request: id, tokens });
                 }
                 Some(Pending::InlayHints) => {
                     out.push(LspEvent::InlayHints { request: id, hints: parse_inlay_hints(&result) });
@@ -955,6 +1011,35 @@ pub(crate) fn parse_workspace_symbols(v: &Value) -> Vec<Symbol> {
         .collect()
 }
 
+/// Decode the relative `data` array of a semantic tokens result.
+pub(crate) fn decode_semantic_tokens(data: &Value, types: &[String], mods: &[String]) -> Vec<SemanticToken> {
+    let Some(d) = data.as_array() else { return vec![] };
+    let nums: Vec<u32> = d.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect();
+    let (mut line, mut start) = (0u32, 0u32);
+    nums.chunks_exact(5)
+        .map(|c| {
+            if c[0] > 0 {
+                line += c[0];
+                start = c[1];
+            } else {
+                start += c[1];
+            }
+            SemanticToken {
+                line,
+                start,
+                length: c[2],
+                kind: types.get(c[3] as usize).cloned().unwrap_or_default(),
+                modifiers: mods
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| c[4] & (1 << i) != 0)
+                    .map(|(_, m)| m.clone())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn parse_inlay_hints(v: &Value) -> Vec<InlayHint> {
     let Some(list) = v.as_array() else { return vec![] };
     let mut out: Vec<InlayHint> = list
@@ -1017,6 +1102,20 @@ pub fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_semantic_tokens() {
+        let types: Vec<String> = ["function", "variable", "macro"].map(String::from).to_vec();
+        let mods: Vec<String> = ["declaration", "mutable"].map(String::from).to_vec();
+        // line 0 col 3 len 4 function+declaration; same line col 10 len 1 variable+mutable; line 2 col 4 macro.
+        let t = decode_semantic_tokens(&json!([0, 3, 4, 0, 1, 0, 7, 1, 1, 2, 2, 4, 6, 2, 0]), &types, &mods);
+        assert_eq!(t.len(), 3);
+        assert_eq!((t[0].line, t[0].start, t[0].length, t[0].kind.as_str()), (0, 3, 4, "function"));
+        assert_eq!(t[0].modifiers, vec!["declaration".to_string()]);
+        assert_eq!((t[1].line, t[1].start, t[1].kind.as_str()), (0, 10, "variable"));
+        assert_eq!(t[1].modifiers, vec!["mutable".to_string()]);
+        assert_eq!((t[2].line, t[2].start, t[2].length, t[2].kind.as_str()), (2, 4, 6, "macro"));
+    }
 
     #[test]
     fn inlay_hints_and_workspace_symbols() {

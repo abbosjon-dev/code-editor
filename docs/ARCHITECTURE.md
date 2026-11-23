@@ -44,7 +44,7 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] LSP: rename, find references, formatting / format on save
 - [x] LSP: signature help, code actions (quick fix), document symbols
 - [x] LSP: inlay hints, workspace symbols
-- [ ] LSP: semantic tokens
+- [x] LSP: semantic tokens
 - [x] Git: yonma-yon diff ko'rinishi, branch almashtirish
 - [x] Git: hunk'ni qaytarish (gutter), inline blame
 - [x] Git: stash, merge konfliktlarini hal qilish UI

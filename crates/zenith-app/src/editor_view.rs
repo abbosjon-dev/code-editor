@@ -12,6 +12,7 @@ use zenith_lsp::Severity;
 
 use crate::conflicts::Resolution;
 use crate::document::Document;
+use crate::highlight::Span;
 use crate::settings::Settings;
 use crate::theme::{Palette, MONO_BOLD, MONO_ITALIC};
 
@@ -97,6 +98,29 @@ fn line_vcols(doc: &Document, line: usize, chars: &[char], tab: usize) -> Vec<us
         out.push(v);
         if let Some(&c) = chars.get(i) {
             v += if c == '\t' { tab - v % tab } else { c.width().unwrap_or(1).max(1) };
+        }
+    }
+    out
+}
+
+/// Syntax spans with semantic token colors laid over them.
+fn overlay_semantic(base: &[Span], sem: &[crate::document::SemSpan], len: usize, default: Color32) -> Vec<Span> {
+    let mut styles: Vec<(Color32, bool, bool)> = vec![(default, false, false); len];
+    for sp in base {
+        for st in styles.iter_mut().take(sp.end.min(len)).skip(sp.start) {
+            *st = (sp.color, sp.bold, sp.italic);
+        }
+    }
+    for t in sem {
+        for st in styles.iter_mut().take(t.end.min(len)).skip(t.start) {
+            *st = (t.color, t.bold, t.italic);
+        }
+    }
+    let mut out: Vec<Span> = vec![];
+    for (i, (color, bold, italic)) in styles.into_iter().enumerate() {
+        match out.last_mut() {
+            Some(s) if s.color == color && s.bold == bold && s.italic == italic => s.end = i + 1,
+            _ => out.push(Span { start: i, end: i + 1, color, bold, italic }),
         }
     }
     out
@@ -601,6 +625,12 @@ pub fn editor_ui(
 
                     // Text (in pieces between inlay hints, which take their own room).
                     let hints = doc.hints_on(line);
+                    let sem = doc.semantic_on(line);
+                    let merged: Option<Vec<Span>> = if sem.is_empty() {
+                        None
+                    } else {
+                        doc.highlight.line(line).map(|base| overlay_semantic(base, sem, chars.len(), p.text))
+                    };
                     if seg_e > seg_s {
                         let mut cuts: Vec<usize> =
                             hints.iter().map(|h| h.col).filter(|&c| c > seg_s && c < seg_e).collect();
@@ -608,7 +638,8 @@ pub fn editor_ui(
                         let mut a = seg_s;
                         for b in cuts.into_iter().chain([seg_e]) {
                             if b > a {
-                                let spans = doc.highlight.line(line).map(|sp| slice_spans(sp, a, b));
+                                let base = merged.as_deref().or_else(|| doc.highlight.line(line));
+                                let spans = base.map(|sp| slice_spans(sp, a, b));
                                 let job = layout_line(&chars[a..b], spans.as_deref(), &m, p);
                                 let galley = ui.fonts(|f| f.layout_job(job));
                                 painter.galley(egui::pos2(x_of(a), y + (m.line_h - m.row_h) / 2.0), galley, p.text);

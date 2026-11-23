@@ -165,6 +165,18 @@ impl HighlightCache {
         self.ts.as_ref().filter(|_| self.ts_active).map(|t| t.lang_name())
     }
 
+    /// Style of a TextMate scope in the current theme (None = default text).
+    pub fn scope_style(&self, scope: &str) -> Option<(Color32, bool, bool)> {
+        let hl = Highlighter::new(&self.theme);
+        let s = hl.style_for_stack(ScopeStack::from_vec(vec![syntect::parsing::Scope::new(scope).ok()?]).as_slice());
+        let default = self.theme.settings.foreground.map(to_color);
+        let color = to_color(s.foreground);
+        if Some(color) == default && s.font_style.is_empty() {
+            return None;
+        }
+        Some((color, s.font_style.contains(FontStyle::BOLD), s.font_style.contains(FontStyle::ITALIC)))
+    }
+
     /// Shifted fold ranges are in use; they'll be recomputed after a pause.
     pub fn folds_pending(&self) -> bool {
         self.ts.as_ref().is_some_and(|t| self.ts_active && t.folds_pending())

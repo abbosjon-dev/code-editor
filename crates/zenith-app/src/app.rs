@@ -686,6 +686,9 @@ impl ZenithApp {
         self.syntax_theme = highlight::load_theme(&name);
         for d in &mut self.docs {
             d.highlight.set_theme(self.syntax_theme.clone());
+            // Semantic colors come from the theme too: fetch them again.
+            d.semantic.clear();
+            d.semantic_version = None;
         }
         self.settings.syntax_theme = name;
     }
@@ -1942,11 +1945,19 @@ impl ZenithApp {
     fn handle_lsp(&mut self) {
         let roots: Vec<Option<PathBuf>> = self.docs.iter().map(|d| self.root_of(d.path())).collect();
         self.lsp.inlay_hints = self.settings.inlay_hints;
+        if self.lsp.semantic != self.settings.semantic_highlighting {
+            self.lsp.semantic = self.settings.semantic_highlighting;
+            for d in &mut self.docs {
+                d.semantic.clear();
+                d.semantic_version = None;
+            }
+        }
         for (i, (doc, root)) in self.docs.iter_mut().zip(roots).enumerate() {
             self.lsp.sync(doc, root.as_deref(), false);
             // Hints only for what's on screen.
             if i == self.active || (self.split && i == self.other) {
                 self.lsp.maybe_request_inlay_hints(doc, root.as_deref());
+                self.lsp.maybe_request_semantic(doc, root.as_deref());
             }
         }
         self.update_workspace_symbols();

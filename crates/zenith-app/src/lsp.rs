@@ -6,6 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use eframe::egui;
 use zenith_lsp::{default_servers, language_id, LspClient, LspEvent, ServerConfig};
 
 use crate::document::{Completion, Document, Hover};
@@ -26,6 +27,8 @@ pub struct LspManager {
     client_roots: HashMap<String, PathBuf>,
     /// Show inlay hints (types, parameter names).
     pub inlay_hints: bool,
+    /// Request semantic tokens.
+    pub semantic: bool,
 }
 
 /// What the app should do with an event that isn't tied to a document.
@@ -96,6 +99,7 @@ impl LspManager {
             wake_at: None,
             client_roots: HashMap::new(),
             inlay_hints: true,
+            semantic: true,
         }
     }
 
@@ -321,6 +325,28 @@ impl LspManager {
         }
     }
 
+    /// Request semantic tokens once the document's text reached the server.
+    pub fn maybe_request_semantic(&mut self, doc: &mut Document, root: Option<&Path>) {
+        if !self.semantic || !doc.lsp_active || doc.semantic_request.is_some() {
+            return;
+        }
+        let v = doc.buffer.version();
+        if doc.lsp_version != Some(v) || doc.semantic_version == Some(v) {
+            return;
+        }
+        if doc.semantic_retry.1.is_some_and(|t| t > Instant::now()) {
+            return;
+        }
+        let Some(path) = doc.path().map(Path::to_path_buf) else { return };
+        if let Some(c) = self.client_for(doc, root) {
+            if c.has_semantic_tokens() {
+                doc.semantic_request = Some((c.semantic_tokens(&path), v));
+            } else {
+                doc.semantic_version = Some(v); // the server doesn't offer them
+            }
+        }
+    }
+
     pub fn request_symbols(&mut self, doc: &mut Document, root: Option<&Path>) -> Option<u64> {
         self.sync(doc, root, true);
         let path = doc.path()?.to_path_buf();
@@ -388,6 +414,50 @@ impl LspManager {
                 LspEvent::WorkspaceSymbols { request, symbols } => {
                     out.push(LspOutcome::WorkspaceSymbols { request, symbols })
                 }
+                LspEvent::SemanticTokens { request, tokens } => {
+                    if let Some(doc) = docs.iter_mut().find(|d| d.semantic_request.is_some_and(|(r, _)| r == request)) {
+                        let (_, v) = doc.semantic_request.take().unwrap_or_default();
+                        if v == doc.buffer.version() {
+                            let empty = tokens.is_empty();
+                            let mut styles: HashMap<String, Option<(egui::Color32, bool, bool)>> = HashMap::new();
+                            let mut line_cache: (usize, String) = (usize::MAX, String::new());
+                            let mut spans = vec![];
+                            for t in &tokens {
+                                let Some(scope) = semantic_scope(&t.kind, &t.modifiers) else { continue };
+                                let style = *styles
+                                    .entry(scope.to_string())
+                                    .or_insert_with(|| doc.highlight.scope_style(scope));
+                                let Some((color, bold, italic)) = style else { continue };
+                                let line = t.line as usize;
+                                if line_cache.0 != line {
+                                    line_cache = (line, doc.buffer.line_text(line));
+                                }
+                                let text = &line_cache.1;
+                                let start = zenith_lsp::text::utf16_to_char_col(text, t.start);
+                                let end = zenith_lsp::text::utf16_to_char_col(text, t.start + t.length);
+                                if end > start {
+                                    spans.push(crate::document::SemSpan { line, start, end, color, bold, italic });
+                                }
+                            }
+                            spans.sort_by_key(|s| (s.line, s.start));
+                            doc.semantic = spans;
+                            doc.semantic_version = Some(v);
+                            if empty && doc.semantic_retry.0 < 8 {
+                                doc.semantic_retry.0 += 1;
+                                let wait = Duration::from_millis(800 * doc.semantic_retry.0 as u64);
+                                doc.semantic_retry.1 = Some(Instant::now() + wait);
+                                doc.semantic_version = None;
+                                let waker = self.waker.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(wait + Duration::from_millis(10));
+                                    waker();
+                                });
+                            } else if !empty {
+                                doc.semantic_retry = (0, None);
+                            }
+                        }
+                    }
+                }
                 LspEvent::InlayHints { request, hints } => {
                     if let Some(doc) = docs.iter_mut().find(|d| d.inlay_request.is_some_and(|(r, _)| r == request)) {
                         let (_, v) = doc.inlay_request.take().unwrap_or_default();
@@ -449,6 +519,8 @@ impl LspManager {
                         for d in docs.iter_mut() {
                             d.inlay_version = None;
                             d.inlay_retry = (0, None);
+                            d.semantic_version = None;
+                            d.semantic_retry = (0, None);
                         }
                     }
                 },
@@ -488,4 +560,35 @@ impl LspManager {
         }
         self.progress.clear();
     }
+}
+
+/// TextMate scope for a semantic token (None = keep the syntax colors).
+pub fn semantic_scope(kind: &str, modifiers: &[String]) -> Option<&'static str> {
+    let has = |m: &str| modifiers.iter().any(|x| x == m);
+    Some(match kind {
+        "namespace" => "entity.name.namespace",
+        "type" | "class" | "struct" | "enum" | "interface" | "typeAlias" | "union" | "trait" | "typeParameter" => {
+            "entity.name.type"
+        }
+        "builtinType" => "storage.type",
+        "parameter" => "variable.parameter",
+        "property" => "variable.other.member",
+        "enumMember" => "constant.other",
+        "function" | "method" if has("defaultLibrary") => "support.function",
+        "function" | "method" => "entity.name.function",
+        "macro" => "entity.name.function.macro",
+        "keyword" => "keyword.control",
+        "selfKeyword" | "selfTypeKeyword" => "variable.language",
+        "boolean" => "constant.language",
+        "comment" => "comment.line",
+        "string" => "string.quoted",
+        "number" => "constant.numeric",
+        "operator" => "keyword.operator",
+        "decorator" | "attribute" | "builtinAttribute" => "entity.other.attribute-name",
+        "lifetime" => "storage.modifier.lifetime",
+        "label" => "entity.name.label",
+        "escapeSequence" | "formatSpecifier" => "constant.character.escape",
+        "variable" if has("readonly") || has("constant") || has("static") => "constant.other",
+        _ => return None,
+    })
 }
