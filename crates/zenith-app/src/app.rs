@@ -37,6 +37,7 @@ enum SidebarView {
     Agents,
     Plugins,
     Debug,
+    Tests,
     /// A plugin's panel (index into `PluginHost::panels()`).
     PluginPanel(usize),
 }
@@ -169,6 +170,8 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Test explorer.
+    tests: crate::testing::Panel,
     /// MCP servers section (workspace `.mcp.json`).
     mcp: crate::mcp_ui::McpPanel,
     /// Update check in flight (manual = report every result), and a newer release.
@@ -284,6 +287,7 @@ impl ZenithApp {
             update_rx: None,
             update_available: None,
             mcp: Default::default(),
+            tests: Default::default(),
             announced_editor: None,
             changes_refreshed: None,
             scm_repo: 0,
@@ -787,6 +791,7 @@ impl ZenithApp {
             SidebarView::Agents => "agents".into(),
             SidebarView::Plugins => "plugins".into(),
             SidebarView::Debug => "debug".into(),
+            SidebarView::Tests => "tests".into(),
             SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
                 Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
                 None => "explorer".into(),
@@ -860,6 +865,7 @@ impl ZenithApp {
             "agents" => SidebarView::Agents,
             "plugins" => SidebarView::Plugins,
             "debug" => SidebarView::Debug,
+            "tests" => SidebarView::Tests,
             other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
                 Some((plugin, panel)) => self
                     .plugins
@@ -1619,6 +1625,48 @@ impl ZenithApp {
             }
             Cmd::About => self.dialog = Some(Dialog::About),
             Cmd::CheckForUpdates => self.start_update_check(true),
+            Cmd::ShowTests => {
+                self.sidebar = SidebarView::Tests;
+                self.show_sidebar = true;
+            }
+            Cmd::RunAllTests => {
+                self.sidebar = SidebarView::Tests;
+                self.show_sidebar = true;
+                let root = self.workspace.clone();
+                self.tests.ensure_discovered(root.as_deref(), self.waker.clone());
+                if !self.tests.items.is_empty() {
+                    self.tests.run(None, self.waker.clone());
+                }
+            }
+            Cmd::RunTestAtCursor => {
+                // The function the caret is in: the nearest `fn name(` / `def name(` above.
+                let name = self.docs.get(self.active).and_then(|d| {
+                    let line = d.buffer.cursor_pos().line;
+                    (0..=line).rev().find_map(|l| {
+                        let t = d.buffer.line_text(l);
+                        let t = t.trim_start();
+                        let rest = t
+                            .strip_prefix("fn ")
+                            .or_else(|| t.split_once(" fn ").map(|(_, r)| r))
+                            .or_else(|| t.strip_prefix("def "))
+                            .or_else(|| t.strip_prefix("async def "))?;
+                        let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                        (!n.is_empty()).then_some(n)
+                    })
+                });
+                self.sidebar = SidebarView::Tests;
+                self.show_sidebar = true;
+                let ids = name.as_deref().map(|n| self.tests.ids_named(n)).unwrap_or_default();
+                if ids.is_empty() {
+                    let msg = match name {
+                        Some(n) => format!("No test named `{n}` (discover tests with ⟳ first)"),
+                        None => "Put the caret inside a test function".into(),
+                    };
+                    self.toast(msg, NotifyLevel::Info);
+                } else {
+                    self.tests.run(Some(ids), self.waker.clone());
+                }
+            }
             Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -2921,6 +2969,7 @@ impl ZenithApp {
                 (SidebarView::Git, "⎇", "Source Control (Ctrl+Shift+G)"),
                 (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
                 (SidebarView::Debug, "▷", "Run and Debug (Ctrl+Shift+D)"),
+                (SidebarView::Tests, "✓", "Testing"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
             ]
@@ -3069,6 +3118,17 @@ impl ZenithApp {
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
             SidebarView::Debug => self.debug_ui(ui, &p),
+            SidebarView::Tests => {
+                let root = self.workspace.clone();
+                let waker = self.waker.clone();
+                if let Some(crate::testing::Action::Open(path, line)) = self.tests.ui(ui, &p, root.as_deref(), waker) {
+                    if self.open_file(&path) {
+                        if let Some(doc) = self.docs.get_mut(self.active) {
+                            doc.goto_line(line);
+                        }
+                    }
+                }
+            }
             SidebarView::PluginPanel(i) => self.plugin_panel_ui(ui, &p, i),
             SidebarView::Git => self.git_ui(ctx, ui, &p),
             SidebarView::Problems => self.problems_ui(ui, &p),
@@ -5641,6 +5701,9 @@ impl eframe::App for ZenithApp {
         }
         self.handle_debugger();
         self.poll_update_check();
+        if self.tests.poll() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         let active_path = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
         if active_path != self.announced_editor {
             self.announced_editor = active_path.clone();

@@ -129,6 +129,16 @@ languages = ["python"]
 
 ![Inlay hints](docs/inlay-hints.png)
 
+## Testlar
+
+**Testing** paneli (✓ belgisi) loyihadagi testlarni topadi: **Rust** (`cargo test` — lib, bin va `tests/`
+integratsion testlari) va **Python** (`pytest`). Hammasini, bitta guruhni yoki bitta testni ishga tushirish,
+holat belgilari (✓ o'tdi, ✕ yiqildi, ○ o'tkazib yuborildi), yiqilgan testning chiqishi, faqat yiqilganlarni qayta
+ishga tushirish (↻ Failed), filtr. Testni ikki marta bossangiz — kodi ochiladi. *Test: Run Test at Cursor* —
+kursor turgan test funksiyasini ishga tushiradi.
+
+![Testing](docs/testing.png)
+
 ## Debugger
 
 **Run and Debug** paneli (`Ctrl+Shift+D`, ▷ belgisi) Debug Adapter Protocol orqali ishlaydi:

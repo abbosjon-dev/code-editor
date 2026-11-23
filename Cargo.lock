@@ -4955,6 +4955,7 @@ dependencies = [
  "tree-sitter-typescript",
  "two-face",
  "unicode-width 0.2.3",
+ "which",
  "winresource",
  "zenith-ai",
  "zenith-core",

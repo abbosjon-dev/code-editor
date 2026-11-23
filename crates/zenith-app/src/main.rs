@@ -23,6 +23,7 @@ mod sample_plugin;
 mod settings;
 mod settings_ui;
 mod terminal_view;
+mod testing;
 mod theme;
 mod treesitter;
 mod update;
