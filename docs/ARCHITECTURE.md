@@ -40,7 +40,7 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 **v0.2 (hozirgi)** — ✅ LSP: avtomatik to'ldirish, diagnostika, hover, ta'rifga o'tish. ✅ Git: gutter belgilari, Source Control paneli, AI commit. ✅ Multi-cursor. ✅ Split editor. ✅ AI o'zgarishlarini diff bilan ko'rib chiqish va qaytarish.
 
 **v0.2**
-- [ ] Ustun bo'yicha (blok) belgilash: Shift+Alt+sudrash
+- [x] Ustun bo'yicha (blok) belgilash: Shift+Alt+sudrash
 - [x] LSP: rename, find references, formatting / format on save
 - [x] LSP: signature help, code actions (quick fix), document symbols
 - [x] LSP: inlay hints, workspace symbols

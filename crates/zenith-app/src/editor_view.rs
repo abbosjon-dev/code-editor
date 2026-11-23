@@ -126,6 +126,35 @@ fn overlay_semantic(base: &[Span], sem: &[crate::document::SemSpan], len: usize,
     out
 }
 
+/// Column (block) selection: one selection per line between `from` and `to`,
+/// spanning the same visual columns on each line (short lines get a cursor at
+/// their end). The line the pointer is on holds the primary selection.
+fn block_select(doc: &mut Document, from: (usize, f32), to: (usize, f32), tab: usize) {
+    let col_at = |doc: &Document, line: usize, target: f32| -> usize {
+        let chars = line_chars(doc, line);
+        let vc = line_vcols(doc, line, &chars, tab);
+        (0..chars.len()).find(|&i| target < (vc[i] + vc[i + 1]) as f32 / 2.0).unwrap_or(chars.len())
+    };
+    let (l0, l1) = (from.0.min(to.0), from.0.max(to.0));
+    let map = doc.fold_map();
+    let mut sels: Vec<Selection> = (l0..=l1.min(doc.buffer.len_lines().saturating_sub(1)))
+        .filter(|&l| !map.is_hidden(l))
+        .map(|line| {
+            let a = doc.buffer.pos_to_char(Position::new(line, col_at(doc, line, from.1)));
+            let h = doc.buffer.pos_to_char(Position::new(line, col_at(doc, line, to.1)));
+            Selection::new(a, h)
+        })
+        .collect();
+    if sels.is_empty() {
+        return;
+    }
+    // Primary first: the selection on the pointer's line.
+    if to.0 > from.0 {
+        sels.rotate_right(1);
+    }
+    doc.buffer.set_selections(sels);
+}
+
 fn line_chars(doc: &Document, line: usize) -> Vec<char> {
     let rope = doc.buffer.rope();
     if line >= rope.len_lines() {
@@ -277,6 +306,13 @@ pub fn editor_ui(
                         }
                         doc.buffer.pos_to_char(Position::new(line, col))
                     };
+                    // Line and visual column under the pointer (for column selection).
+                    let vhit = |pos: Pos2| -> (usize, f32) {
+                        let row = (((pos.y - rect.min.y) / m.line_h).floor().max(0.0) as usize)
+                            .min(total_rows.saturating_sub(1));
+                        ((fm.line_at(row)), ((pos.x - text_x) / m.char_w).max(0.0))
+                    };
+                    let block_key = id.with("block-anchor");
                     let shift = ui.input(|i| i.modifiers.shift);
                     let alt_held = ui.input(|i| i.modifiers.alt);
                     if resp.triple_clicked() && !alt_held {
@@ -289,7 +325,13 @@ pub fn editor_ui(
                         let idx = hit(doc, pos);
                         doc.completion = None;
                         let alt = ui.input(|i| i.modifiers.alt);
-                        if alt && !in_gutter {
+                        ui.data_mut(|d| d.remove::<(usize, f32)>(block_key));
+                        if alt && shift && !in_gutter {
+                            // Column selection starts here (Shift+Alt+drag).
+                            let start = vhit(pos);
+                            ui.data_mut(|d| d.insert_temp(block_key, start));
+                            block_select(doc, start, start, m.tab);
+                        } else if alt && !in_gutter {
                             doc.buffer.add_selection(Selection::cursor(idx));
                         } else if ui.input(|i| i.modifiers.command) && !in_gutter {
                             doc.buffer.set_cursor(idx, false);
@@ -326,6 +368,13 @@ pub fn editor_ui(
                             doc.buffer.set_cursor(idx, shift);
                         }
                         ui.memory_mut(|mem| mem.request_focus(id));
+                    } else if let Some(start) = resp
+                        .dragged_by(egui::PointerButton::Primary)
+                        .then(|| ui.data(|d| d.get_temp::<(usize, f32)>(block_key)))
+                        .flatten()
+                    {
+                        block_select(doc, start, vhit(pos), m.tab);
+                        doc.scroll_to_cursor = true;
                     } else if resp.dragged_by(egui::PointerButton::Primary) {
                         let idx = hit(doc, pos);
                         if in_gutter {
