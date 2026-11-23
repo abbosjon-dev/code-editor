@@ -143,6 +143,16 @@ hisoblanadigan ifodalar; to'xtab turganda o'zgaruvchi ustiga sichqonchani olib b
 
 ![Debugger](docs/debugger.png)
 
+## MCP serverlari
+
+AI Agents panelidagi **MCP SERVERS** bo'limi ish maydonidagi `.mcp.json` faylini tahrirlaydi (Claude Code va
+boshqa agentlar MCP serverlarini shu yerdan o'qiydi): qo'shish (tayyor variantlar: filesystem, fetch, git, memory),
+tahrirlash, o'chirish. Mahalliy (stdio) yoki masofaviy (HTTP URL) serverlar; muhit o'zgaruvchilari. **Test** —
+serverni ishga tushirib, `initialize` + `tools/list` bilan uning vositalarini ko'rsatadi. Ixtiyoriy ravishda
+Gemini CLI uchun `.gemini/settings.json` ga ham yoziladi. Fayldagi boshqa sozlamalar saqlanib qoladi.
+
+![MCP serverlari](docs/mcp.png)
+
 ## AI agent o'zgarishlarini ko'rib chiqish
 
 Agent ishga tushganda Zenith ish maydonining "checkpoint"ini oladi (Git'ning vaqtinchalik indeksi orqali — sizning

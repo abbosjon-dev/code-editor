@@ -57,10 +57,10 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 **v0.3**
 - [x] Kod bloklarini yig'ish (chekinish asosida, barcha tillar uchun)
 - [x] Tree-sitter asosida ranglash va sintaktik folding (11 til)
-- [ ] MCP serverlarini sozlash UI
+- [x] MCP serverlarini sozlash UI (.mcp.json, test)
 - [ ] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
 - [x] Plugin yon panellari (`[[panels]]`, `set_panel`)
-- [ ] Plugin UI kengaytmalari: status bar elementlari
+- [x] Plugin UI kengaytmalari: status bar elementlari
 
 **v1.0**
 - [ ] Plugin marketplace / registry

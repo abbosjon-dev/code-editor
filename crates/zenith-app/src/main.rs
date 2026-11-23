@@ -15,6 +15,7 @@ mod git;
 mod highlight;
 mod keymap;
 mod lsp;
+mod mcp_ui;
 mod mention;
 mod palette;
 mod review;

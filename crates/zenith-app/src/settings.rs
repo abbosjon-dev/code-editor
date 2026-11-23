@@ -41,6 +41,8 @@ pub struct Settings {
     pub default_agent: String,
     /// Extra / overridden AI agents.
     pub agents: Vec<AgentProfile>,
+    /// Mirror the workspace's MCP servers into `.gemini/settings.json`.
+    pub mcp_write_gemini: bool,
     /// Language Server Protocol support (completion, diagnostics, go to definition).
     pub lsp_enabled: bool,
     /// Keep the previous version when a file changes on disk (e.g. edited by an AI agent) so it can be reviewed and reverted.
@@ -78,6 +80,7 @@ impl Default for Settings {
             shell: String::new(),
             default_agent: "claude".into(),
             agents: vec![],
+            mcp_write_gemini: false,
             lsp_enabled: true,
             review_external_changes: true,
             format_on_save: false,

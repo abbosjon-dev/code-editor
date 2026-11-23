@@ -169,6 +169,8 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// MCP servers section (workspace `.mcp.json`).
+    mcp: crate::mcp_ui::McpPanel,
     /// Plugin status bar items keyed by (plugin, item id).
     status_items: std::collections::BTreeMap<(String, String), StatusItem>,
     /// Active document path last announced to plugins.
@@ -276,6 +278,7 @@ impl ZenithApp {
             bp_store: Default::default(),
             ws_symbols: Default::default(),
             status_items: Default::default(),
+            mcp: Default::default(),
             announced_editor: None,
             changes_refreshed: None,
             scm_repo: 0,
@@ -383,6 +386,7 @@ impl ZenithApp {
         self.extra_trees.clear();
         self.extra_index.clear();
         self.extra_gits.clear();
+        self.mcp.reset();
         self.scm_repo = 0;
         self.session.recent_workspaces.retain(|p| p != &path);
         self.session.recent_workspaces.insert(0, path.clone());
@@ -3316,6 +3320,8 @@ impl ZenithApp {
         ui.add_space(8.0);
         let mut launch = None;
         let mut install = None;
+        let mut mcp_settings_changed = false;
+        let mut mcp_message: Option<String> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for a in &self.agents {
                 let ok = self.installed.get(&a.id).copied().unwrap_or(false);
@@ -3372,6 +3378,12 @@ impl ZenithApp {
                 }
             });
             ui.add_space(10.0);
+            match self.mcp.ui(ui, p, self.workspace.as_deref(), &mut self.settings.mcp_write_gemini) {
+                Some(m) if m.is_empty() => mcp_settings_changed = true,
+                Some(m) => mcp_message = Some(m),
+                None => {}
+            }
+            ui.add_space(10.0);
             Self::section_header(ui, p, "QUICK ACTIONS");
             for (label, cmd) in [
                 ("Ask about selection…", Cmd::AskAgent),
@@ -3385,6 +3397,12 @@ impl ZenithApp {
         });
         if let Some(id) = launch {
             self.launch_agent(&id);
+        }
+        if mcp_settings_changed {
+            self.write_settings();
+        }
+        if let Some(m) = mcp_message {
+            self.toast(m, NotifyLevel::Info);
         }
         if let Some(cmd) = install {
             self.run_in_terminal(&cmd);

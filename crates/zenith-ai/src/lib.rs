@@ -5,6 +5,8 @@
 //! terminal, rooted at the open workspace, and gives you shortcuts to send
 //! the current file / selection to them. Any CLI can be added via settings.
 
+pub mod mcp;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
