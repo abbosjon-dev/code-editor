@@ -63,7 +63,7 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] Plugin UI kengaytmalari: status bar elementlari
 
 **v1.0**
-- [ ] Plugin marketplace / registry
+- [x] Plugin marketplace / registry (`registry/plugins.json`, Git'dan o'rnatish)
 - [x] Paketlar: .dmg (macOS), .zip (Windows), .deb va .tar.gz (Linux)
 - [x] .msi (WiX), AppImage, kod imzosi va notarizatsiya (secret'lar bo'lsa), yangilanishni tekshirish
 - [x] Yangilanishni yuklab olib o'rnatish (SHA-256 tekshiruvi bilan, foydalanuvchi so'raganda)

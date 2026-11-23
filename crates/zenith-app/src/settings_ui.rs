@@ -230,6 +230,15 @@ fn ai(ui: &mut egui::Ui, s: &mut Settings, agents: &[AgentProfile], c: &mut Chan
 }
 
 fn advanced(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
+    row_label(ui, "Plugin marketplace", "Index of installable plugins (URL or file; empty = official)");
+    c.any |= ui
+        .add(
+            egui::TextEdit::singleline(&mut s.plugin_registry)
+                .hint_text(crate::marketplace::DEFAULT_REGISTRY)
+                .desired_width(300.0),
+        )
+        .changed();
+    ui.end_row();
     row_label(ui, "Settings Sync", "Git repository for settings, shortcuts and plugins");
     ui.vertical(|ui| {
         c.any |= ui

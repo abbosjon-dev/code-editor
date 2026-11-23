@@ -153,3 +153,32 @@ Plugin status qatoriga o'z elementini qo'yishi mumkin (masalan, so'zlar soni, bu
 
 `active_editor_changed` hodisasi (`{"path": ...}`) aktiv fayl almashganda keladi. Misol:
 [`plugins/examples/text-tools`](../plugins/examples/text-tools/main.py).
+
+## Marketplace: pluginni e'lon qilish
+
+Plugins panelidagi **MARKETPLACE** bo'limi plugin indeksini o'qiydi — standart holatda shu repodagi
+[`registry/plugins.json`](../registry/plugins.json). **Install** pluginni Git repo'dan klonlaydi (plugin katta repo
+ichidagi papka bo'lsa — faqat o'sha papka, sparse checkout bilan) va `plugins/<id>/` ga qo'yadi; indeksdagi versiya
+o'rnatilgandan yangi bo'lsa **Update** chiqadi; **Uninstall** papkani o'chiradi.
+
+O'z pluginingizni qo'shish uchun `registry/plugins.json` ga yozuv qo'shib pull request oching:
+
+```json
+{
+  "id": "my-plugin",
+  "name": "My Plugin",
+  "version": "0.1.0",
+  "description": "Bir qatorda nima qilishi.",
+  "author": "Ismingiz",
+  "repository": "https://github.com/you/my-plugin.git",
+  "path": "",
+  "rev": "v0.1.0",
+  "tags": ["git", "ai"]
+}
+```
+
+- `id` — `plugin.toml` dagi `id` bilan bir xil bo'lishi shart (aks holda o'rnatish rad etiladi).
+- `path` — plugin repo ichidagi papkada bo'lsa (bo'sh = repo ildizi).
+- `rev` — o'rnatiladigan tag yoki branch (bo'sh = asosiy branch). Yangi versiya chiqarganda `version` va `rev` ni yangilang.
+
+Kompaniya ichidagi o'z indeksingiz: Sozlamalar → Advanced → **Plugin marketplace** — URL yoki fayl yo'li.

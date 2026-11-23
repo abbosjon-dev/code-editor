@@ -1,0 +1,24 @@
+{
+  "plugins": [
+    {
+      "id": "todo-tree",
+      "name": "TODO Tree",
+      "version": "0.1.0",
+      "description": "Sidebar panel listing TODO / FIXME / HACK comments in the workspace; ask the AI agent to resolve them.",
+      "author": "Zenith",
+      "repository": "https://github.com/abbosjon-dev/code-editor.git",
+      "path": "plugins/examples/todo-tree",
+      "tags": ["productivity", "ai"]
+    },
+    {
+      "id": "text-tools",
+      "name": "Text Tools",
+      "version": "0.1.0",
+      "description": "Word count, sort lines, UPPER / lower case, ask AI to document the selected code.",
+      "author": "Zenith",
+      "repository": "https://github.com/abbosjon-dev/code-editor.git",
+      "path": "plugins/examples/text-tools",
+      "tags": ["text", "ai"]
+    }
+  ]
+}

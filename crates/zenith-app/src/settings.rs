@@ -41,6 +41,8 @@ pub struct Settings {
     pub sync_repo: String,
     /// Pull synced settings when Zenith starts.
     pub sync_on_startup: bool,
+    /// Plugin marketplace index (URL or file; empty = the official one).
+    pub plugin_registry: String,
     pub auto_save: bool,
     pub format_trim_trailing_whitespace: bool,
     /// Custom shell for new terminals (empty = system default).
@@ -86,6 +88,7 @@ impl Default for Settings {
             tree_sitter: true,
             check_for_updates: true,
             sync_repo: String::new(),
+            plugin_registry: String::new(),
             sync_on_startup: false,
             auto_save: false,
             format_trim_trailing_whitespace: false,

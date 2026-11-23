@@ -200,6 +200,7 @@ pub struct ZenithApp {
     sync_rx: Option<std::sync::mpsc::Receiver<crate::sync_ui::SyncResult>>,
     /// Test explorer.
     tests: crate::testing::Panel,
+    market: crate::marketplace::Market,
     /// MCP servers section (workspace `.mcp.json`).
     mcp: crate::mcp_ui::McpPanel,
     /// Update check in flight (manual = report every result), and a newer release.
@@ -316,6 +317,7 @@ impl ZenithApp {
             update_available: None,
             mcp: Default::default(),
             tests: Default::default(),
+            market: Default::default(),
             sync_rx: None,
             remote: None,
             remote_connecting: None,
@@ -3616,6 +3618,7 @@ impl ZenithApp {
         let mut toggle = None;
         let mut exec = None;
         let mut install_server: Option<String> = None;
+        let mut market_act: Option<MarketAct> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, pl) in self.plugins.plugins.iter_mut().enumerate() {
                 let running = pl.is_running();
@@ -3654,6 +3657,8 @@ impl ZenithApp {
                 ui.add_space(6.0);
             }
             ui.add_space(8.0);
+            market_ui(&mut self.market, ui, p, &self.settings.plugin_registry, &mut market_act, self.waker.clone());
+            ui.add_space(8.0);
             Self::section_header(ui, p, "LANGUAGE SERVERS");
             let running = self.lsp.running();
             for cfg in self.lsp.configs() {
@@ -3679,6 +3684,25 @@ impl ZenithApp {
                 });
             }
         });
+        match market_act {
+            Some(MarketAct::Install(e)) => {
+                // Updating: stop the running copy first (Windows can't replace a folder in use).
+                if crate::marketplace::installed_version(&settings::plugins_dir(), &e.id).is_some() {
+                    self.plugins.shutdown();
+                }
+                self.market.install(e, settings::plugins_dir(), self.waker.clone());
+            }
+            Some(MarketAct::Uninstall(id)) => {
+                // Stop it before its folder goes away.
+                self.plugins.shutdown();
+                match crate::marketplace::uninstall(&id, &settings::plugins_dir()) {
+                    Ok(msg) => self.toast(msg, NotifyLevel::Info),
+                    Err(e) => self.toast(e, NotifyLevel::Error),
+                }
+                self.load_plugins();
+            }
+            None => {}
+        }
         if let Some(cmd) = install_server {
             self.run_in_terminal(&cmd);
             self.toast("Installing in terminal — then run “Language Servers: Restart”.", NotifyLevel::Info);
@@ -6106,6 +6130,18 @@ impl eframe::App for ZenithApp {
         self.handle_debugger();
         self.poll_update_check();
         self.poll_remote(ctx);
+        for o in self.market.poll() {
+            match o {
+                crate::marketplace::Outcome::Reload(msg) => {
+                    self.load_plugins();
+                    self.toast(msg, NotifyLevel::Info);
+                }
+                crate::marketplace::Outcome::Error(e) => {
+                    self.load_plugins();
+                    self.toast(e, NotifyLevel::Error);
+                }
+            }
+        }
         self.poll_update_install(ctx);
         self.poll_sync();
         if self.tests.poll() {
@@ -6269,4 +6305,97 @@ fn same_chord(a: Modifiers, b: Modifiers) -> bool {
         }
     };
     norm(a) == norm(b)
+}
+
+enum MarketAct {
+    Install(crate::marketplace::Entry),
+    Uninstall(String),
+}
+
+/// The MARKETPLACE section of the Plugins view.
+fn market_ui(
+    m: &mut crate::marketplace::Market,
+    ui: &mut egui::Ui,
+    p: &Palette,
+    registry: &str,
+    act: &mut Option<MarketAct>,
+    waker: Arc<dyn Fn() + Send + Sync>,
+) {
+    let url = if registry.trim().is_empty() { crate::marketplace::DEFAULT_REGISTRY } else { registry.trim() };
+    m.load(url, false, waker.clone());
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("MARKETPLACE").size(11.0).color(p.text_dim).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if m.loading() {
+                ui.spinner();
+            } else if ui.small_button("⟳").on_hover_text("Reload the plugin index").clicked() {
+                m.load(url, true, waker.clone());
+            }
+        });
+    });
+    ui.add(egui::TextEdit::singleline(&mut m.search).hint_text("Search plugins").desired_width(f32::INFINITY));
+    if let Some(e) = &m.error {
+        ui.label(RichText::new(e).small().color(p.error));
+    }
+    let dir = settings::plugins_dir();
+    let visible: Vec<crate::marketplace::Entry> = m.visible().into_iter().cloned().collect();
+    if visible.is_empty() && !m.loading() && m.error.is_none() {
+        ui.label(RichText::new("No plugins found.").small().color(p.text_dim));
+    }
+    for e in visible {
+        let installed = crate::marketplace::installed_version(&dir, &e.id);
+        let busy = m.busy_with(&e.id);
+        egui::Frame::new()
+            .fill(p.bg_elevated)
+            .corner_radius(8)
+            .inner_margin(10)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&e.name).strong());
+                    ui.label(RichText::new(&e.version).small().color(p.text_dim));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if busy {
+                            ui.spinner();
+                            return;
+                        }
+                        match &installed {
+                            None => {
+                                if ui.button(RichText::new("Install").color(p.accent)).clicked() {
+                                    *act = Some(MarketAct::Install(e.clone()));
+                                }
+                            }
+                            Some(v) => {
+                                if ui.small_button("Uninstall").clicked() {
+                                    *act = Some(MarketAct::Uninstall(e.id.clone()));
+                                }
+                                if crate::marketplace::is_newer(&e.version, v) {
+                                    if ui
+                                        .button(RichText::new(format!("Update ({v} → {})", e.version)).color(p.accent))
+                                        .clicked()
+                                    {
+                                        *act = Some(MarketAct::Install(e.clone()));
+                                    }
+                                } else {
+                                    ui.label(RichText::new("✓ Installed").small().color(p.success));
+                                }
+                            }
+                        }
+                    });
+                });
+                if !e.description.is_empty() {
+                    ui.label(RichText::new(&e.description).small().color(p.text_dim));
+                }
+                let mut meta = vec![];
+                if !e.author.is_empty() {
+                    meta.push(e.author.clone());
+                }
+                meta.extend(e.tags.iter().map(|t| format!("#{t}")));
+                if !meta.is_empty() {
+                    ui.label(RichText::new(meta.join("  ")).small().color(p.text_faint));
+                }
+            });
+        ui.add_space(6.0);
+    }
 }
