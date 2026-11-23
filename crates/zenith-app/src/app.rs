@@ -98,13 +98,30 @@ enum InputKind {
 }
 
 enum Dialog {
-    Input { title: String, value: String, kind: InputKind, focus: bool },
+    Input {
+        title: String,
+        value: String,
+        kind: InputKind,
+        focus: bool,
+    },
     ConfirmDelete(PathBuf),
     UnsavedClose(u64),
     UnsavedQuit,
-    ConfirmReplace { files: usize, count: usize },
-    AskAgent { question: String, focus: bool, caret: usize, pick: usize },
+    ConfirmReplace {
+        files: usize,
+        count: usize,
+    },
+    AskAgent {
+        question: String,
+        focus: bool,
+        caret: usize,
+        pick: usize,
+    },
     About,
+    /// A newer release: install it?
+    Update(crate::update::Release),
+    /// The update is installed: restart now?
+    Restart(String),
 }
 
 #[derive(Default)]
@@ -170,6 +187,10 @@ pub struct ZenithApp {
     debugger: crate::debug::Debugger,
     /// Launch configurations shown in Run & Debug (cached).
     debug_configs: Option<(Vec<zenith_dap::LaunchConfig>, Option<String>)>,
+    /// Update being installed; the executable to start when Zenith exits.
+    install_rx: Option<std::sync::mpsc::Receiver<Result<crate::update::Outcome, String>>>,
+    restart_exe: Option<PathBuf>,
+    pending_update_version: String,
     /// Settings Sync operation in flight.
     sync_rx: Option<std::sync::mpsc::Receiver<crate::sync_ui::SyncResult>>,
     /// Test explorer.
@@ -291,6 +312,9 @@ impl ZenithApp {
             mcp: Default::default(),
             tests: Default::default(),
             sync_rx: None,
+            install_rx: None,
+            restart_exe: None,
+            pending_update_version: String::new(),
             announced_editor: None,
             changes_refreshed: None,
             scm_repo: 0,
@@ -4185,6 +4209,38 @@ impl ZenithApp {
         }
     }
 
+    fn start_update_install(&mut self, release: crate::update::Release) {
+        if self.install_rx.is_some() {
+            return;
+        }
+        let w = self.waker.clone();
+        self.toast(format!("Downloading Zenith {}…", release.version), NotifyLevel::Info);
+        self.pending_update_version = release.version.clone();
+        self.install_rx = Some(crate::update::install_async(release, move || w()));
+    }
+
+    fn poll_update_install(&mut self, ctx: &egui::Context) {
+        use crate::update::Outcome;
+        let Some(rx) = &self.install_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.install_rx = None;
+        match result {
+            Ok(Outcome::Restart(exe)) => {
+                self.restart_exe = Some(exe);
+                self.update_available = None;
+                self.dialog = Some(Dialog::Restart(self.pending_update_version.clone()));
+            }
+            Ok(Outcome::InstallerStarted) => {
+                self.toast("The installer is running; Zenith will close.", NotifyLevel::Info);
+                self.run(ctx, Cmd::Quit);
+            }
+            Ok(Outcome::Manual(msg)) => {
+                self.toast(msg, NotifyLevel::Info);
+            }
+            Err(e) => self.toast(format!("Update failed: {e}"), NotifyLevel::Error),
+        }
+    }
+
     fn poll_update_check(&mut self) {
         let Some((rx, manual)) = &self.update_rx else { return };
         let manual = *manual;
@@ -4210,6 +4266,7 @@ impl ZenithApp {
         let p = self.colors.clone();
         let mut cmd = None;
         let mut plugin_click: Option<String> = None;
+        let mut update_click = false;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let small = |t: String| RichText::new(t).size(12.0).color(p.text_dim);
@@ -4267,7 +4324,7 @@ impl ZenithApp {
                     .on_hover_text("A newer Zenith is available — open the release page")
                     .clicked()
                 {
-                    open_url(&r.url);
+                    update_click = true;
                 }
             }
             let running_agents = self.ai.tabs.iter().filter(|t| t.is_alive()).count();
@@ -4340,6 +4397,11 @@ impl ZenithApp {
         });
         if let Some(c) = cmd {
             self.run(ctx, c);
+        }
+        if update_click {
+            if let Some(r) = self.update_available.clone() {
+                self.dialog = Some(Dialog::Update(r));
+            }
         }
         if let Some(c) = plugin_click {
             let ectx = self.editor_context();
@@ -4867,6 +4929,76 @@ impl ZenithApp {
                     self.send_to_agent(prompt, true, None);
                 } else if keep {
                     next = Some(Dialog::AskAgent { question, focus: false, caret, pick });
+                }
+            }
+            Dialog::Update(r) => {
+                let mut install = false;
+                window("Update available").show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(format!("Zenith {} is available", r.version))
+                            .size(16.0)
+                            .color(self.colors.accent),
+                    );
+                    ui.label(
+                        RichText::new(format!("You have {}.", env!("CARGO_PKG_VERSION"))).color(self.colors.text_dim),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("⬇ Install and restart").color(Color32::WHITE))
+                                    .fill(self.colors.accent),
+                            )
+                            .clicked()
+                        {
+                            install = true;
+                        }
+                        if ui.button("Release notes").clicked() {
+                            open_url(&r.url);
+                        }
+                        if ui.button("Later").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            keep = false;
+                        }
+                    });
+                    ui.label(
+                        RichText::new("The download is checked against GitHub's checksum before installing.")
+                            .small()
+                            .color(self.colors.text_faint),
+                    );
+                });
+                if install {
+                    self.start_update_install(r);
+                } else if keep {
+                    next = Some(Dialog::Update(r));
+                }
+            }
+            Dialog::Restart(version) => {
+                let mut restart = false;
+                window("Update installed").show(ctx, |ui| {
+                    ui.label(format!("Zenith {version} is installed. Restart to use it."));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Restart now").color(Color32::WHITE))
+                                    .fill(self.colors.accent),
+                            )
+                            .clicked()
+                        {
+                            restart = true;
+                        }
+                        if ui.button("Later").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+                if restart {
+                    // The new process starts when this one has really closed (after any unsaved-changes prompt).
+                    self.run(ctx, Cmd::Quit);
+                } else if keep {
+                    next = Some(Dialog::Restart(version));
+                } else {
+                    self.restart_exe = None;
                 }
             }
             Dialog::About => {
@@ -5748,6 +5880,16 @@ fn open_in_os(path: &Path) {
 }
 
 impl eframe::App for ZenithApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Restart into the freshly installed version.
+        if let Some(exe) = self.restart_exe.take() {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            if let Err(e) = std::process::Command::new(&exe).args(args).spawn() {
+                log::error!("restart failed: {e}");
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
@@ -5767,6 +5909,7 @@ impl eframe::App for ZenithApp {
         }
         self.handle_debugger();
         self.poll_update_check();
+        self.poll_update_install(ctx);
         self.poll_sync();
         if self.tests.poll() {
             ctx.request_repaint_after(Duration::from_millis(100));

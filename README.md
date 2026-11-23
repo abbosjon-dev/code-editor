@@ -44,7 +44,10 @@ notarizatsiya uchun `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`; Windows �
 (`packaging/package.sh` boshidagi izohga qarang).
 
 **Yangilanishlar.** Zenith kuniga bir marta GitHub'dagi oxirgi release'ni tekshiradi va yangi versiya chiqsa status
-qatorida **⬆ Update** ko'rsatadi (hech narsa avtomatik o'rnatilmaydi). *Help → Check for Updates* — qo'lda tekshirish;
+qatorida **⬆ Update** ko'rsatadi. Uni bossangiz — **Install and restart**: Zenith qanday o'rnatilgan bo'lsa, o'shanga mos
+paketni yuklab oladi (AppImage, tar.gz, ZIP, macOS DMG ichidagi .app, MSI), GitHub bergan SHA-256 bilan tekshiradi,
+o'rnatadi va qayta ishga tushiradi (MSI uchun o'rnatuvchi ochiladi; .deb uchun `sudo apt install …` buyrug'i
+ko'rsatiladi). Siz so'ramaguningizcha hech narsa o'rnatilmaydi. *Help → Check for Updates* — qo'lda tekshirish;
 Sozlamalar → Advanced'da o'chirish mumkin.
 
 ## Manba koddan ishga tushirish
