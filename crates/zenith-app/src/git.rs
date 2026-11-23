@@ -73,6 +73,22 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Where git commands run: here, or in the folder on an SSH host.
+#[derive(Clone)]
+struct Runner {
+    root: PathBuf,
+    remote: Option<crate::remote::RemoteSpec>,
+}
+
+impl Runner {
+    fn git(&self, args: &[&str]) -> Result<String, String> {
+        match &self.remote {
+            None => git(&self.root, args),
+            Some(spec) => crate::remote::git(spec, args),
+        }
+    }
+}
+
 /// `git init` in `dir`.
 pub fn init(dir: &Path) -> Result<(), String> {
     git(dir, &["init", "-q"]).map(|_| ())
@@ -106,6 +122,36 @@ pub fn parse_status(root: &Path, porcelain_z: &str) -> Vec<StatusEntry> {
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     out
+}
+
+/// Status of a folder on a host from [`crate::remote::git_state`]: paths
+/// are made relative to the folder (it may be inside the repository).
+fn remote_state(
+    cache: &Path,
+    (status, branch, stashes, ops, prefix): (String, String, usize, Vec<String>, String),
+) -> RepoState {
+    let status = parse_status(cache, &status)
+        .into_iter()
+        .filter_map(|mut e| {
+            let rel = e.rel.strip_prefix(&prefix)?.to_string();
+            e.path = cache.join(&rel);
+            e.rel = rel;
+            Some(e)
+        })
+        .collect();
+    let has = |n: &str| ops.iter().any(|o| o == n);
+    let operation = if has("rebase-merge") || has("rebase-apply") {
+        Some(Operation::Rebase)
+    } else if has("MERGE_HEAD") {
+        Some(Operation::Merge)
+    } else if has("CHERRY_PICK_HEAD") {
+        Some(Operation::CherryPick)
+    } else if has("REVERT_HEAD") {
+        Some(Operation::Revert)
+    } else {
+        None
+    };
+    RepoState { status, branch: (!branch.is_empty()).then_some(branch), operation, stashes }
 }
 
 /// Line-level diff of `current` against `base` for gutter markers.
@@ -298,6 +344,10 @@ struct RepoState {
 pub struct Git {
     pub root: PathBuf,
     git_dir: PathBuf,
+    run: Runner,
+    /// Set after commands that may change files (pull, checkout, stash) on a
+    /// remote host: the mirror should fetch them.
+    pub host_files_changed: bool,
     pub branch: Option<String>,
     pub status: Vec<StatusEntry>,
     pub operation: Option<Operation>,
@@ -314,6 +364,8 @@ impl Git {
             .map(|s| PathBuf::from(s.trim()))
             .unwrap_or_else(|_| root.join(".git"));
         let mut g = Self {
+            run: Runner { root: root.clone(), remote: None },
+            host_files_changed: false,
             root,
             git_dir,
             branch: None,
@@ -327,6 +379,43 @@ impl Git {
         Some(g)
     }
 
+    /// The repository of a folder on an SSH host; `cache` is its local mirror.
+    /// Every git command runs on the host.
+    pub fn open_remote(cache: &Path, spec: &crate::remote::RemoteSpec) -> Option<Self> {
+        let state = crate::remote::git_state(spec).ok()?;
+        let mut g = Self {
+            run: Runner { root: cache.to_path_buf(), remote: Some(spec.clone()) },
+            host_files_changed: false,
+            root: cache.to_path_buf(),
+            git_dir: PathBuf::new(),
+            branch: None,
+            status: vec![],
+            operation: None,
+            stashes: 0,
+            status_rx: None,
+            last_refresh: None,
+        };
+        g.apply_state(remote_state(cache, state));
+        g.refresh();
+        Some(g)
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.run.remote.is_some()
+    }
+
+    fn apply_state(&mut self, st: RepoState) -> bool {
+        let changed = st.status != self.status
+            || st.branch != self.branch
+            || st.operation != self.operation
+            || st.stashes != self.stashes;
+        self.status = st.status;
+        self.branch = st.branch;
+        self.operation = st.operation;
+        self.stashes = st.stashes;
+        changed
+    }
+
     /// Refresh status in the background.
     pub fn refresh(&mut self) {
         if self.status_rx.is_some() {
@@ -335,6 +424,16 @@ impl Git {
         let (tx, rx) = channel();
         let root = self.root.clone();
         let git_dir = self.git_dir.clone();
+        if let Some(spec) = self.run.remote.clone() {
+            thread::spawn(move || {
+                if let Ok(st) = crate::remote::git_state(&spec) {
+                    let _ = tx.send(remote_state(&root, st));
+                }
+            });
+            self.status_rx = Some(rx);
+            self.last_refresh = Some(Instant::now());
+            return;
+        }
         thread::spawn(move || {
             // --no-optional-locks: never take index.lock in the background,
             // so it can't race with stage/commit.
@@ -355,19 +454,18 @@ impl Git {
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         if let Some(rx) = &self.status_rx {
-            if let Ok(st) = rx.try_recv() {
-                changed = st.status != self.status
-                    || st.branch != self.branch
-                    || st.operation != self.operation
-                    || st.stashes != self.stashes;
-                self.status = st.status;
-                self.branch = st.branch;
-                self.operation = st.operation;
-                self.stashes = st.stashes;
-                self.status_rx = None;
+            match rx.try_recv() {
+                Ok(st) => {
+                    changed = self.apply_state(st);
+                    self.status_rx = None;
+                }
+                // A failed remote refresh (offline) sends nothing.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.status_rx = None,
+                Err(_) => {}
             }
         }
-        if self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(4)) {
+        let every = Duration::from_secs(if self.is_remote() { 5 } else { 4 });
+        if self.last_refresh.is_none_or(|t| t.elapsed() > every) {
             self.refresh();
         }
         changed
@@ -380,21 +478,22 @@ impl Git {
     /// File content at HEAD (None if untracked / not in a repo).
     pub fn head_text(&self, path: &Path) -> Option<String> {
         let rel = self.rel(path)?;
-        git(&self.root, &["show", &format!("HEAD:{rel}")]).ok()
+        self.run.git(&["show", &format!("HEAD:./{rel}")]).ok()
     }
 
     pub fn stage(&mut self, rel: &str) -> Result<(), String> {
-        git(&self.root, &["add", "--", rel]).map(|_| self.refresh_now())
+        self.run.git(&["add", "--", rel]).map(|_| self.refresh_now())
     }
 
     pub fn unstage(&mut self, rel: &str) -> Result<(), String> {
-        git(&self.root, &["reset", "-q", "HEAD", "--", rel])
-            .or_else(|_| git(&self.root, &["rm", "--cached", "-q", "--", rel]))
+        self.run
+            .git(&["reset", "-q", "HEAD", "--", rel])
+            .or_else(|_| self.run.git(&["rm", "--cached", "-q", "--", rel]))
             .map(|_| self.refresh_now())
     }
 
     pub fn stage_all(&mut self) -> Result<(), String> {
-        git(&self.root, &["add", "-A"]).map(|_| self.refresh_now())
+        self.run.git(&["add", "-A"]).map(|_| self.refresh_now())
     }
 
     pub fn commit(&mut self, message: &str) -> Result<String, String> {
@@ -403,28 +502,30 @@ impl Git {
         }
         let staged_any = self.status.iter().any(|e| e.is_staged());
         if !staged_any {
-            git(&self.root, &["add", "-A"])?;
+            self.run.git(&["add", "-A"])?;
         }
-        let out = git(&self.root, &["commit", "-m", message])?;
+        let out = self.run.git(&["commit", "-m", message])?;
         self.refresh_now();
         Ok(out.lines().next().unwrap_or("").to_string())
     }
 
     pub fn push(&self) -> Result<String, String> {
-        git(&self.root, &["push"]).map(|s| if s.trim().is_empty() { "Pushed".into() } else { s })
+        self.run.git(&["push"]).map(|s| if s.trim().is_empty() { "Pushed".into() } else { s })
     }
 
-    pub fn pull(&self) -> Result<String, String> {
-        git(&self.root, &["pull", "--ff-only"])
+    pub fn pull(&mut self) -> Result<String, String> {
+        let r = self.run.git(&["pull", "--ff-only"]);
+        self.refresh_now();
+        r
     }
 
     /// Blame a file in the background; the result arrives on the returned channel.
     pub fn blame_async(&self, path: &Path) -> Option<Receiver<Vec<BlameLine>>> {
         let rel = self.rel(path)?;
-        let root = self.root.clone();
+        let run = self.run.clone();
         let (tx, rx) = channel();
         thread::spawn(move || {
-            let out = git(&root, &["--no-optional-locks", "blame", "--porcelain", "--", &rel]).unwrap_or_default();
+            let out = run.git(&["--no-optional-locks", "blame", "--porcelain", "--", &rel]).unwrap_or_default();
             let _ = tx.send(parse_blame(&out));
         });
         Some(rx)
@@ -432,19 +533,20 @@ impl Git {
 
     /// Local branches, most recently committed first.
     pub fn branches(&self) -> Vec<String> {
-        git(&self.root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads/"])
+        self.run
+            .git(&["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads/"])
             .map(|s| s.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
             .unwrap_or_default()
     }
 
     pub fn checkout(&mut self, branch: &str) -> Result<(), String> {
-        git(&self.root, &["checkout", "-q", branch])?;
+        self.run.git(&["checkout", "-q", branch])?;
         self.refresh_now();
         Ok(())
     }
 
     pub fn create_branch(&mut self, branch: &str) -> Result<(), String> {
-        git(&self.root, &["checkout", "-q", "-b", branch])?;
+        self.run.git(&["checkout", "-q", "-b", branch])?;
         self.refresh_now();
         Ok(())
     }
@@ -452,7 +554,7 @@ impl Git {
     /// Abort the merge / rebase / cherry-pick in progress.
     pub fn abort_operation(&mut self) -> Result<String, String> {
         let op = self.operation.ok_or("Nothing to abort")?;
-        let r = git(&self.root, &[op.command(), "--abort"]);
+        let r = self.run.git(&[op.command(), "--abort"]);
         self.refresh_now();
         r.map(|_| format!("{} aborted", op.label()))
     }
@@ -465,8 +567,8 @@ impl Git {
         }
         // Keep the prepared commit message instead of opening an editor.
         let r = match op {
-            Operation::Merge => git(&self.root, &["commit", "--no-edit"]),
-            _ => git(&self.root, &["-c", "core.editor=true", op.command(), "--continue"]),
+            Operation::Merge => self.run.git(&["commit", "--no-edit"]),
+            _ => self.run.git(&["-c", "core.editor=true", op.command(), "--continue"]),
         };
         self.refresh_now();
         r.map(|s| s.lines().next().unwrap_or("").to_string())
@@ -478,19 +580,21 @@ impl Git {
         if !message.trim().is_empty() {
             args.extend(["-m", message.trim()]);
         }
-        let r = git(&self.root, &args);
+        let r = self.run.git(&args);
         self.refresh_now();
         r.map(|s| s.lines().next().unwrap_or("Stashed").to_string())
     }
 
     pub fn stash_pop(&mut self) -> Result<String, String> {
-        let r = git(&self.root, &["stash", "pop"]);
+        let r = self.run.git(&["stash", "pop"]);
         self.refresh_now();
         r.map(|_| "Stash applied".to_string())
     }
 
     fn refresh_now(&mut self) {
         self.status_rx = None;
+        // Commands that touch the working tree changed files on the host.
+        self.host_files_changed |= self.is_remote();
         self.refresh();
     }
 }

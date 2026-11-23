@@ -411,6 +411,9 @@ impl ZenithApp {
                     // Reattach the remote folder this workspace mirrors (fetches what changed meanwhile).
                     if let (Some(spec), Some(ws)) = (saved.remote.clone(), app.workspace.clone()) {
                         if crate::remote::cache_dir(&settings::config_dir(), &spec) == ws {
+                            if let Some(g) = Git::open_remote(&ws, &spec) {
+                                app.git = Some(g);
+                            }
                             let mut s = crate::remote::Session::new(spec, ws, saved.remote_since, app.waker.clone());
                             s.pull_now();
                             app.remote = Some(s);
@@ -2306,56 +2309,7 @@ impl ZenithApp {
             self.scm_repo = sel;
         }
         let root = roots.get(self.scm_repo).cloned();
-        if self.remote.is_some() {
-            self.remote_git_ui(ui, p);
-            return;
-        }
         self.with_repo(self.scm_repo, |app| app.git_repo_ui(ctx, ui, p, root));
-    }
-
-    /// Source Control for a remote folder: the copy's status, read-only (Git
-    /// commands belong on the host, in its terminal).
-    fn remote_git_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        Self::section_header(ui, p, "SOURCE CONTROL");
-        let Some(g) = &self.git else {
-            ui.label(RichText::new("The remote folder is not a Git repository.").color(p.text_dim));
-            return;
-        };
-        if let Some(b) = &g.branch {
-            ui.label(RichText::new(format!("⎇ {b}")).color(p.accent));
-        }
-        ui.label(
-            RichText::new("Remote folder: commit, push and pull in a terminal — it runs on the host.")
-                .small()
-                .color(p.text_dim),
-        );
-        let mut open_term = false;
-        let mut open = None;
-        if ui.button("Open terminal on host").clicked() {
-            open_term = true;
-        }
-        ui.add_space(6.0);
-        for e in &g.status {
-            let r = ui.add(
-                egui::Label::new(RichText::new(format!("{}  {}", e.letter(), e.rel)).size(12.5)).sense(Sense::click()),
-            );
-            if r.clicked() {
-                open = Some(e.path.clone());
-            }
-        }
-        if g.status.is_empty() {
-            ui.label(RichText::new("No changes.").color(p.text_dim));
-        }
-        if open_term {
-            self.new_terminal(None);
-        }
-        if let Some(path) = open {
-            if self.open_file(&path) {
-                if let Some(doc) = self.docs.get_mut(self.active) {
-                    doc.show_git_diff = doc.git_base.is_some();
-                }
-            }
-        }
     }
 
     fn git_repo_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, p: &Palette, root: Option<PathBuf>) {
@@ -4283,6 +4237,10 @@ impl ZenithApp {
                     Ok(since) => {
                         self.remote = None;
                         self.open_workspace(cache.clone());
+                        // Source Control runs git on the host.
+                        if let Some(g) = Git::open_remote(&cache, &spec) {
+                            self.git = Some(g);
+                        }
                         self.remote = Some(crate::remote::Session::new(spec.clone(), cache, since, self.waker.clone()));
                         self.save_session();
                         self.toast(format!("Opened {} over SSH", spec.label()), NotifyLevel::Info);
@@ -4292,6 +4250,10 @@ impl ZenithApp {
             }
         }
         let Some(r) = &mut self.remote else { return };
+        // Git on the host may have changed files (pull, checkout, stash): fetch them.
+        if self.git.as_mut().is_some_and(|g| std::mem::take(&mut g.host_files_changed)) {
+            r.pull_all();
+        }
         let (changed, errors) = r.poll();
         for e in errors {
             self.toast(e, NotifyLevel::Error);

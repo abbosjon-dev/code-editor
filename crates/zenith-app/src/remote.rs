@@ -213,6 +213,56 @@ pub fn pull_changes(spec: &RemoteSpec, dest: &Path, since: i64) -> Result<(i64, 
     Ok((now, untar(&data, dest)?))
 }
 
+/// Every file in the folder on the host (relative paths; skipped folders
+/// and `.git` left out).
+pub fn list_files(spec: &RemoteSpec) -> Result<std::collections::HashSet<String>, String> {
+    let prune = SKIP.iter().chain([".git"].iter()).map(|d| format!("-path ./{d}")).collect::<Vec<_>>().join(" -o ");
+    let script = format!("cd {} && find . \\( {prune} \\) -prune -o -type f -print0", spec.qpath());
+    let out = run(ssh(spec, &script))?;
+    Ok(String::from_utf8_lossy(&out)
+        .split('\0')
+        .map(|p| p.trim_start_matches("./").to_string())
+        .filter(|p| !p.is_empty())
+        .collect())
+}
+
+/// Delete files from the mirror that no longer exist on the host. Files
+/// changed here since `keep_after` are kept (they may still be uploading).
+fn prune_deleted(
+    cache: &Path,
+    present: &std::collections::HashSet<String>,
+    keep_after: std::time::SystemTime,
+) -> Vec<PathBuf> {
+    fn walk(dir: &Path, cache: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                if dir == cache && (name == ".git" || SKIP.contains(&name.as_ref())) {
+                    continue;
+                }
+                walk(&p, cache, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = vec![];
+    walk(cache, cache, &mut files);
+    let mut removed = vec![];
+    for f in files {
+        let Ok(rel) = f.strip_prefix(cache) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let recent = std::fs::metadata(&f).and_then(|m| m.modified()).is_ok_and(|t| t > keep_after);
+        if !present.contains(&rel) && !recent && std::fs::remove_file(&f).is_ok() {
+            removed.push(f);
+        }
+    }
+    removed
+}
+
 /// Write `local` to `rel` on the host.
 pub fn upload(spec: &RemoteSpec, rel: &str, local: &Path) -> Result<(), String> {
     let target = spec.qrel(rel);
@@ -233,6 +283,43 @@ pub fn rename(spec: &RemoteSpec, from: &str, to: &str) -> Result<(), String> {
 
 pub fn mkdir(spec: &RemoteSpec, rel: &str) -> Result<(), String> {
     run(ssh(spec, &format!("mkdir -p {}", spec.qrel(rel)))).map(|_| ())
+}
+
+/// Run `git <args>` in the folder on the host.
+pub fn git(spec: &RemoteSpec, args: &[&str]) -> Result<String, String> {
+    let words: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    let script = format!("cd {} && GIT_TERMINAL_PROMPT=0 git {}", spec.qpath(), words.join(" "));
+    run(ssh(spec, &script)).map(|o| String::from_utf8_lossy(&o).into_owned())
+}
+
+/// Separator between the parts of [`git_state`]'s output.
+const PART: &str = "\n--zenith-part--\n";
+
+/// Everything the Source Control view needs, in one round trip:
+/// (`status --porcelain -z`, branch, stash count, in-progress operation
+/// markers found in the git dir, path prefix of the folder in the repo).
+pub fn git_state(spec: &RemoteSpec) -> Result<(String, String, usize, Vec<String>, String), String> {
+    let script = format!(
+        "cd {} && git rev-parse --git-dir >/dev/null || exit 1; \
+         git --no-optional-locks status --porcelain=v1 -z --untracked-files=all; printf '{PART}'; \
+         git rev-parse --abbrev-ref HEAD; printf '{PART}'; \
+         git --no-optional-locks stash list | wc -l; printf '{PART}'; \
+         d=$(git rev-parse --git-dir); for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; \
+         do [ -e \"$d/$f\" ] && echo $f; done; printf '{PART}'; git rev-parse --show-prefix",
+        spec.qpath()
+    );
+    let out = String::from_utf8_lossy(&run(ssh(spec, &script))?).into_owned();
+    let parts: Vec<&str> = out.split("\n--zenith-part--\n").collect();
+    if parts.len() < 5 {
+        return Err("unexpected output from git on the host".into());
+    }
+    Ok((
+        parts[0].to_string(),
+        parts[1].trim().to_string(),
+        parts[2].trim().parse().unwrap_or(0),
+        parts[3].lines().map(str::to_string).filter(|l| !l.is_empty()).collect(),
+        parts[4].trim().to_string(),
+    ))
 }
 
 /// `ssh` arguments for an interactive shell in the folder.
@@ -267,6 +354,8 @@ enum Op {
 
 /// How often files changed on the host are fetched.
 pub const PULL_EVERY: Duration = Duration::from_secs(4);
+/// How often deletions on the host are looked for (a full file listing).
+const FULL_EVERY: Duration = Duration::from_secs(20);
 
 /// Result of a background pull: new `since` and the files that changed.
 type PullResult = Result<(i64, Vec<PathBuf>), String>;
@@ -283,6 +372,8 @@ pub struct Session {
     errors: Receiver<String>,
     pull: Option<Receiver<PullResult>>,
     last_pull: Instant,
+    /// Last time deletions on the host were looked for.
+    last_full: Instant,
     waker: Arc<dyn Fn() + Send + Sync>,
     pub last_error: Option<String>,
 }
@@ -336,7 +427,18 @@ impl Session {
                 }
             }
         });
-        Self { spec, cache, since, ops, errors, pull: None, last_pull: Instant::now(), waker, last_error: None }
+        Self {
+            spec,
+            cache,
+            since,
+            ops,
+            errors,
+            pull: None,
+            last_pull: Instant::now(),
+            last_full: Instant::now(),
+            waker,
+            last_error: None,
+        }
     }
 
     /// Path relative to the remote folder (`/`-separated), if inside it.
@@ -372,16 +474,40 @@ impl Session {
 
     /// Fetch host changes now.
     pub fn pull_now(&mut self) {
+        self.pull_with(false);
+    }
+
+    /// Fetch host changes, including files deleted there (e.g. by git).
+    pub fn pull_all(&mut self) {
+        self.pull_with(true);
+    }
+
+    fn pull_with(&mut self, full: bool) {
         if self.pull.is_some() {
+            if full {
+                // Look for deletions with the next pull.
+                self.last_full = Instant::now() - FULL_EVERY;
+            }
             return;
+        }
+        let full = full || self.last_full.elapsed() >= FULL_EVERY;
+        if full {
+            self.last_full = Instant::now();
         }
         let (tx, rx) = channel();
         let (spec, cache, since, w) = (self.spec.clone(), self.cache.clone(), self.since, self.waker.clone());
         std::thread::spawn(move || {
+            let started = std::time::SystemTime::now();
             let incoming = cache.with_extension("incoming");
             let _ = std::fs::remove_dir_all(&incoming);
-            let r = pull_changes(&spec, &incoming, since)
-                .map(|(now, files)| (now, merge_incoming(&incoming, &cache, &files)));
+            let r = pull_changes(&spec, &incoming, since).and_then(|(now, files)| {
+                let mut changed = merge_incoming(&incoming, &cache, &files);
+                if full {
+                    let present = list_files(&spec)?;
+                    changed.extend(prune_deleted(&cache, &present, started - Duration::from_secs(10)));
+                }
+                Ok((now, changed))
+            });
             let _ = tx.send(r);
             w();
         });
@@ -485,6 +611,21 @@ mod tests {
         assert!(remote_dir.join("src/lib2.rs").exists());
         remove(&spec, "new dir").unwrap();
         assert!(!remote_dir.join("new dir").exists());
+        // Deleted on the host: gone from the mirror, unless just edited here.
+        std::fs::write(cache.join("fresh.txt"), "new").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(cache.join("src/lib.rs")).unwrap().set_modified(old).unwrap();
+        let present = list_files(&spec).unwrap();
+        assert!(present.contains("src/lib2.rs") && !present.contains("src/lib.rs"));
+        let removed = prune_deleted(&cache, &present, std::time::SystemTime::now() - Duration::from_secs(5));
+        assert!(removed.iter().any(|p| p.ends_with("src/lib.rs")), "{removed:?}");
+        assert!(cache.join("fresh.txt").exists());
+        // Git runs on the host.
+        if git(&spec, &["init", "-q"]).is_ok() {
+            let (status, _, stashes, ops, prefix) = git_state(&spec).unwrap();
+            assert!(status.contains("src/main.rs"), "{status:?}");
+            assert_eq!((stashes, ops.len(), prefix.as_str()), (0, 0, ""));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }

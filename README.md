@@ -241,7 +241,9 @@ sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`
 - Serverdagi o'zgarishlar (agent yoki terminal qilgan) har 4 soniyada olinadi; ochiq fayl o'zgarsa, odatdagi diff
   banneri chiqadi (**Keep / Revert** — Revert ham serverga yoziladi).
 - Status qatorida **SSH host**: bossangiz — hoziroq yangilaydi; ulanish uzilsa qizil "(offline)" ko'rinadi.
-- Source Control paneli faqat o'qish uchun: commit/push uchun serverdagi terminalda `git` ishlating.
+- **Source Control to'liq ishlaydi** — stage, commit, push/pull, branch, stash, merge konfliktlari: `git` buyruqlari
+  serverning o'zida bajariladi (serverdagi git sozlamalari va kalitlari bilan). Git fayllarni o'zgartirsa
+  (pull, checkout, stash), ular darhol mahalliy nusxaga olinadi; serverda o'chirilgan fayllar nusxadan ham o'chadi.
 - Oxirgi ulanishlar eslab qolinadi; Zenith qayta ochilganda uzoq papka avtomatik qayta ulanadi.
 
 ## Klaviatura
