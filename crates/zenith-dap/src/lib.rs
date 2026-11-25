@@ -95,6 +95,8 @@ pub struct DapClient {
     stdin: Arc<Mutex<ChildStdin>>,
     child: Child,
     seq: Arc<Mutex<i64>>,
+    /// Path translation when the adapter runs on another machine.
+    map: Option<zenith_core::pathmap::PathMap>,
 }
 
 impl DapClient {
@@ -104,6 +106,19 @@ impl DapClient {
         cwd: &Path,
         tx: Sender<DapMessage>,
         waker: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self> {
+        Self::start_with(command, args, cwd, tx, waker, None)
+    }
+
+    /// Like [`start`](Self::start); with `map`, paths in messages are
+    /// translated (the adapter runs on another machine, e.g. through ssh).
+    pub fn start_with(
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        tx: Sender<DapMessage>,
+        waker: Arc<dyn Fn() + Send + Sync>,
+        map: Option<zenith_core::pathmap::PathMap>,
     ) -> Result<Self> {
         let program = which::which(command).unwrap_or_else(|_| PathBuf::from(command));
         let mut cmd = Command::new(program);
@@ -123,10 +138,14 @@ impl DapClient {
             let waker = waker.clone();
             let stdin = stdin.clone();
             let seq = seq.clone();
+            let map = map.clone();
             thread::Builder::new().name("dap-reader".into()).spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let trace = std::env::var_os("ZENITH_DAP_TRACE").is_some();
-                while let Ok(Some(v)) = read_message(&mut reader) {
+                while let Ok(Some(mut v)) = read_message(&mut reader) {
+                    if let Some(m) = &map {
+                        m.incoming(&mut v);
+                    }
                     if trace {
                         eprintln!("dap <- {v}");
                     }
@@ -158,7 +177,7 @@ impl DapClient {
                 let _ = tx.send(DapMessage::Stderr(line));
             }
         });
-        Ok(Self { stdin, child, seq })
+        Ok(Self { stdin, child, seq, map })
     }
 
     /// Send a request; returns its sequence number (matched by responses).
@@ -168,7 +187,10 @@ impl DapClient {
             *s += 1;
             *s
         };
-        let msg = json!({ "seq": seq, "type": "request", "command": command, "arguments": arguments });
+        let mut msg = json!({ "seq": seq, "type": "request", "command": command, "arguments": arguments });
+        if let Some(m) = &self.map {
+            m.outgoing(&mut msg);
+        }
         if std::env::var_os("ZENITH_DAP_TRACE").is_some() {
             eprintln!("dap -> {msg}");
         }

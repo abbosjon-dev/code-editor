@@ -242,6 +242,10 @@ sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`
 
 - Papka mahalliy nusxaga (`<config>/remote/<host>/…`) yuklanadi — tahrirlash, qidirish, LSP va tree-sitter
   tarmoqni kutmaydi. **Saqlash**, yangi fayl/papka, nomini o'zgartirish va o'chirish darhol serverga yuboriladi.
+- **Til serverlari (LSP) va debugger ham serverda** ishlaydi: Zenith serverda qaysi dasturlar borligini tekshiradi
+  (`rust-analyzer`, `pyright`, `gopls`, `gdb`, `python3 -m debugpy` …, PATH va `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`
+  dan) va ularni `ssh` orqali ishga tushiradi; fayl yo'llari mahalliy nusxa ↔ server o'rtasida avtomatik
+  almashtiriladi. Debug konfiguratsiyasidagi `build` buyrug'i ham serverda bajariladi.
 - **Terminal va AI agentlar serverda** ishga tushadi (`ssh -t host 'cd papka && …'`) — `cargo`, `npm`, `claude`
   va boshqalar serverdagi muhitda ishlaydi.
 - Serverdagi o'zgarishlar (agent yoki terminal qilgan) har 4 soniyada olinadi; ochiq fayl o'zgarsa, odatdagi diff

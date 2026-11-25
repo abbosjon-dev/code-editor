@@ -9,7 +9,7 @@ mod protocol;
 pub mod text;
 
 use std::collections::HashMap;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -351,9 +351,35 @@ struct Shared {
     legend: Option<(Vec<String>, Vec<String>)>,
 }
 
+/// The server's stdin; messages are path-mapped for remote servers.
+pub struct Out {
+    w: ChildStdin,
+    map: Option<zenith_core::pathmap::PathMap>,
+}
+
+impl Out {
+    fn write(&mut self, msg: &Value) -> std::io::Result<()> {
+        match &self.map {
+            Some(m) => {
+                let mut v = msg.clone();
+                m.outgoing(&mut v);
+                protocol::write_message(&mut self.w, &v)
+            }
+            None => protocol::write_message(&mut self.w, msg),
+        }
+    }
+}
+
+/// Run a language server on another machine: `argv` starts it there (e.g.
+/// through ssh), `map` translates paths between the local mirror and it.
+pub struct RemoteLaunch {
+    pub argv: Vec<String>,
+    pub map: zenith_core::pathmap::PathMap,
+}
+
 pub struct LspClient {
     pub config: ServerConfig,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Out>>,
     child: Child,
     shared: Arc<Mutex<Shared>>,
     next_id: u64,
@@ -366,16 +392,33 @@ impl LspClient {
         tx: Sender<LspEvent>,
         waker: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self> {
-        let program = which::which(&config.command).unwrap_or_else(|_| PathBuf::from(&config.command));
+        Self::start_with(config, root, tx, waker, None)
+    }
+
+    pub fn start_with(
+        config: ServerConfig,
+        root: &Path,
+        tx: Sender<LspEvent>,
+        waker: Arc<dyn Fn() + Send + Sync>,
+        remote: Option<RemoteLaunch>,
+    ) -> Result<Self> {
+        let (program, args) = match &remote {
+            Some(r) if !r.argv.is_empty() => (PathBuf::from(&r.argv[0]), r.argv[1..].to_vec()),
+            _ => {
+                (which::which(&config.command).unwrap_or_else(|_| PathBuf::from(&config.command)), config.args.clone())
+            }
+        };
+        let map = remote.map(|r| r.map);
+        let is_remote = map.is_some();
         let mut cmd = Command::new(program);
-        cmd.args(&config.args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(&args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = cmd.spawn().with_context(|| format!("failed to start language server `{}`", config.command))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().context("no stdin")?));
+        let stdin = Arc::new(Mutex::new(Out { w: child.stdin.take().context("no stdin")?, map: map.clone() }));
         let stdout = child.stdout.take().context("no stdout")?;
         let stderr = child.stderr.take().context("no stderr")?;
         let shared = Arc::new(Mutex::new(Shared {
@@ -393,9 +436,13 @@ impl LspClient {
             let shared = shared.clone();
             let tx = tx.clone();
             let waker = waker.clone();
+            let map = map.clone();
             thread::Builder::new().name(format!("lsp-{name}")).spawn(move || {
                 let mut reader = BufReader::new(stdout);
-                while let Ok(Some(msg)) = protocol::read_message(&mut reader) {
+                while let Ok(Some(mut msg)) = protocol::read_message(&mut reader) {
+                    if let Some(m) = &map {
+                        m.incoming(&mut msg);
+                    }
                     for ev in handle_message(&name, msg, &stdin, &shared) {
                         let _ = tx.send(ev);
                     }
@@ -422,7 +469,7 @@ impl LspClient {
             "id": 1,
             "method": "initialize",
             "params": {
-                "processId": std::process::id(),
+                "processId": if is_remote { Value::Null } else { json!(std::process::id()) },
                 "clientInfo": { "name": "zenith", "version": env!("CARGO_PKG_VERSION") },
                 "rootUri": root_uri,
                 "rootPath": root.to_string_lossy(),
@@ -470,7 +517,7 @@ impl LspClient {
                 }
             }
         });
-        protocol::write_message(&mut *stdin.lock().unwrap(), &init)?;
+        stdin.lock().unwrap().write(&init)?;
         Ok(Self { config, stdin, child, shared, next_id: 100 })
     }
 
@@ -494,7 +541,7 @@ impl LspClient {
         }
         drop(sh);
         if let Ok(mut w) = self.stdin.lock() {
-            let _ = protocol::write_message(&mut *w, &msg);
+            let _ = w.write(&msg);
         }
     }
 
@@ -647,19 +694,13 @@ impl Drop for LspClient {
     }
 }
 
-fn write_now(stdin: &Arc<Mutex<ChildStdin>>, msg: &Value) {
+fn write_now(stdin: &Arc<Mutex<Out>>, msg: &Value) {
     if let Ok(mut w) = stdin.lock() {
-        let _ = protocol::write_message(&mut *w, msg);
-        let _ = w.flush();
+        let _ = w.write(msg);
     }
 }
 
-fn handle_message(
-    server: &str,
-    msg: Value,
-    stdin: &Arc<Mutex<ChildStdin>>,
-    shared: &Arc<Mutex<Shared>>,
-) -> Vec<LspEvent> {
+fn handle_message(server: &str, msg: Value, stdin: &Arc<Mutex<Out>>, shared: &Arc<Mutex<Shared>>) -> Vec<LspEvent> {
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(|m| m.as_str()).map(str::to_string);
     let mut out = vec![];

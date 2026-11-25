@@ -415,8 +415,8 @@ impl ZenithApp {
                         }
                     }
                     app.active = saved.active.min(app.docs.len().saturating_sub(1));
-                    app.restore_session_state(&saved);
-                    // Reattach the remote folder this workspace mirrors (fetches what changed meanwhile).
+                    // Reattach the remote folder this workspace mirrors (fetches what changed
+                    // meanwhile) before terminals are restored, so they open on the host.
                     if let (Some(spec), Some(ws)) = (saved.remote.clone(), app.workspace.clone()) {
                         if crate::remote::cache_dir(&settings::config_dir(), &spec) == ws {
                             if let Some(g) = Git::open_remote(&ws, &spec) {
@@ -425,8 +425,10 @@ impl ZenithApp {
                             let mut s = crate::remote::Session::new(spec, ws, saved.remote_since, app.waker.clone());
                             s.pull_now();
                             app.remote = Some(s);
+                            app.probe_remote();
                         }
                     }
+                    app.restore_session_state(&saved);
                 }
             }
         }
@@ -452,6 +454,11 @@ impl ZenithApp {
         // A different folder ends the remote session (re-set by the caller when connecting).
         if self.remote.as_ref().is_some_and(|r| r.cache != path) {
             self.remote = None;
+        }
+        if self.remote.is_none() {
+            self.lsp.remote = None;
+            self.lsp.remote_pending = None;
+            self.debugger.remote = None;
         }
         self.index = FileIndex::build(&path);
         self.git = Git::open(&path);
@@ -4367,6 +4374,21 @@ impl ZenithApp {
         self.remote_connecting = Some((spec, cache, rx));
     }
 
+    /// Find out what the host has, so language servers and debug adapters
+    /// can run there.
+    fn probe_remote(&mut self) {
+        let mut programs: Vec<String> = self.lsp.configs().iter().map(|c| c.command.clone()).collect();
+        for a in zenith_dap::ADAPTERS {
+            programs.extend(a.commands.iter().map(|(p, _)| p.to_string()));
+        }
+        programs.sort();
+        programs.dedup();
+        if let Some(r) = &mut self.remote {
+            r.start_probe(programs);
+            self.lsp.remote_pending = Some(r.cache.clone());
+        }
+    }
+
     fn poll_remote(&mut self, ctx: &egui::Context) {
         if let Some((_, _, rx)) = &self.remote_connecting {
             if let Ok(r) = rx.try_recv() {
@@ -4380,6 +4402,7 @@ impl ZenithApp {
                             self.git = Some(g);
                         }
                         self.remote = Some(crate::remote::Session::new(spec.clone(), cache, since, self.waker.clone()));
+                        self.probe_remote();
                         self.save_session();
                         self.toast(format!("Opened {} over SSH", spec.label()), NotifyLevel::Info);
                     }
@@ -4388,6 +4411,22 @@ impl ZenithApp {
             }
         }
         let Some(r) = &mut self.remote else { return };
+        match r.take_probed() {
+            Some(Ok(())) => {
+                let host = r.host.clone();
+                self.lsp.remote = host.clone();
+                self.lsp.remote_pending = None;
+                self.debugger.remote = host;
+                self.lsp.restart(&mut self.docs);
+                return;
+            }
+            Some(Err(e)) => {
+                self.lsp.remote_pending = None;
+                self.toast(format!("Language servers on the host are unavailable: {e}"), NotifyLevel::Warning);
+                return;
+            }
+            None => {}
+        }
         // Git on the host may have changed files (pull, checkout, stash): fetch them.
         if self.git.as_mut().is_some_and(|g| std::mem::take(&mut g.host_files_changed)) {
             r.pull_all();

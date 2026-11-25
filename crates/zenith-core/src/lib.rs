@@ -5,6 +5,7 @@
 
 mod buffer;
 mod history;
+pub mod pathmap;
 mod search;
 mod selection;
 

@@ -4982,6 +4982,7 @@ name = "zenith-core"
 version = "0.1.0"
 dependencies = [
  "ropey",
+ "serde_json",
 ]
 
 [[package]]
@@ -4994,6 +4995,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "which",
+ "zenith-core",
 ]
 
 [[package]]
@@ -5006,6 +5008,7 @@ dependencies = [
  "serde_json",
  "url",
  "which",
+ "zenith-core",
 ]
 
 [[package]]

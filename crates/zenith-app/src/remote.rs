@@ -340,6 +340,93 @@ pub fn git_state(spec: &RemoteSpec) -> Result<(String, String, usize, Vec<String
     ))
 }
 
+/// What runs on the host: its absolute folder path and which programs are
+/// installed there (found through the login shell's PATH).
+#[derive(Clone, Debug)]
+pub struct HostInfo {
+    pub spec: RemoteSpec,
+    /// The local mirror.
+    pub cache: PathBuf,
+    /// The folder's absolute path on the host.
+    pub root: String,
+    /// Installed programs: name → path on the host.
+    pub found: std::collections::HashMap<String, String>,
+}
+
+impl HostInfo {
+    /// `local` (inside the mirror) as a path on the host.
+    pub fn host_path(&self, local: &Path) -> Option<String> {
+        let rel = local.strip_prefix(&self.cache).ok()?.to_string_lossy().replace('\\', "/");
+        Some(if rel.is_empty() { self.root.clone() } else { format!("{}/{rel}", self.root.trim_end_matches('/')) })
+    }
+
+    /// Path mapping between the mirror folder `local` and the host.
+    pub fn path_map(&self, local: &Path) -> Option<zenith_core::pathmap::PathMap> {
+        let remote = self.host_path(local)?;
+        let local_uri = zenith_lsp::text::path_to_uri(local);
+        let remote_uri = format!("file://{}", uri_encode(&remote));
+        Some(zenith_core::pathmap::PathMap::new(&local.to_string_lossy(), &remote, Some((&local_uri, &remote_uri))))
+    }
+
+    /// Command line that runs `program args` on the host in `local`'s folder
+    /// (no terminal, so binary protocols on stdin/stdout stay intact).
+    pub fn command(&self, local: &Path, program: &str, args: &[String]) -> Vec<String> {
+        let dir = self.host_path(local).unwrap_or_else(|| self.root.clone());
+        let exe = self.found.get(program).cloned().unwrap_or_else(|| program.to_string());
+        let cmd: Vec<String> = std::iter::once(exe).chain(args.iter().cloned()).map(|a| sh_quote(&a)).collect();
+        let mut a = vec!["ssh".to_string()];
+        a.extend(ssh_args(&self.spec, false));
+        a.push(format!("cd {} && exec \"${{SHELL:-sh}}\" -lc {}", sh_quote(&dir), sh_quote(&cmd.join(" "))));
+        a
+    }
+
+    /// Run a shell command line on the host in `local`'s folder.
+    pub fn shell(&self, local: &Path, line: &str) -> Vec<String> {
+        let dir = self.host_path(local).unwrap_or_else(|| self.root.clone());
+        let mut a = vec!["ssh".to_string()];
+        a.extend(ssh_args(&self.spec, false));
+        a.push(format!("cd {} && exec \"${{SHELL:-sh}}\" -lc {}", sh_quote(&dir), sh_quote(line)));
+        a
+    }
+}
+
+/// Percent-encode a POSIX path for a `file://` URI.
+fn uri_encode(path: &str) -> String {
+    let mut out = String::new();
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Find the folder's absolute path and which of `programs` the host has.
+pub fn probe(spec: &RemoteSpec, cache: &Path, programs: &[String]) -> Result<HostInfo, String> {
+    let list: Vec<String> = programs.iter().map(|p| sh_quote(p)).collect();
+    let inner = format!(
+        "echo \"@root:$(pwd)\"; for c in {}; do p=$(command -v \"$c\" 2>/dev/null); \
+         if [ -z \"$p\" ]; then for d in \"$HOME/.cargo/bin\" \"$HOME/.local/bin\" \"$HOME/go/bin\" /usr/local/bin; do \
+         [ -x \"$d/$c\" ] && p=\"$d/$c\" && break; done; fi; [ -n \"$p\" ] && echo \"@has:$c=$p\"; done; true",
+        list.join(" ")
+    );
+    let script = format!("cd {} && \"${{SHELL:-sh}}\" -lc {}", spec.qpath(), sh_quote(&inner));
+    let out = String::from_utf8_lossy(&run(ssh(spec, &script))?).into_owned();
+    let root = out.lines().find_map(|l| l.strip_prefix("@root:")).ok_or("couldn't read the folder's path")?;
+    Ok(HostInfo {
+        spec: spec.clone(),
+        cache: cache.to_path_buf(),
+        root: root.trim().to_string(),
+        found: out
+            .lines()
+            .filter_map(|l| l.strip_prefix("@has:")?.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect(),
+    })
+}
+
 /// `ssh` arguments for an interactive shell in the folder.
 pub fn shell_args(spec: &RemoteSpec) -> Vec<String> {
     let mut a = ssh_args(spec, true);
@@ -392,6 +479,9 @@ pub struct Session {
     last_pull: Instant,
     /// Last time deletions on the host were looked for.
     last_full: Instant,
+    probe: Option<Receiver<Result<HostInfo, String>>>,
+    /// The host's folder path and programs, once known.
+    pub host: Option<HostInfo>,
     waker: Arc<dyn Fn() + Send + Sync>,
     pub last_error: Option<String>,
 }
@@ -454,6 +544,8 @@ impl Session {
             pull: None,
             last_pull: Instant::now(),
             last_full: Instant::now(),
+            probe: None,
+            host: None,
             waker,
             last_error: None,
         }
@@ -488,6 +580,30 @@ impl Session {
         if let Some(rel) = self.rel(p) {
             let _ = self.ops.send(Op::Mkdir(rel));
         }
+    }
+
+    /// Look up the host's folder path and which of `programs` it has, in the
+    /// background ([`poll`](Self::poll) reports when it's known).
+    pub fn start_probe(&mut self, programs: Vec<String>) {
+        let (tx, rx) = channel();
+        let (spec, cache, w) = (self.spec.clone(), self.cache.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(probe(&spec, &cache, &programs));
+            w();
+        });
+        self.probe = Some(rx);
+    }
+
+    /// The probe's result, once (the host info is then in `host`).
+    pub fn take_probed(&mut self) -> Option<Result<(), String>> {
+        let rx = self.probe.as_ref()?;
+        let r = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(_) => Err("probe failed".into()),
+        };
+        self.probe = None;
+        Some(r.map(|h| self.host = Some(h)))
     }
 
     /// Fetch host changes now.
@@ -638,6 +754,16 @@ mod tests {
         let removed = prune_deleted(&cache, &present, std::time::SystemTime::now() - Duration::from_secs(5));
         assert!(removed.iter().any(|p| p.ends_with("src/lib.rs")), "{removed:?}");
         assert!(cache.join("fresh.txt").exists());
+        // The host's path and programs.
+        let info = probe(&spec, &cache, &["sh".into(), "no-such-program-zenith".into()]).unwrap();
+        assert!(info.found.contains_key("sh") && !info.found.contains_key("no-such-program-zenith"));
+        assert_eq!(std::path::Path::new(&info.root).canonicalize().unwrap(), remote_dir.canonicalize().unwrap());
+        assert_eq!(info.host_path(&cache.join("src/a.rs")).unwrap(), format!("{}/src/a.rs", info.root));
+        let out = std::process::Command::new("ssh")
+            .args(&info.command(&cache.join("src"), "pwd", &[])[1..])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).trim().ends_with("/src"));
         // Git runs on the host.
         if git(&spec, &["init", "-q"]).is_ok() {
             let (status, _, stashes, ops, prefix) = git_state(&spec).unwrap();

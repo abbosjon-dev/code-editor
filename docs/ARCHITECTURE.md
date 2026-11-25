@@ -70,4 +70,4 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] Sozlamalar oynasi
 - [x] Sozlamalarni Git repo orqali sinxronlash
 - [x] Test paneli (cargo test, pytest), testni debugger ostida ishga tushirish
-- [x] SSH orqali uzoqdan ishlash (mahalliy nusxa + serverda terminal/agentlar/git)
+- [x] SSH orqali uzoqdan ishlash (mahalliy nusxa + serverda terminal/agentlar/git/LSP/debugger)

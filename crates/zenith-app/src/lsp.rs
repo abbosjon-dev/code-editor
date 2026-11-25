@@ -29,6 +29,10 @@ pub struct LspManager {
     pub inlay_hints: bool,
     /// Request semantic tokens.
     pub semantic: bool,
+    /// Folder opened over SSH: its servers run on the host.
+    pub remote: Option<crate::remote::HostInfo>,
+    /// A remote folder whose host isn't probed yet: wait instead of failing.
+    pub remote_pending: Option<PathBuf>,
 }
 
 /// What the app should do with an event that isn't tied to a document.
@@ -100,6 +104,8 @@ impl LspManager {
             client_roots: HashMap::new(),
             inlay_hints: true,
             semantic: true,
+            remote: None,
+            remote_pending: None,
         }
     }
 
@@ -138,13 +144,31 @@ impl LspManager {
             return None;
         }
         if !self.clients.contains_key(&key) {
-            if !cfg.is_installed() {
-                self.failed.insert(cfg.name.clone());
-                return None;
+            if self.remote_pending.as_ref().is_some_and(|c| root.starts_with(c)) {
+                return None; // not known yet what the host has
             }
+            // In a folder opened over SSH the server runs on the host.
+            let host = self.remote.as_ref().filter(|h| root.starts_with(&h.cache));
+            let launch = match host {
+                Some(h) => {
+                    if !h.found.contains_key(&cfg.command) {
+                        self.failed.insert(cfg.name.clone());
+                        return None;
+                    }
+                    let map = h.path_map(&root)?;
+                    Some(zenith_lsp::RemoteLaunch { argv: h.command(&root, &cfg.command, &cfg.args), map })
+                }
+                None => {
+                    if !cfg.is_installed() {
+                        self.failed.insert(cfg.name.clone());
+                        return None;
+                    }
+                    None
+                }
+            };
             let mut cfg = cfg.clone();
             cfg.name = key.clone(); // events are tagged with this name
-            match LspClient::start(cfg, &root, self.tx.clone(), self.waker.clone()) {
+            match LspClient::start_with(cfg, &root, self.tx.clone(), self.waker.clone(), launch) {
                 Ok(c) => {
                     self.clients.insert(key.clone(), c);
                     self.client_roots.insert(key.clone(), root);

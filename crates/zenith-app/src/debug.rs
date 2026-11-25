@@ -88,6 +88,8 @@ pub struct Session {
 }
 
 pub struct Debugger {
+    /// Folder opened over SSH: adapters and builds run on the host.
+    pub remote: Option<crate::remote::HostInfo>,
     pub session: Option<Session>,
     pub output: Vec<(String, String)>,
     pub console_input: String,
@@ -112,6 +114,7 @@ impl Debugger {
     pub fn new(waker: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (tx, rx) = channel();
         Self {
+            remote: None,
             session: None,
             output: vec![],
             console_input: String::new(),
@@ -202,8 +205,10 @@ impl Debugger {
             let (tx, rx) = channel();
             let out_tx = self.tx.clone();
             let waker = self.waker.clone();
+            // On a remote folder the build runs on the host.
+            let argv = self.remote.as_ref().filter(|h| root.starts_with(&h.cache)).map(|h| h.shell(&root, &cfg.build));
             thread::spawn(move || {
-                let r = run_build(&cfg.build, &root, &out_tx);
+                let r = run_build(&cfg.build, argv, &root, &out_tx);
                 let _ = tx.send(r);
                 waker();
             });
@@ -215,10 +220,27 @@ impl Debugger {
 
     fn launch_adapter(&mut self) {
         let Some(s) = &mut self.session else { return };
+        let host = self.remote.as_ref().filter(|h| s.root.starts_with(&h.cache));
         let cmd = if !s.config.command.is_empty() {
             Some((s.config.command[0].clone(), s.config.command[1..].to_vec()))
+        } else if let Some(h) = host {
+            // The first of the adapter's commands the host has.
+            zenith_dap::adapter(&s.config.adapter).and_then(|a| {
+                a.commands
+                    .iter()
+                    .find(|(p, _)| h.found.contains_key(*p))
+                    .map(|(p, args)| (p.to_string(), args.iter().map(|x| x.to_string()).collect()))
+            })
         } else {
             zenith_dap::adapter(&s.config.adapter).and_then(|a| a.resolve())
+        };
+        // Remote: start it through ssh and translate paths.
+        let (cmd, map) = match (cmd, host) {
+            (Some((p, a)), Some(h)) => {
+                let argv = h.command(&s.root, &p, &a);
+                (Some((argv[0].clone(), argv[1..].to_vec())), h.path_map(&s.root))
+            }
+            (c, _) => (c, None),
         };
         let Some((program, args)) = cmd else {
             let hint = zenith_dap::adapter(&s.config.adapter).map(|a| a.install_hint).unwrap_or("check launch.toml");
@@ -227,7 +249,7 @@ impl Debugger {
             self.log_line("stderr", msg);
             return;
         };
-        match DapClient::start(&program, &args, &s.root, self.tx.clone(), self.waker.clone()) {
+        match DapClient::start_with(&program, &args, &s.root, self.tx.clone(), self.waker.clone(), map) {
             Ok(mut c) => {
                 let seq = c.request(
                     "initialize",
@@ -624,10 +646,14 @@ fn build_line(l: String) -> DapMessage {
     DapMessage::Event { event: "output".into(), body: json!({ "category": "console", "output": format!("{l}\n") }) }
 }
 
-fn run_build(cmd: &str, root: &Path, tx: &Sender<DapMessage>) -> Result<(), String> {
+fn run_build(cmd: &str, argv: Option<Vec<String>>, root: &Path, tx: &Sender<DapMessage>) -> Result<(), String> {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
-    let mut c = if cfg!(windows) {
+    let mut c = if let Some(a) = argv.filter(|a| !a.is_empty()) {
+        let mut c = Command::new(&a[0]);
+        c.args(&a[1..]);
+        c
+    } else if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.args(["/C", cmd]);
         c
