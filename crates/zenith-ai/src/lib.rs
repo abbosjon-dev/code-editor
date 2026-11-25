@@ -33,6 +33,11 @@ pub struct AgentProfile {
     /// editor restores a session (e.g. `--continue` for Claude Code).
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// Arguments that make the CLI answer one prompt and exit (used for
+    /// inline AI edits); `{prompt}` is replaced by the prompt. Empty: the
+    /// agent can't do inline edits.
+    #[serde(default)]
+    pub oneshot_args: Vec<String>,
 }
 
 fn default_icon() -> String {
@@ -50,6 +55,7 @@ impl AgentProfile {
             install_hint: hint.into(),
             icon: icon.into(),
             resume_args: vec![],
+            oneshot_args: vec![],
         }
     }
 
@@ -64,12 +70,22 @@ pub fn builtin_agents() -> Vec<AgentProfile> {
     vec![
         AgentProfile {
             resume_args: vec!["--continue".into()],
+            oneshot_args: vec!["-p".into(), "{prompt}".into()],
             ..AgentProfile::builtin("claude", "Claude Code", "claude", "✳", "npm install -g @anthropic-ai/claude-code")
         },
-        AgentProfile::builtin("codex", "OpenAI Codex", "codex", "◎", "npm install -g @openai/codex"),
-        AgentProfile::builtin("gemini", "Gemini CLI", "gemini", "◈", "npm install -g @google/gemini-cli"),
+        AgentProfile {
+            oneshot_args: vec!["exec".into(), "{prompt}".into()],
+            ..AgentProfile::builtin("codex", "OpenAI Codex", "codex", "◎", "npm install -g @openai/codex")
+        },
+        AgentProfile {
+            oneshot_args: vec!["-p".into(), "{prompt}".into()],
+            ..AgentProfile::builtin("gemini", "Gemini CLI", "gemini", "◈", "npm install -g @google/gemini-cli")
+        },
         AgentProfile::builtin("aider", "Aider", "aider", "◆", "python -m pip install aider-install && aider-install"),
-        AgentProfile::builtin("opencode", "OpenCode", "opencode", "◇", "npm install -g opencode-ai"),
+        AgentProfile {
+            oneshot_args: vec!["run".into(), "{prompt}".into()],
+            ..AgentProfile::builtin("opencode", "OpenCode", "opencode", "◇", "npm install -g opencode-ai")
+        },
     ]
 }
 

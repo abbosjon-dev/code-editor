@@ -13,6 +13,7 @@ mod file_tree;
 mod folding;
 mod git;
 mod highlight;
+mod inline_ai;
 mod keymap;
 mod lsp;
 mod marketplace;

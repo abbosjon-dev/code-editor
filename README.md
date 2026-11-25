@@ -96,6 +96,15 @@ Claude Code o'zining oxirgi suhbatini `--continue` bilan davom ettiradi (agentga
 
 API kalitlarni sozlamalarga yozmang — agentlar sizning shell muhitingizdagi o'zgaruvchilarni meros qilib oladi.
 
+## AI bilan inline tahrir (Ctrl+K)
+
+Kodni belgilang va `Ctrl+K` (macOS: `⌘K`) — ko'rsatma yozing ("xatolarni qayta ishlashni qo'sh", "async qil"…) va
+Enter. Standart AI agent (Claude Code `-p`, Codex `exec`, Gemini `-p`, OpenCode `run`) bir martalik rejimda javob
+beradi; natija **yonma-yon diff** ko'rinishida chiqadi: **✓ Accept** (`Ctrl+Enter`) yoki **✕ Reject** (`Esc`).
+Qabul qilmaguningizcha fayl o'zgarmaydi; ko'rsatmani o'zgartirib Enter — qayta so'raydi. Hech narsa belgilanmagan
+bo'lsa — kursor joyiga yangi kod yoziladi. O'z agentingiz uchun `settings.toml` da `oneshot_args = ["-p", "{prompt}"]`.
+SSH papkada agent serverda ishlaydi.
+
 ## AI o'zgarishlarini ko'rib chiqish
 
 Agent (masalan Claude Code) ochiq faylni o'zgartirsa, tepada banner chiqadi: **Review diff** — har bir o'zgarishni

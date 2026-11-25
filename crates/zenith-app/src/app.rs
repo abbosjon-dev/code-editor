@@ -201,6 +201,8 @@ pub struct ZenithApp {
     /// Test explorer.
     tests: crate::testing::Panel,
     market: crate::marketplace::Market,
+    /// Ctrl+K: an AI edit of the selection in progress.
+    inline_edit: Option<crate::inline_ai::InlineEdit>,
     /// settings.toml as written (without the workspace's overrides).
     user_settings: Settings,
     /// Keys the workspace's .zenith/settings.toml overrides.
@@ -322,6 +324,7 @@ impl ZenithApp {
             mcp: Default::default(),
             tests: Default::default(),
             market: Default::default(),
+            inline_edit: None,
             user_settings: settings.clone(),
             ws_overrides: vec![],
             sync_rx: None,
@@ -1592,6 +1595,21 @@ impl ZenithApp {
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
             Cmd::OpenSettings => self.show_settings = true,
+            Cmd::InlineAiEdit => {
+                let Some(doc) = self.docs.get(self.active) else { return };
+                let file = doc
+                    .path()
+                    .map(|p| {
+                        self.workspace
+                            .as_ref()
+                            .and_then(|w| p.strip_prefix(w).ok())
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| doc.title());
+                self.inline_edit = Some(crate::inline_ai::InlineEdit::new(doc, file));
+            }
             Cmd::StageChangeAtCursor | Cmd::UnstageChangeAtCursor => {
                 if let Some(line) = self.docs.get(self.active).map(|d| d.buffer.cursor_pos().line) {
                     self.stage_hunk(line, cmd == Cmd::StageChangeAtCursor);
@@ -2873,6 +2891,7 @@ impl ZenithApp {
             (cs, Key::F, Cmd::FindInFiles, true),
             (cs, Key::A, Cmd::ToggleAiPanel, true),
             (cs, Key::L, Cmd::SendSelectionToAgent, false),
+            (cmd, Key::K, Cmd::InlineAiEdit, false),
             (cs, Key::I, Cmd::AskAgent, true),
             (cs, Key::E, Cmd::ShowExplorer, true),
             (cs, Key::G, Cmd::ShowSourceControl, true),
@@ -3093,6 +3112,7 @@ impl ZenithApp {
                     }
                 }
                 ui.separator();
+                item(ui, Cmd::InlineAiEdit, "Edit Selection with AI…");
                 item(ui, Cmd::AskAgent, "Ask About Selection…");
                 item(ui, Cmd::SendSelectionToAgent, "Send Selection");
                 item(ui, Cmd::SendFileToAgent, "Send Current File");
@@ -5441,6 +5461,166 @@ impl ZenithApp {
         }
     }
 
+    /// Ctrl+K: instruction → agent → diff → accept / reject.
+    fn inline_edit_window(&mut self, ctx: &egui::Context) {
+        use crate::inline_ai::State;
+        let Some(e) = &mut self.inline_edit else { return };
+        e.poll();
+        let p = self.colors.clone();
+        let mut submit = false;
+        let mut accept = false;
+        let mut close = false;
+        let lines = {
+            let doc = self.docs.iter().find(|d| d.id == e.doc_id);
+            doc.map(|d| {
+                let a = d.buffer.char_to_pos(e.start.min(d.buffer.len_chars())).line + 1;
+                let b = d.buffer.char_to_pos(e.end.min(d.buffer.len_chars())).line + 1;
+                if e.original.is_empty() {
+                    format!("insert at line {a}")
+                } else {
+                    format!("lines {a}–{b}")
+                }
+            })
+            .unwrap_or_default()
+        };
+        egui::Window::new("✳ AI Edit")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(760.0)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 70.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{} · {lines}", e.file)).small().color(p.text_dim));
+                let busy = matches!(e.state, State::Asking { .. });
+                let r = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::multiline(&mut e.instruction)
+                        .hint_text(if e.original.is_empty() {
+                            "What should be written here? (Enter to send)"
+                        } else {
+                            "How should the selection change? (Enter to send, Shift+Enter: new line)"
+                        })
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if e.focus {
+                    r.request_focus();
+                    e.focus = false;
+                }
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift && !i.modifiers.command);
+                if r.has_focus() && enter {
+                    // Don't keep the newline the key just typed.
+                    while e.instruction.ends_with('\n') {
+                        e.instruction.pop();
+                    }
+                    submit = !e.instruction.trim().is_empty();
+                }
+                match &e.state {
+                    State::Editing => {}
+                    State::Asking { .. } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Asking {}…", e.agent_name));
+                            if ui.button("Cancel").clicked() {
+                                e.cancel();
+                            }
+                        });
+                    }
+                    State::Failed(err) => {
+                        ui.label(RichText::new(err).color(p.error));
+                    }
+                    State::Ready(new) => {
+                        let rows = crate::git::side_by_side(&e.original, new);
+                        let changes: Vec<usize> = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, r)| r.changed && (*i == 0 || !rows[i - 1].changed))
+                            .map(|(i, _)| i)
+                            .collect();
+                        let old: Vec<&str> = e.original.lines().collect();
+                        let newl: Vec<&str> = new.lines().collect();
+                        let h = (rows.len() as f32 * 20.0 + 10.0).clamp(60.0, 360.0);
+                        ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
+                            let id = ui.make_persistent_id("inline-ai-diff");
+                            let fs = self.settings.editor_font_size * 0.95;
+                            crate::diff_view::rows_ui(ui, id, &rows, &changes, &old, &newl, &p, fs, None, false);
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("✓ Accept").color(egui::Color32::WHITE))
+                                        .fill(p.success),
+                                )
+                                .on_hover_text("Ctrl+Enter")
+                                .clicked()
+                            {
+                                accept = true;
+                            }
+                            if ui.button("✕ Reject").on_hover_text("Esc").clicked() {
+                                close = true;
+                            }
+                            ui.label(
+                                RichText::new("Change the instruction and press Enter to try again")
+                                    .small()
+                                    .color(p.text_dim),
+                            );
+                        });
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) {
+                            accept = true;
+                        }
+                    }
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if submit {
+            let agent = self.agents.iter().find(|a| a.id == self.settings.default_agent).cloned();
+            let prompt = e.prompt();
+            match agent.as_ref().and_then(|a| crate::inline_ai::oneshot_command(a, &prompt).map(|c| (a, c))) {
+                Some((a, argv)) => {
+                    e.agent_name = a.name.clone();
+                    // On a remote folder the agent runs on the host.
+                    let argv = match (&self.debugger.remote, &self.workspace) {
+                        (Some(h), Some(ws)) => h.command(ws, &argv[0], &argv[1..]),
+                        _ => argv,
+                    };
+                    let cwd = if self.debugger.remote.is_some() { None } else { self.workspace.clone() };
+                    e.ask(argv, cwd, self.waker.clone());
+                }
+                None => {
+                    let name = agent.map(|a| a.name).unwrap_or_else(|| self.settings.default_agent.clone());
+                    e.state = State::Failed(format!(
+                        "{name} has no one-shot mode for inline edits. Pick another default agent (Settings → AI) \
+                         or set its `oneshot_args` in settings.toml, e.g. [\"-p\", \"{{prompt}}\"]."
+                    ));
+                }
+            }
+        }
+        if accept {
+            if let Some(e) = self.inline_edit.take() {
+                if let State::Ready(new) = &e.state {
+                    match self.docs.iter_mut().find(|d| d.id == e.doc_id) {
+                        Some(doc)
+                            if e.end <= doc.buffer.len_chars()
+                                && doc.buffer.rope().slice(e.start..e.end) == e.original.as_str() =>
+                        {
+                            doc.buffer.clear_extra();
+                            doc.buffer.apply_edits(vec![(e.start, e.end, new.clone())]);
+                            let end = e.start + new.chars().count();
+                            doc.buffer.set_cursor(e.start, false);
+                            doc.buffer.set_cursor(end, true);
+                            self.focus_editor = true;
+                        }
+                        _ => self.toast("The code changed meanwhile; the AI edit wasn't applied", NotifyLevel::Warning),
+                    }
+                }
+            }
+        } else if close {
+            self.inline_edit = None;
+            self.focus_editor = true;
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -6449,6 +6629,7 @@ impl eframe::App for ZenithApp {
         self.dialogs(ctx);
         self.changes_window(ctx);
         self.settings_window(ctx);
+        self.inline_edit_window(ctx);
         self.toasts_ui(ctx);
 
         // Agents may edit files on disk; poll for external changes now and then.
