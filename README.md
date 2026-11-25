@@ -101,7 +101,8 @@ API kalitlarni sozlamalarga yozmang — agentlar sizning shell muhitingizdagi o'
 Kodni belgilang va `Ctrl+K` (macOS: `⌘K`) — ko'rsatma yozing ("xatolarni qayta ishlashni qo'sh", "async qil"…) va
 Enter. Standart AI agent (Claude Code `-p`, Codex `exec`, Gemini `-p`, OpenCode `run`) bir martalik rejimda javob
 beradi; javob **yozilayotganda jonli** ko'rinadi (Claude Code — `stream-json` orqali), natija **yonma-yon diff** ko'rinishida chiqadi: **✓ Accept** (`Ctrl+Enter`) yoki **✕ Reject** (`Esc`).
-Qabul qilmaguningizcha fayl o'zgarmaydi; ko'rsatmani o'zgartirib Enter — qayta so'raydi. Hech narsa belgilanmagan
+Qabul qilmaguningizcha fayl o'zgarmaydi; ko'rsatmani o'zgartirib Enter — qayta so'raydi. **Bir nechta belgilash** (`Ctrl+D`, `Alt+bosish`, `Shift+Alt+sudrash`) bo'lsa — hammasi bitta so'rovda o'zgartiriladi
+va har biri uchun alohida diff chiqadi; *AI: Edit Whole File* — butun faylni. Hech narsa belgilanmagan
 bo'lsa — kursor joyiga yangi kod yoziladi. O'z agentingiz uchun `settings.toml` da `oneshot_args = ["-p", "{prompt}"]`.
 SSH papkada agent serverda ishlaydi.
 

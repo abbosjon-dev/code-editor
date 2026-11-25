@@ -40,6 +40,64 @@ pub fn build_prompt(file: &str, language: &str, before: &str, code: &str, after:
     )
 }
 
+/// Prompt for the whole file.
+pub fn build_file_prompt(file: &str, language: &str, text: &str, instruction: &str) -> String {
+    format!(
+        "You are editing {file} ({language}). Rewrite the whole file following the instruction.\n\
+         Answer with ONLY the complete new content of the file, nothing else: no explanation, \
+         no markdown fences. Don't modify any files yourself.\n\n\
+         Instruction: {instruction}\n\n\
+         <FILE>{text}</FILE>"
+    )
+}
+
+/// Prompt for several selections at once; the answer has one block per
+/// selection, each after a `=== n ===` line.
+pub fn build_multi_prompt(file: &str, language: &str, regions: &[Region], instruction: &str) -> String {
+    let mut p = format!(
+        "You are editing {file} ({language}). Rewrite each numbered selection below following the instruction.\n\
+         Answer with each rewritten selection after its own marker line, exactly like this:\n\
+         === 1 ===\n<code for selection 1>\n=== 2 ===\n<code for selection 2>\n\
+         Nothing else: no explanation, no markdown fences; keep the indentation. Don't modify any files.\n\n\
+         Instruction: {instruction}\n"
+    );
+    for (i, r) in regions.iter().enumerate() {
+        p.push_str(&format!(
+            "\nSelection {} (line {}), with the code around it:\n{}<SELECTION>{}</SELECTION>{}\n",
+            i + 1,
+            r.line + 1,
+            r.before,
+            r.original,
+            r.after
+        ));
+    }
+    p
+}
+
+/// Split a multi-selection answer into its `=== n ===` blocks (raw).
+/// Blocks not seen yet are empty.
+pub fn split_blocks(raw: &str, n: usize) -> Vec<String> {
+    let mut out = vec![String::new(); n];
+    let mut cur: Option<usize> = None;
+    for line in raw.split_inclusive('\n') {
+        let t = line.trim();
+        if let Some(k) =
+            t.strip_prefix("===").and_then(|r| r.strip_suffix("===")).and_then(|k| k.trim().parse::<usize>().ok())
+        {
+            cur = (k >= 1 && k <= n).then(|| k - 1);
+            continue;
+        }
+        // A marker still being written (streaming) isn't code.
+        if !line.ends_with('\n') && t.starts_with("===") {
+            continue;
+        }
+        if let Some(i) = cur {
+            out[i].push_str(line);
+        }
+    }
+    out
+}
+
 /// The agent's answer as plain code: no ``` fences, and ending with a
 /// newline exactly when the original did.
 pub fn clean_answer(out: &str, original: &str) -> String {
@@ -110,21 +168,37 @@ pub fn clean_partial(raw: &str) -> String {
 
 pub enum State {
     Editing,
-    Asking { rx: Receiver<Msg>, child: Arc<Mutex<Option<Child>>>, partial: String },
-    Ready(String),
+    Asking {
+        rx: Receiver<Msg>,
+        child: Arc<Mutex<Option<Child>>>,
+        partial: String,
+    },
+    /// The new code for each region.
+    Ready(Vec<String>),
     Failed(String),
+}
+
+/// One selection being edited.
+#[derive(Clone, Debug)]
+pub struct Region {
+    /// Char range (empty: insert at `start`).
+    pub start: usize,
+    pub end: usize,
+    pub original: String,
+    /// Context sent along.
+    pub before: String,
+    pub after: String,
+    /// 0-based first line.
+    pub line: usize,
 }
 
 pub struct InlineEdit {
     pub doc_id: u64,
-    /// Char range of the selection (empty: insert at `start`).
-    pub start: usize,
-    pub end: usize,
-    pub original: String,
+    /// The selections, in document order (one when editing the whole file).
+    pub regions: Vec<Region>,
+    pub whole_file: bool,
     pub file: String,
     pub language: String,
-    pub before: String,
-    pub after: String,
     pub instruction: String,
     pub state: State,
     pub agent_name: String,
@@ -132,30 +206,89 @@ pub struct InlineEdit {
 }
 
 impl InlineEdit {
+    /// Edit the document's selections (or insert at the caret).
     pub fn new(doc: &crate::document::Document, file: String) -> Self {
         let b = &doc.buffer;
-        let (start, end) = (b.sel.start(), b.sel.end());
+        let mut sels = b.selections();
+        sels.sort_by_key(|s| s.start());
+        // Less context each when there are several.
+        let ctx = if sels.len() > 1 { 8 } else { CONTEXT_LINES };
         let rope = b.rope();
-        let original = rope.slice(start..end).to_string();
-        let first = rope.char_to_line(start);
-        let last = rope.char_to_line(end);
-        let from = rope.line_to_char(first.saturating_sub(CONTEXT_LINES));
-        let to_line = (last + CONTEXT_LINES + 1).min(rope.len_lines());
-        let to = if to_line >= rope.len_lines() { rope.len_chars() } else { rope.line_to_char(to_line) };
+        let regions = sels
+            .iter()
+            .map(|sel| {
+                let (start, end) = (sel.start(), sel.end());
+                let first = rope.char_to_line(start);
+                let last = rope.char_to_line(end);
+                let from = rope.line_to_char(first.saturating_sub(ctx));
+                let to_line = (last + ctx + 1).min(rope.len_lines());
+                let to = if to_line >= rope.len_lines() { rope.len_chars() } else { rope.line_to_char(to_line) };
+                Region {
+                    start,
+                    end,
+                    original: rope.slice(start..end).to_string(),
+                    before: rope.slice(from..start).to_string(),
+                    after: rope.slice(end..to).to_string(),
+                    line: first,
+                }
+            })
+            .collect();
+        Self::with_regions(doc, file, regions, false)
+    }
+
+    /// Edit the whole document.
+    pub fn whole_file(doc: &crate::document::Document, file: String) -> Self {
+        let text = doc.buffer.text();
+        let region = Region {
+            start: 0,
+            end: doc.buffer.len_chars(),
+            original: text,
+            before: String::new(),
+            after: String::new(),
+            line: 0,
+        };
+        Self::with_regions(doc, file, vec![region], true)
+    }
+
+    fn with_regions(doc: &crate::document::Document, file: String, regions: Vec<Region>, whole_file: bool) -> Self {
         Self {
             doc_id: doc.id,
-            start,
-            end,
-            original,
+            regions,
+            whole_file,
             file,
             language: doc.language().to_string(),
-            before: rope.slice(from..start).to_string(),
-            after: rope.slice(end..to).to_string(),
             instruction: String::new(),
             state: State::Editing,
             agent_name: String::new(),
             focus: true,
         }
+    }
+
+    /// The answer so far split per region, for the live diff.
+    pub fn partial_answers(&self, raw: &str) -> Vec<String> {
+        if self.regions.len() == 1 {
+            vec![clean_partial(raw)]
+        } else {
+            split_blocks(raw, self.regions.len()).iter().map(|b| clean_partial(b)).collect()
+        }
+    }
+
+    /// The final answer per region, or why it can't be used.
+    fn answers(&self, raw: &str) -> Result<Vec<String>, String> {
+        if self.regions.len() == 1 {
+            let t = clean_answer(raw, &self.regions[0].original);
+            if t.trim().is_empty() && !self.regions[0].original.is_empty() {
+                return Err("The agent answered with no code".into());
+            }
+            return Ok(vec![t]);
+        }
+        let blocks = split_blocks(raw, self.regions.len());
+        let missing: Vec<String> =
+            blocks.iter().enumerate().filter(|(_, b)| b.trim().is_empty()).map(|(i, _)| (i + 1).to_string()).collect();
+        if !missing.is_empty() {
+            return Err(format!("The answer has no code for selection {}", missing.join(", ")));
+        }
+        Ok(blocks.iter().zip(&self.regions).map(|(b, r)| clean_answer(b, &r.original)).collect())
     }
 
     /// Ask `argv` (built by the caller; maybe through ssh) in `cwd`;
@@ -164,7 +297,6 @@ impl InlineEdit {
         let (tx, rx) = channel();
         let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let slot = child.clone();
-        let original = self.original.clone();
         let json = format == "claude-stream-json";
         std::thread::spawn(move || {
             let r = (|| {
@@ -231,7 +363,7 @@ impl InlineEdit {
                             Some(Ok(t)) if !t.is_empty() => t,
                             _ => text,
                         };
-                        Ok(clean_answer(&full, &original))
+                        Ok(full)
                     }
                     (Some(_), _) => {
                         Err(if err.trim().is_empty() { text.trim().to_string() } else { err.trim().to_string() })
@@ -264,18 +396,19 @@ impl InlineEdit {
             }
         }
         if let Some(r) = done {
-            self.state = match r {
-                Ok(t) if t.trim().is_empty() && !self.original.is_empty() => {
-                    State::Failed("The agent answered with no code".into())
-                }
-                Ok(t) => State::Ready(t),
+            self.state = match r.and_then(|raw| self.answers(&raw)) {
+                Ok(v) => State::Ready(v),
                 Err(e) => State::Failed(e),
             };
         }
     }
 
     pub fn prompt(&self) -> String {
-        build_prompt(&self.file, &self.language, &self.before, &self.original, &self.after, &self.instruction)
+        match &self.regions[..] {
+            [r] if self.whole_file => build_file_prompt(&self.file, &self.language, &r.original, &self.instruction),
+            [r] => build_prompt(&self.file, &self.language, &r.before, &r.original, &r.after, &self.instruction),
+            rs => build_multi_prompt(&self.file, &self.language, rs, &self.instruction),
+        }
     }
 }
 
@@ -308,6 +441,28 @@ mod tests {
     }
 
     #[test]
+    fn several_selections_and_whole_file() {
+        let mut doc = crate::document::Document::new_untitled(1, 1, crate::highlight::load_theme("OneHalfDark"));
+        doc.buffer.set_text("a = 1\nb = 2\nc = 3\n");
+        // Select "1" and "3".
+        doc.buffer.set_selections(vec![zenith_core::Selection::new(16, 17), zenith_core::Selection::new(4, 5)]);
+        let e = InlineEdit::new(&doc, "x.py".into());
+        assert_eq!(e.regions.iter().map(|r| r.original.as_str()).collect::<Vec<_>>(), ["1", "3"]);
+        assert_eq!(e.regions[1].line, 2);
+        let p = e.prompt();
+        assert!(p.contains("=== 1 ===") && p.contains("Selection 2 (line 3)"));
+        let raw = "=== 1 ===\n10\n=== 2 ===\n```\n30\n```\n";
+        assert_eq!(e.answers(raw).unwrap(), ["10", "30"]);
+        assert!(e.answers("=== 1 ===\n10\n").unwrap_err().contains("selection 2"));
+        assert_eq!(e.partial_answers("=== 1 ===\n10\n=== 2"), ["10\n", ""]);
+
+        let w = InlineEdit::whole_file(&doc, "x.py".into());
+        assert!(w.whole_file && w.regions[0].end == doc.buffer.len_chars());
+        assert!(w.prompt().contains("<FILE>a = 1"));
+        assert_eq!(w.answers("a = 10\nb = 2\nc = 3").unwrap(), ["a = 10\nb = 2\nc = 3\n"]);
+    }
+
+    #[test]
     fn stream_json_and_partials() {
         let delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"let x"}}}"#;
         assert!(matches!(parse_stream_json(delta), Event::Delta(t) if t == "let x"));
@@ -328,7 +483,7 @@ mod tests {
         let mut doc = crate::document::Document::new_untitled(1, 1, crate::highlight::load_theme("OneHalfDark"));
         doc.buffer.set_text("x\n");
         let mut e = InlineEdit::new(&doc, "a.rs".into());
-        e.original = "    1\n".into();
+        e.regions[0].original = "    1\n".into();
         let script = r#"
 d() { printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}}\n' "$1"; }
 echo '{"type":"system","subtype":"init"}'; d '    2'; sleep 0.3; d '0'; sleep 0.3
@@ -345,7 +500,7 @@ echo '{"type":"result","is_error":false,"result":"    20"}'"#;
         }
         assert!(seen_partial, "no partial answer seen");
         assert!(
-            matches!(&e.state, State::Ready(t) if t == "    20\n"),
+            matches!(&e.state, State::Ready(t) if t[0] == "    20\n"),
             "{}",
             match &e.state {
                 State::Failed(m) => m.clone(),
@@ -361,14 +516,14 @@ echo '{"type":"result","is_error":false,"result":"    20"}'"#;
         let mut doc = crate::document::Document::new_untitled(1, 1, crate::highlight::load_theme("OneHalfDark"));
         doc.buffer.set_text("fn a() {\n    1\n}\n");
         let mut e = InlineEdit::new(&doc, "a.rs".into());
-        e.original = "    1\n".into();
+        e.regions[0].original = "    1\n".into();
         e.ask(vec!["sh".into(), "-c".into(), "printf '```\\n    2\\n```\\n'".into()], None, "", Arc::new(|| {}));
         let t = std::time::Instant::now();
         while matches!(e.state, State::Asking { .. }) && t.elapsed().as_secs() < 10 {
             std::thread::sleep(std::time::Duration::from_millis(20));
             e.poll();
         }
-        assert!(matches!(&e.state, State::Ready(t) if t == "    2\n"));
+        assert!(matches!(&e.state, State::Ready(t) if t[0] == "    2\n"));
         e.ask(vec!["sh".into(), "-c".into(), "echo nope >&2; exit 3".into()], None, "", Arc::new(|| {}));
         let t = std::time::Instant::now();
         while matches!(e.state, State::Asking { .. }) && t.elapsed().as_secs() < 10 {

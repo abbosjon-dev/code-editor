@@ -1595,7 +1595,7 @@ impl ZenithApp {
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
             Cmd::OpenSettings => self.show_settings = true,
-            Cmd::InlineAiEdit => {
+            Cmd::InlineAiEdit | Cmd::InlineAiEditFile => {
                 let Some(doc) = self.docs.get(self.active) else { return };
                 let file = doc
                     .path()
@@ -1608,7 +1608,11 @@ impl ZenithApp {
                             .into_owned()
                     })
                     .unwrap_or_else(|| doc.title());
-                self.inline_edit = Some(crate::inline_ai::InlineEdit::new(doc, file));
+                self.inline_edit = Some(if cmd == Cmd::InlineAiEditFile {
+                    crate::inline_ai::InlineEdit::whole_file(doc, file)
+                } else {
+                    crate::inline_ai::InlineEdit::new(doc, file)
+                });
             }
             Cmd::StageChangeAtCursor | Cmd::UnstageChangeAtCursor => {
                 if let Some(line) = self.docs.get(self.active).map(|d| d.buffer.cursor_pos().line) {
@@ -3113,6 +3117,7 @@ impl ZenithApp {
                 }
                 ui.separator();
                 item(ui, Cmd::InlineAiEdit, "Edit Selection with AI…");
+                item(ui, Cmd::InlineAiEditFile, "Edit Whole File with AI…");
                 item(ui, Cmd::AskAgent, "Ask About Selection…");
                 item(ui, Cmd::SendSelectionToAgent, "Send Selection");
                 item(ui, Cmd::SendFileToAgent, "Send Current File");
@@ -5501,18 +5506,46 @@ impl ZenithApp {
         let mut submit = false;
         let mut accept = false;
         let mut close = false;
-        let lines = {
-            let doc = self.docs.iter().find(|d| d.id == e.doc_id);
-            doc.map(|d| {
-                let a = d.buffer.char_to_pos(e.start.min(d.buffer.len_chars())).line + 1;
-                let b = d.buffer.char_to_pos(e.end.min(d.buffer.len_chars())).line + 1;
-                if e.original.is_empty() {
-                    format!("insert at line {a}")
-                } else {
-                    format!("lines {a}–{b}")
+        let what = match &e.regions[..] {
+            _ if e.whole_file => "whole file".to_string(),
+            [r] if r.original.is_empty() => format!("insert at line {}", r.line + 1),
+            [r] => format!("lines {}–{}", r.line + 1, r.line + r.original.lines().count().max(1)),
+            rs => format!("{} selections", rs.len()),
+        };
+        let fs = self.settings.editor_font_size * 0.95;
+        // One diff per region (original → new).
+        let diffs = |ui: &mut egui::Ui, regions: &[crate::inline_ai::Region], news: &[String], live: bool| {
+            let many = regions.len() > 1;
+            egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (i, (r, new)) in regions.iter().zip(news).enumerate() {
+                    if many {
+                        ui.label(
+                            RichText::new(format!("Selection {} · line {}", i + 1, r.line + 1))
+                                .small()
+                                .color(p.text_dim),
+                        );
+                    }
+                    if live && new.is_empty() {
+                        continue;
+                    }
+                    let rows = crate::git::side_by_side(&r.original, new);
+                    let changes: Vec<usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, r)| r.changed && (*i == 0 || !rows[i - 1].changed))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let old: Vec<&str> = r.original.lines().collect();
+                    let newl: Vec<&str> = new.lines().collect();
+                    let cap = if many { 160.0 } else { 360.0 };
+                    let h = (rows.len() as f32 * 21.0 + 6.0).clamp(26.0, cap);
+                    ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
+                        let id = ui.make_persistent_id(("inline-ai-diff", i));
+                        let jump = live.then(|| rows.len().saturating_sub(8));
+                        crate::diff_view::rows_ui(ui, id, &rows, &changes, &old, &newl, &p, fs, jump, false);
+                    });
                 }
-            })
-            .unwrap_or_default()
+            });
         };
         egui::Window::new("✳ AI Edit")
             .collapsible(false)
@@ -5520,15 +5553,16 @@ impl ZenithApp {
             .default_width(760.0)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 70.0])
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("{} · {lines}", e.file)).small().color(p.text_dim));
+                ui.label(RichText::new(format!("{} · {what}", e.file)).small().color(p.text_dim));
                 let busy = matches!(e.state, State::Asking { .. });
+                let inserting = e.regions.len() == 1 && e.regions[0].original.is_empty();
                 let r = ui.add_enabled(
                     !busy,
                     egui::TextEdit::multiline(&mut e.instruction)
-                        .hint_text(if e.original.is_empty() {
+                        .hint_text(if inserting {
                             "What should be written here? (Enter to send)"
                         } else {
-                            "How should the selection change? (Enter to send, Shift+Enter: new line)"
+                            "How should it change? (Enter to send, Shift+Enter: new line)"
                         })
                         .desired_rows(2)
                         .desired_width(f32::INFINITY),
@@ -5548,48 +5582,27 @@ impl ZenithApp {
                 match &e.state {
                     State::Editing => {}
                     State::Asking { partial, .. } => {
-                        let partial = crate::inline_ai::clean_partial(partial);
+                        let news = e.partial_answers(partial);
+                        let started = !partial.is_empty();
+                        let mut cancel = false;
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            let what = if partial.is_empty() { "Asking" } else { "Writing" };
-                            ui.label(format!("{what}… ({})", e.agent_name));
-                            if ui.button("Cancel").clicked() {
-                                e.cancel();
-                            }
+                            let doing = if started { "Writing" } else { "Asking" };
+                            ui.label(format!("{doing}… ({})", e.agent_name));
+                            cancel = ui.button("Cancel").clicked();
                         });
-                        // The answer so far, as a live diff.
-                        if !partial.is_empty() {
-                            let rows = crate::git::side_by_side(&e.original, &partial);
-                            let old: Vec<&str> = e.original.lines().collect();
-                            let newl: Vec<&str> = partial.lines().collect();
-                            let h = (rows.len() as f32 * 20.0 + 10.0).clamp(60.0, 360.0);
-                            ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
-                                let id = ui.make_persistent_id("inline-ai-diff");
-                                let fs = self.settings.editor_font_size * 0.95;
-                                let jump = Some(rows.len().saturating_sub(12));
-                                crate::diff_view::rows_ui(ui, id, &rows, &[], &old, &newl, &p, fs, jump, false);
-                            });
+                        if started {
+                            diffs(ui, &e.regions, &news, true);
+                        }
+                        if cancel {
+                            e.cancel();
                         }
                     }
                     State::Failed(err) => {
                         ui.label(RichText::new(err).color(p.error));
                     }
-                    State::Ready(new) => {
-                        let rows = crate::git::side_by_side(&e.original, new);
-                        let changes: Vec<usize> = rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, r)| r.changed && (*i == 0 || !rows[i - 1].changed))
-                            .map(|(i, _)| i)
-                            .collect();
-                        let old: Vec<&str> = e.original.lines().collect();
-                        let newl: Vec<&str> = new.lines().collect();
-                        let h = (rows.len() as f32 * 20.0 + 10.0).clamp(60.0, 360.0);
-                        ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
-                            let id = ui.make_persistent_id("inline-ai-diff");
-                            let fs = self.settings.editor_font_size * 0.95;
-                            crate::diff_view::rows_ui(ui, id, &rows, &changes, &old, &newl, &p, fs, None, false);
-                        });
+                    State::Ready(news) => {
+                        diffs(ui, &e.regions, news, false);
                         ui.horizontal(|ui| {
                             if ui
                                 .add(
@@ -5644,17 +5657,25 @@ impl ZenithApp {
         }
         if accept {
             if let Some(e) = self.inline_edit.take() {
-                if let State::Ready(new) = &e.state {
+                if let State::Ready(news) = &e.state {
                     match self.docs.iter_mut().find(|d| d.id == e.doc_id) {
+                        // Every region must still hold what was sent.
                         Some(doc)
-                            if e.end <= doc.buffer.len_chars()
-                                && doc.buffer.rope().slice(e.start..e.end) == e.original.as_str() =>
+                            if e.regions.iter().all(|r| {
+                                r.end <= doc.buffer.len_chars()
+                                    && doc.buffer.rope().slice(r.start..r.end) == r.original.as_str()
+                            }) =>
                         {
                             doc.buffer.clear_extra();
-                            doc.buffer.apply_edits(vec![(e.start, e.end, new.clone())]);
-                            let end = e.start + new.chars().count();
-                            doc.buffer.set_cursor(e.start, false);
-                            doc.buffer.set_cursor(end, true);
+                            let edits: Vec<(usize, usize, String)> =
+                                e.regions.iter().zip(news).map(|(r, n)| (r.start, r.end, n.clone())).collect();
+                            doc.buffer.apply_edits(edits);
+                            if let ([r], [n]) = (&e.regions[..], &news[..]) {
+                                if !e.whole_file {
+                                    doc.buffer.set_cursor(r.start, false);
+                                    doc.buffer.set_cursor(r.start + n.chars().count(), true);
+                                }
+                            }
                             self.focus_editor = true;
                         }
                         _ => self.toast("The code changed meanwhile; the AI edit wasn't applied", NotifyLevel::Warning),
