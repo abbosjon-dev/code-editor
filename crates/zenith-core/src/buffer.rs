@@ -962,11 +962,12 @@ impl Buffer {
     }
 }
 
-fn normalize(text: &str) -> (String, LineEnding) {
+/// LF line endings (copies the text only when it has CRLF ones).
+fn normalize(text: &str) -> (std::borrow::Cow<'_, str>, LineEnding) {
     if text.contains("\r\n") {
-        (text.replace("\r\n", "\n"), LineEnding::CrLf)
+        (text.replace("\r\n", "\n").into(), LineEnding::CrLf)
     } else {
-        (text.to_string(), LineEnding::Lf)
+        (text.into(), LineEnding::Lf)
     }
 }
 
@@ -1173,5 +1174,33 @@ mod tests {
         assert_eq!(b.text(), "two\none");
         b.duplicate_line();
         assert_eq!(b.text(), "two\none\none");
+    }
+}
+
+#[cfg(test)]
+mod load_perf {
+    /// `cargo test --release -p zenith-core load_perf -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn load_perf() {
+        let p = std::env::var("ZENITH_BIG_FILE").unwrap_or_default();
+        if p.is_empty() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let bytes = std::fs::read(&p).unwrap();
+        println!("read: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let text = String::from_utf8_lossy(&bytes);
+        println!("utf8: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let r = ropey::Rope::from_str(&text);
+        println!("rope: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = super::detect_tabs(&r);
+        println!("tabs: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = super::Buffer::load(&p).unwrap();
+        println!("Buffer::load: {:?}", t.elapsed());
     }
 }

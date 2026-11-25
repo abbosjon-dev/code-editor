@@ -5963,6 +5963,7 @@ dependencies = [
 name = "zenith-core"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "ropey",
  "serde_json",
 ]

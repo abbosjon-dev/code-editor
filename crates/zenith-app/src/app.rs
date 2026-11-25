@@ -6493,7 +6493,24 @@ impl eframe::App for ZenithApp {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let started = Instant::now();
+        self.update_inner(ctx, frame);
+        // Slow frames are logged (RUST_LOG=warn) to find what stalls the UI.
+        let took = started.elapsed();
+        if took > Duration::from_millis(100) {
+            let doc = self.docs.get(self.active);
+            log::warn!(
+                "slow frame: {took:?} (file: {}, {} lines)",
+                doc.map(|d| d.title()).unwrap_or_default(),
+                doc.map_or(0, |d| d.buffer.len_lines())
+            );
+        }
+    }
+}
+
+impl ZenithApp {
+    fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
             self.style_dirty = false;

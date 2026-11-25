@@ -18,6 +18,7 @@ zenith-dap = { path = "crates/zenith-dap" }
 ropey = "1.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 toml = "0.8"
 anyhow = "1"
 log = "0.4"

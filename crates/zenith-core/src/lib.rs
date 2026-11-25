@@ -11,7 +11,8 @@ mod selection;
 
 pub use buffer::{Buffer, LineEnding};
 pub use history::{Edit, History};
-pub use search::{find_all, SearchOptions};
+pub use ropey::Rope;
+pub use search::{find_all, find_limited, SearchOptions};
 pub use selection::Selection;
 
 /// A (line, column) position, both zero-based, column counted in chars.

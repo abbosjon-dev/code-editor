@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use syntect::highlighting::Theme;
-use zenith_core::{find_all, Buffer, SearchOptions, Selection};
+use zenith_core::{Buffer, SearchOptions, Selection};
 
 use crate::highlight::{self, HighlightCache};
 use zenith_lsp::{CompletionItem, LspPos, LspRange, Severity};
@@ -93,6 +93,8 @@ pub struct Document {
     longest_line: (u64, usize),
     longest_dirty: Option<(usize, usize)>,
     longest_full_at: Option<std::time::Instant>,
+    /// How long the last full scan took.
+    longest_full_cost: std::time::Duration,
     // --- language server state ---
     pub diagnostics: Vec<DocDiagnostic>,
     pub completion: Option<Completion>,
@@ -157,6 +159,26 @@ pub struct Document {
     last_len_lines: usize,
 }
 
+/// Length in chars of the longest line (without its line break): one pass
+/// over the bytes, counting chars as the bytes that don't continue one.
+fn longest_line_scan(rope: &zenith_core::Rope) -> usize {
+    let (mut best, mut cur) = (0usize, 0usize);
+    for chunk in rope.chunks() {
+        for &b in chunk.as_bytes() {
+            if b == b'\n' {
+                best = best.max(cur);
+                cur = 0;
+            } else if b & 0xC0 != 0x80 && b != b'\r' {
+                cur += 1;
+            }
+        }
+    }
+    best.max(cur)
+}
+
+/// In-file find stops here (a one-letter query in a huge file).
+pub const MAX_FIND_MATCHES: usize = 100_000;
+
 impl Document {
     pub fn new_untitled(id: u64, n: usize, theme: Arc<Theme>) -> Self {
         let buffer = Buffer::from_str("");
@@ -193,6 +215,7 @@ impl Document {
             longest_line: (u64::MAX, 0),
             longest_dirty: None,
             longest_full_at: None,
+            longest_full_cost: std::time::Duration::ZERO,
             diagnostics: vec![],
             completion: None,
             hover: None,
@@ -676,15 +699,20 @@ impl Document {
         }
         // Full scans are O(lines): do them at most twice a second; in between,
         // only grow the width from the edited lines (shrinking can wait).
-        let full_due = self.longest_full_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(500));
+        // A big file's scan takes a while: wait at least 20× as long between them.
+        let gap = std::time::Duration::from_millis(500).max(self.longest_full_cost * 20);
+        let full_due = self.longest_full_at.is_none_or(|t| t.elapsed() > gap);
         let n = match (self.longest_dirty.take(), full_due) {
             (Some((a, b)), false) if self.longest_line.0 != u64::MAX => {
                 let b = b.min(self.buffer.len_lines().saturating_sub(1));
                 (a..=b).map(|l| self.buffer.line_len(l)).max().unwrap_or(0).max(self.longest_line.1)
             }
             _ => {
-                self.longest_full_at = Some(std::time::Instant::now());
-                (0..self.buffer.len_lines()).map(|l| self.buffer.line_len(l)).max().unwrap_or(0)
+                let t = std::time::Instant::now();
+                self.longest_full_at = Some(t);
+                let n = longest_line_scan(self.buffer.rope());
+                self.longest_full_cost = t.elapsed();
+                n
             }
         };
         self.longest_line = (v, n);
@@ -702,7 +730,7 @@ impl Document {
         if f.computed_for.as_ref() == Some(&key) {
             return;
         }
-        f.matches = find_all(self.buffer.rope(), &f.query, f.opts);
+        f.matches = zenith_core::find_limited(self.buffer.rope(), &f.query, f.opts, MAX_FIND_MATCHES);
         let head = self.buffer.sel.start();
         f.current = f.matches.iter().position(|m| m.start >= head).unwrap_or(0);
         f.computed_for = Some(key);
@@ -1012,6 +1040,86 @@ mod perf {
     }
 
     /// Per-keystroke work on a large file. Run with:
+    #[test]
+    fn longest_line_scan_counts_chars() {
+        let r = zenith_core::Rope::from_str("ab\r\nsalom dünyo\n\nxyz");
+        assert_eq!(longest_line_scan(&r), "salom dünyo".chars().count());
+        assert_eq!(longest_line_scan(&zenith_core::Rope::from_str("")), 0);
+    }
+
+    /// A 100 MB+ log: open, first frames, jump to the end, type, find, save.
+    /// `cargo test --release -p zenith-app perf_huge_log -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_huge_log() {
+        let dir = std::env::temp_dir().join("zenith-perf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.log");
+        let mut text = String::with_capacity(130 << 20);
+        let mut i = 0u64;
+        while text.len() < 120 << 20 {
+            text.push_str(&format!(
+                "2026-11-25T10:{:02}:{:02}.{:03}Z INFO  request id={i} path=/api/v1/items/{} status=200 took={}ms\n",
+                (i / 60) % 60,
+                i % 60,
+                i % 1000,
+                i * 7 % 10_000,
+                i % 97
+            ));
+            i += 1;
+        }
+        std::fs::write(&path, &text).unwrap();
+        println!("file: {} MB, {} lines", text.len() >> 20, i);
+        drop(text);
+        let t = Instant::now();
+        let mut doc = Document::open(1, &path, highlight::load_theme("OneHalfDark"), 4).unwrap();
+        println!("open: {:?}", t.elapsed());
+        let t = Instant::now();
+        doc.sync();
+        println!("  sync: {:?}", t.elapsed());
+        let t2 = Instant::now();
+        doc.longest_line_chars();
+        println!("  longest line: {:?}", t2.elapsed());
+        let t2 = Instant::now();
+        doc.fold_map();
+        println!("  fold map: {:?}", t2.elapsed());
+        let t2 = Instant::now();
+        doc.highlight.ensure(&doc.buffer, 0, 60);
+        println!("  highlight: {:?}", t2.elapsed());
+        println!("first frame: {:?}", t.elapsed());
+        let last = doc.buffer.len_lines() - 1;
+        let t = Instant::now();
+        doc.goto_line(last);
+        doc.sync();
+        doc.highlight.ensure(&doc.buffer, last - 60, last);
+        println!("jump to the end: {:?}", t.elapsed());
+        let t = Instant::now();
+        let mut parts = [std::time::Duration::ZERO; 4];
+        for c in "hello".chars() {
+            let t = Instant::now();
+            doc.buffer.type_char(c);
+            parts[0] += t.elapsed();
+            let t = Instant::now();
+            doc.sync();
+            parts[1] += t.elapsed();
+            let t = Instant::now();
+            doc.longest_line_chars();
+            parts[2] += t.elapsed();
+            let t = Instant::now();
+            doc.fold_map();
+            parts[3] += t.elapsed();
+        }
+        println!("  type / sync / longest / folds: {parts:?}");
+        println!("5 keystrokes at the end: {:?}", t.elapsed());
+        let t = Instant::now();
+        let hits = zenith_core::find_all(doc.buffer.rope(), "id=1234567 ", Default::default());
+        println!("find (1 hit): {} in {:?}", hits.len(), t.elapsed());
+        let t = Instant::now();
+        doc.buffer.save().unwrap();
+        println!("save: {:?}", t.elapsed());
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `cargo test --release -p zenith-app perf -- --ignored --nocapture`
     #[test]
     #[ignore]

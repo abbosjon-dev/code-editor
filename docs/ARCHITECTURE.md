@@ -46,6 +46,18 @@ papka; standart: cargo registry manbalari). 29 853 fayl, ~780 MB, 4 yadro, disk 
 | Fayllarda qidirish, regex `fn\s+new\(` | 830 ms | **95 ms** |
 | Fayllarda qidirish, ko'p uchraydigan so'z (5 000 natija) | 84 ms | 14 ms |
 
+**Katta fayl** (120 MB log, 1,34 mln qator; `cargo test --release -p zenith-app perf_huge_log -- --ignored --nocapture`):
+
+| Amal | Oldin | Hozir |
+|---|---|---|
+| Ochish (`Buffer::load`) | 471 ms | 339 ms |
+| Birinchi kadr | 608 ms | 116 ms |
+| Bir tugma bosish | ~600 ms (eng uzun qatorni qayta hisoblash) | **6 µs** |
+| Fayl ichida qidirish (Ctrl+F) | 1 240 ms | **63 ms** |
+| Saqlash | 185 ms | 173 ms |
+
+Qidiruv natijalari 100 000 ta bilan cheklanadi ("100000+"), 100 ms dan uzun kadrlar `RUST_LOG=warn` da logga yoziladi.
+
 Nima o'zgardi: fayllar parallel o'qiladi (`ignore` parallel walker); har fayl avval butunligicha bayt-regex bilan
 tekshiriladi (mos kelmasa — qatorlarga bo'linmaydi va UTF-8 ga o'girilmaydi); qator raqami faqat topilgan joygacha
 sanaladi. Natijalar ro'yxati faqat ko'rinadigan qatorlarni chizadi (oldin har kadrda 5 000 qator va fayl sarlavhasi

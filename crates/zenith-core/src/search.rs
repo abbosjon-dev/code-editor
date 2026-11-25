@@ -9,52 +9,76 @@ pub struct SearchOptions {
 }
 
 /// Find all occurrences of `needle` in `rope`, returning char ranges.
-/// Works line by line so it never allocates the whole document as one string.
+/// The rope is searched chunk by chunk (whole lines at a time, never the
+/// whole document as one string) with a literal regex.
 pub fn find_all(rope: &Rope, needle: &str, opts: SearchOptions) -> Vec<Range<usize>> {
+    find_limited(rope, needle, opts, usize::MAX)
+}
+
+/// [`find_all`], stopping after `limit` matches.
+pub fn find_limited(rope: &Rope, needle: &str, opts: SearchOptions, limit: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     if needle.is_empty() || needle.contains('\n') {
         return out;
     }
-    let needle_cmp = if opts.case_sensitive { needle.to_string() } else { needle.to_lowercase() };
-    let needle_chars = needle.chars().count();
-    for (line_idx, line) in rope.lines().enumerate() {
-        let line_start = rope.line_to_char(line_idx);
-        let text: String = line.chars().collect();
-        let hay = if opts.case_sensitive { text.clone() } else { text.to_lowercase() };
-        // Lowercasing can change byte lengths for some scripts; fall back to
-        // char-wise compare when it does.
-        if hay.len() != text.len() {
-            let hay_chars: Vec<char> = hay.chars().collect();
-            let nd: Vec<char> = needle_cmp.chars().collect();
-            if nd.len() > hay_chars.len() {
-                continue;
-            }
-            for i in 0..=hay_chars.len() - nd.len() {
-                if hay_chars[i..i + nd.len()] == nd[..] {
-                    out.push(line_start + i..line_start + i + needle_chars);
-                }
-            }
-            continue;
-        }
+    let mut pat = regex::escape(needle);
+    if opts.whole_word {
+        // Word = letters, digits and `_` (not a regex \b, which treats e.g.
+        // combining marks differently).
+        pat = format!(r"(?:^|[^\p{{Alphabetic}}\p{{Nd}}_])({pat})(?:$|[^\p{{Alphabetic}}\p{{Nd}}_])");
+    } else {
+        pat = format!("({pat})");
+    }
+    let Ok(re) = regex::RegexBuilder::new(&pat).case_insensitive(!opts.case_sensitive).multi_line(true).build() else {
+        return out;
+    };
+    // `region` holds whole lines: the rest of the previous chunk's last line
+    // plus this chunk up to its last newline.
+    let mut carry = String::new();
+    let mut region_start = 0usize; // char index of the region's first char
+    let scan = |region: &str, start: usize, out: &mut Vec<Range<usize>>| {
+        let (mut at_byte, mut at_char) = (0usize, start);
         let mut from = 0;
-        while let Some(found) = hay[from..].find(&needle_cmp) {
-            let byte = from + found;
-            let char_off = text[..byte].chars().count();
-            let ok = !opts.whole_word || {
-                let before = text[..byte].chars().next_back();
-                let after = text[byte + needle_cmp.len()..].chars().next();
-                let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-                !is_word(before) && !is_word(after)
-            };
-            if ok {
-                out.push(line_start + char_off..line_start + char_off + needle_chars);
+        while let Some(c) = re.captures_at(region, from) {
+            let m = c.get(1).unwrap();
+            at_char += region[at_byte..m.start()].chars().count();
+            at_byte = m.start();
+            let n = m.as_str().chars().count();
+            out.push(at_char..at_char + n);
+            if out.len() >= limit {
+                break;
             }
-            from = byte + needle_cmp.len().max(1);
-            if from > hay.len() {
+            // Next search from the end of the needle (a whole-word match may
+            // need the separator after it as the next one's leading boundary).
+            from = m.end();
+            if from >= region.len() {
                 break;
             }
         }
+        start + region.chars().count()
+    };
+    for chunk in rope.chunks() {
+        if out.len() >= limit {
+            return out;
+        }
+        match chunk.rfind('\n') {
+            Some(nl) => {
+                if carry.is_empty() {
+                    region_start = scan(&chunk[..=nl], region_start, &mut out);
+                } else {
+                    carry.push_str(&chunk[..=nl]);
+                    region_start = scan(&carry, region_start, &mut out);
+                    carry.clear();
+                }
+                carry.push_str(&chunk[nl + 1..]);
+            }
+            None => carry.push_str(chunk),
+        }
     }
+    if !carry.is_empty() && out.len() < limit {
+        scan(&carry, region_start, &mut out);
+    }
+    out.truncate(limit);
     out
 }
 
@@ -74,6 +98,31 @@ mod tests {
         let r = Rope::from_str("foo food foo_bar foo");
         let hits = find_all(&r, "foo", SearchOptions { case_sensitive: true, whole_word: true });
         assert_eq!(hits, vec![0..3, 17..20]);
+    }
+
+    #[test]
+    fn across_chunks_and_boundaries() {
+        // Long enough for several rope chunks; matches near chunk edges.
+        let line = "abc foo xyz foo_bar\n";
+        let text = line.repeat(500);
+        let r = Rope::from_str(&text);
+        let hits = find_all(&r, "foo", SearchOptions { case_sensitive: true, whole_word: false });
+        assert_eq!(hits.len(), 1000);
+        assert!(hits.iter().all(|h| r.slice(h.clone()) == "foo"));
+        let words = find_all(&r, "foo", SearchOptions { case_sensitive: true, whole_word: true });
+        assert_eq!(words.len(), 500);
+        assert_eq!(words[1].start, line.chars().count() + 4);
+        // Adjacent whole-word matches share the separator.
+        let r = Rope::from_str("foo foo foo");
+        assert_eq!(find_all(&r, "foo", SearchOptions { case_sensitive: true, whole_word: true }).len(), 3);
+        let r = Rope::from_str("SÖZ söz");
+        assert_eq!(find_all(&r, "söz", SearchOptions::default()), vec![0..3, 4..7]);
+    }
+
+    #[test]
+    fn limit() {
+        let r = Rope::from_str(&"a ".repeat(1000));
+        assert_eq!(find_limited(&r, "a", SearchOptions::default(), 10).len(), 10);
     }
 
     #[test]

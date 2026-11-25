@@ -2086,7 +2086,8 @@ fn find_bar(ui: &mut egui::Ui, doc: &mut Document, p: &Palette) {
                     "No results".into()
                 }
             } else {
-                format!("{} of {}", (doc.find.current + 1).min(n), n)
+                let plus = if n >= crate::document::MAX_FIND_MATCHES { "+" } else { "" };
+                format!("{} of {n}{plus}", (doc.find.current + 1).min(n))
             };
             ui.label(egui::RichText::new(label).color(p.text_dim).small());
             let mut changed = false;
