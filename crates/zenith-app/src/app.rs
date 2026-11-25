@@ -5547,14 +5547,29 @@ impl ZenithApp {
                 }
                 match &e.state {
                     State::Editing => {}
-                    State::Asking { .. } => {
+                    State::Asking { partial, .. } => {
+                        let partial = crate::inline_ai::clean_partial(partial);
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!("Asking {}…", e.agent_name));
+                            let what = if partial.is_empty() { "Asking" } else { "Writing" };
+                            ui.label(format!("{what}… ({})", e.agent_name));
                             if ui.button("Cancel").clicked() {
                                 e.cancel();
                             }
                         });
+                        // The answer so far, as a live diff.
+                        if !partial.is_empty() {
+                            let rows = crate::git::side_by_side(&e.original, &partial);
+                            let old: Vec<&str> = e.original.lines().collect();
+                            let newl: Vec<&str> = partial.lines().collect();
+                            let h = (rows.len() as f32 * 20.0 + 10.0).clamp(60.0, 360.0);
+                            ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
+                                let id = ui.make_persistent_id("inline-ai-diff");
+                                let fs = self.settings.editor_font_size * 0.95;
+                                let jump = Some(rows.len().saturating_sub(12));
+                                crate::diff_view::rows_ui(ui, id, &rows, &[], &old, &newl, &p, fs, jump, false);
+                            });
+                        }
                     }
                     State::Failed(err) => {
                         ui.label(RichText::new(err).color(p.error));
@@ -5616,7 +5631,7 @@ impl ZenithApp {
                         _ => argv,
                     };
                     let cwd = if self.debugger.remote.is_some() { None } else { self.workspace.clone() };
-                    e.ask(argv, cwd, self.waker.clone());
+                    e.ask(argv, cwd, &a.oneshot_format, self.waker.clone());
                 }
                 None => {
                     let name = agent.map(|a| a.name).unwrap_or_else(|| self.settings.default_agent.clone());

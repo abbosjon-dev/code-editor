@@ -38,6 +38,10 @@ pub struct AgentProfile {
     /// agent can't do inline edits.
     #[serde(default)]
     pub oneshot_args: Vec<String>,
+    /// How the one-shot answer is printed: "" (plain text, streamed as it
+    /// comes) or "claude-stream-json" (Claude Code's streaming JSON events).
+    #[serde(default)]
+    pub oneshot_format: String,
 }
 
 fn default_icon() -> String {
@@ -56,6 +60,7 @@ impl AgentProfile {
             icon: icon.into(),
             resume_args: vec![],
             oneshot_args: vec![],
+            oneshot_format: String::new(),
         }
     }
 
@@ -70,7 +75,18 @@ pub fn builtin_agents() -> Vec<AgentProfile> {
     vec![
         AgentProfile {
             resume_args: vec!["--continue".into()],
-            oneshot_args: vec!["-p".into(), "{prompt}".into()],
+            // Stream the answer as it is written.
+            oneshot_args: [
+                "-p",
+                "{prompt}",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+            ]
+            .map(String::from)
+            .to_vec(),
+            oneshot_format: "claude-stream-json".into(),
             ..AgentProfile::builtin("claude", "Claude Code", "claude", "✳", "npm install -g @anthropic-ai/claude-code")
         },
         AgentProfile {
