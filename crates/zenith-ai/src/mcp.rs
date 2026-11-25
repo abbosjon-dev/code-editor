@@ -129,6 +129,11 @@ pub fn save(workspace: &Path, servers: &[McpServer], gemini: bool) -> Result<(),
 
 /// Start a stdio server, initialize it and list its tools (10 s limit).
 pub fn probe(server: &McpServer, cwd: &Path) -> Result<Vec<String>, String> {
+    probe_within(server, cwd, Duration::from_secs(10))
+}
+
+/// [`probe`] with a time limit.
+pub fn probe_within(server: &McpServer, cwd: &Path, limit: Duration) -> Result<Vec<String>, String> {
     if server.is_remote() {
         return Err("remote servers are checked by the agent".into());
     }
@@ -162,10 +167,10 @@ pub fn probe(server: &McpServer, cwd: &Path) -> Result<Vec<String>, String> {
         writeln!(stdin, "{v}").and_then(|_| stdin.flush()).map_err(|e| format!("server closed: {e}"))
     };
     let wait_for = |id: i64| -> Result<Value, String> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + limit;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let v = rx.recv_timeout(left).map_err(|_| "no answer within 10 s".to_string())?;
+            let v = rx.recv_timeout(left).map_err(|_| format!("no answer within {} s", limit.as_secs()))?;
             if v.get("id").and_then(Value::as_i64) == Some(id) {
                 if let Some(e) = v.get("error") {
                     return Err(e.get("message").and_then(Value::as_str).unwrap_or("error").to_string());
@@ -251,7 +256,9 @@ for line in sys.stdin:
             args: vec![path.to_string_lossy().into_owned()],
             ..Default::default()
         };
-        assert_eq!(probe(&s, &dir).unwrap(), vec!["echo".to_string(), "add".to_string()]);
+        // A busy CI machine can take a while to start Python.
+        let tools = probe_within(&s, &dir, Duration::from_secs(60)).unwrap();
+        assert_eq!(tools, vec!["echo".to_string(), "add".to_string()]);
         let missing = McpServer { name: "x".into(), command: "zenith-no-such-cmd".into(), ..Default::default() };
         assert!(probe(&missing, &dir).unwrap_err().contains("not found"));
         let _ = std::fs::remove_file(path);
