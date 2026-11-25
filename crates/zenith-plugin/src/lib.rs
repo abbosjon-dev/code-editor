@@ -350,7 +350,7 @@ pub fn url_allowed(url: &str, hosts: Option<&[String]>) -> Result<(), String> {
     .to_lowercase();
     match hosts {
         None => Ok(()),
-        Some(h) if h.iter().any(|a| *a == host) => Ok(()),
+        Some(h) if h.contains(&host) => Ok(()),
         Some(_) => Err(format!("the plugin has no permission to reach {host} (add \"network:{host}\")")),
     }
 }
