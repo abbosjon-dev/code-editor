@@ -126,7 +126,66 @@ fn session_path() -> PathBuf {
     config_dir().join("session.json")
 }
 
+/// Per-project overrides: `<workspace>/.zenith/settings.toml`.
+pub fn workspace_settings_path(ws: &Path) -> PathBuf {
+    ws.join(".zenith").join("settings.toml")
+}
+
+/// Keys a workspace may not set: they start programs or reach the network,
+/// and opening a cloned repository must not do that by itself.
+pub const WORKSPACE_DENIED: &[&str] =
+    &["shell", "agents", "language_servers", "sync_repo", "sync_on_startup", "plugin_registry", "check_for_updates"];
+
+/// User settings with a workspace's overrides on top.
+pub struct Layered {
+    pub settings: Settings,
+    /// Keys the workspace file sets (and that were applied).
+    pub overridden: Vec<String>,
+    /// Keys it tried to set but may not.
+    pub ignored: Vec<String>,
+    pub error: Option<String>,
+}
+
 impl Settings {
+    /// Merge `overrides` (a workspace settings.toml) over `self`.
+    pub fn layered(&self, overrides: &str) -> Layered {
+        let mut out = Layered { settings: self.clone(), overridden: vec![], ignored: vec![], error: None };
+        let ws: toml::Table = match toml::from_str(overrides) {
+            Ok(t) => t,
+            Err(e) => {
+                out.error = Some(format!(".zenith/settings.toml: {e}"));
+                return out;
+            }
+        };
+        let mut base = toml::Table::try_from(self).unwrap_or_default();
+        for (k, v) in ws {
+            if WORKSPACE_DENIED.contains(&k.as_str()) {
+                out.ignored.push(k);
+            } else if base.contains_key(&k) {
+                base.insert(k.clone(), v);
+                out.overridden.push(k);
+            } else {
+                out.ignored.push(k);
+            }
+        }
+        match toml::Value::Table(base).try_into::<Settings>() {
+            Ok(s) => out.settings = s,
+            Err(e) => {
+                out.error = Some(format!(".zenith/settings.toml: {e}"));
+                out.overridden.clear();
+            }
+        }
+        out
+    }
+
+    /// Effective settings for a workspace (user settings when it has none).
+    pub fn for_workspace(&self, ws: Option<&Path>) -> Layered {
+        match ws.and_then(|w| std::fs::read_to_string(workspace_settings_path(w)).ok()) {
+            Some(text) => self.layered(&text),
+            None => Layered { settings: self.clone(), overridden: vec![], ignored: vec![], error: None },
+        }
+    }
+
     pub fn load() -> (Self, Option<String>) {
         let path = settings_path();
         match std::fs::read_to_string(&path) {
@@ -217,5 +276,25 @@ impl Session {
         if let Ok(t) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_overrides() {
+        let user = Settings { tab_size: 4, word_wrap: false, ..Default::default() };
+        let l = user.layered("tab_size = 2\nword_wrap = true\nshell = \"evil\"\nnope = 1\n");
+        assert_eq!(l.settings.tab_size, 2);
+        assert!(l.settings.word_wrap);
+        assert_eq!(l.settings.shell, "");
+        assert_eq!(l.overridden, ["tab_size", "word_wrap"]);
+        assert!(l.ignored.contains(&"shell".to_string()) && l.ignored.contains(&"nope".to_string()));
+        // A wrong type is an error and changes nothing.
+        let l = user.layered("tab_size = \"two\"\n");
+        assert!(l.error.is_some());
+        assert_eq!(l.settings.tab_size, 4);
     }
 }

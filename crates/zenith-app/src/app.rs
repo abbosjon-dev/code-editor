@@ -201,6 +201,10 @@ pub struct ZenithApp {
     /// Test explorer.
     tests: crate::testing::Panel,
     market: crate::marketplace::Market,
+    /// settings.toml as written (without the workspace's overrides).
+    user_settings: Settings,
+    /// Keys the workspace's .zenith/settings.toml overrides.
+    ws_overrides: Vec<String>,
     /// MCP servers section (workspace `.mcp.json`).
     mcp: crate::mcp_ui::McpPanel,
     /// Update check in flight (manual = report every result), and a newer release.
@@ -293,7 +297,7 @@ impl ZenithApp {
 
         let mut app = Self {
             syntax_theme: highlight::load_theme(&settings.syntax_theme),
-            settings,
+            settings: settings.clone(),
             colors,
             session,
             workspace: None,
@@ -318,6 +322,8 @@ impl ZenithApp {
             mcp: Default::default(),
             tests: Default::default(),
             market: Default::default(),
+            user_settings: settings.clone(),
+            ws_overrides: vec![],
             sync_rx: None,
             remote: None,
             remote_connecting: None,
@@ -463,6 +469,7 @@ impl ZenithApp {
         }
         self.session.recent_workspaces.truncate(10);
         self.workspace = Some(path);
+        self.reload_settings_with(false);
         self.lsp.restart(&mut self.docs);
         self.load_plugins();
         self.save_session();
@@ -686,6 +693,7 @@ impl ZenithApp {
                     }
                     if Some(p.as_path()) == settings::settings_path().canonicalize().ok().as_deref()
                         || p == &settings::settings_path()
+                        || self.workspace.as_ref().is_some_and(|w| p == &settings::workspace_settings_path(w))
                     {
                         self.reload_settings();
                     }
@@ -721,11 +729,42 @@ impl ZenithApp {
     }
 
     fn reload_settings(&mut self) {
-        let (s, err) = Settings::load();
+        self.reload_settings_with(true);
+    }
+
+    /// Reload settings.toml and the workspace's overrides.
+    fn reload_settings_with(&mut self, announce: bool) {
+        let (user, err) = Settings::load();
         if let Some(e) = err {
             self.toast(e, NotifyLevel::Error);
             return;
         }
+        let layered = user.for_workspace(self.workspace.as_deref());
+        if let Some(e) = &layered.error {
+            self.toast(e.clone(), NotifyLevel::Error);
+        }
+        if !layered.ignored.is_empty() {
+            self.toast(
+                format!(
+                    ".zenith/settings.toml: ignored {} (only allowed in your own settings)",
+                    layered.ignored.join(", ")
+                ),
+                NotifyLevel::Warning,
+            );
+        }
+        let s = layered.settings;
+        let unchanged = toml::Table::try_from(&s).ok() == toml::Table::try_from(&self.settings).ok();
+        self.user_settings = user;
+        self.ws_overrides = layered.overridden;
+        if unchanged {
+            if announce {
+                self.toast("Settings reloaded", NotifyLevel::Info);
+            }
+            return;
+        }
+        let lsp_changed = s.lsp_enabled != self.settings.lsp_enabled
+            || toml::Value::try_from(&s.language_servers).ok()
+                != toml::Value::try_from(&self.settings.language_servers).ok();
         let theme_changed = s.syntax_theme != self.settings.syntax_theme || s.tree_sitter != self.settings.tree_sitter;
         crate::highlight::TREE_SITTER.store(s.tree_sitter, std::sync::atomic::Ordering::Relaxed);
         self.settings = s;
@@ -735,11 +774,15 @@ impl ZenithApp {
         if theme_changed {
             self.set_syntax_theme(self.settings.syntax_theme.clone());
         }
-        self.lsp.shutdown();
-        self.lsp = LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
-        self.lsp.restart(&mut self.docs);
+        if lsp_changed {
+            self.lsp.shutdown();
+            self.lsp = LspManager::new(&self.settings.language_servers, self.settings.lsp_enabled, self.waker.clone());
+            self.lsp.restart(&mut self.docs);
+        }
         self.style_dirty = true;
-        self.toast("Settings reloaded", NotifyLevel::Info);
+        if announce {
+            self.toast("Settings reloaded", NotifyLevel::Info);
+        }
     }
 
     fn write_settings(&mut self) {
@@ -747,7 +790,17 @@ impl ZenithApp {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         // Rewrite simple top-level keys while keeping comments/agents intact.
         let mut doc: toml::Table = toml::from_str(&text).unwrap_or_default();
-        let fresh = toml::Table::try_from(&self.settings).unwrap_or_default();
+        let mut fresh = toml::Table::try_from(&self.settings).unwrap_or_default();
+        // Keys the workspace overrides keep the user's own value.
+        let user = toml::Table::try_from(&self.user_settings).unwrap_or_default();
+        for k in &self.ws_overrides {
+            if let Some(v) = user.get(k) {
+                fresh.insert(k.clone(), v.clone());
+            }
+        }
+        if let Ok(u) = toml::Value::Table(fresh.clone()).try_into::<Settings>() {
+            self.user_settings = u;
+        }
         for (k, v) in fresh {
             doc.insert(k, v);
         }
@@ -1508,6 +1561,28 @@ impl ZenithApp {
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
             Cmd::OpenSettings => self.show_settings = true,
+            Cmd::OpenWorkspaceSettings => {
+                let Some(ws) = self.workspace.clone() else {
+                    self.toast("Open a folder first", NotifyLevel::Info);
+                    return;
+                };
+                let p = settings::workspace_settings_path(&ws);
+                if !p.exists() {
+                    let _ = std::fs::create_dir_all(p.parent().unwrap_or(&ws));
+                    let _ = std::fs::write(
+                        &p,
+                        "# Settings for this project only: they override your own settings.toml\n\
+# while this folder is open. Commit the file to share them with your team.\n\
+# Programs, agents, language servers and network settings can't be set here.\n\
+#\n\
+# tab_size = 2\n\
+# insert_spaces = true\n\
+# format_on_save = true\n\
+# word_wrap = false\n",
+                    );
+                }
+                self.open_file(&p);
+            }
             Cmd::OpenSettingsFile => {
                 let p = settings::settings_path();
                 if !p.exists() {
@@ -5286,6 +5361,7 @@ impl ZenithApp {
             &mut self.settings,
             &self.agents,
             &p,
+            &self.ws_overrides,
         );
         let mut c = c;
         if c.style {
@@ -5318,6 +5394,10 @@ impl ZenithApp {
         }
         if c.open_keybindings {
             self.run(ctx, Cmd::OpenKeybindings);
+        }
+        if c.open_workspace_file {
+            self.show_settings = false;
+            self.run(ctx, Cmd::OpenWorkspaceSettings);
         }
         if c.open_file {
             self.show_settings = false;

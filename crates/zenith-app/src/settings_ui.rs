@@ -15,6 +15,7 @@ pub struct Changes {
     pub lsp: bool,
     pub open_file: bool,
     pub open_keybindings: bool,
+    pub open_workspace_file: bool,
     /// Settings Sync buttons.
     pub sync: Option<crate::sync_ui::SyncOp>,
 }
@@ -35,6 +36,7 @@ pub fn window(
     s: &mut Settings,
     agents: &[AgentProfile],
     p: &Palette,
+    overridden: &[String],
 ) -> Changes {
     let mut c = Changes::default();
     let mut still_open = *open;
@@ -69,6 +71,22 @@ pub fn window(
                 ui.vertical(|ui| {
                     ui.set_min_width(ui.available_width());
                     ui.spacing_mut().slider_width = 200.0;
+                    if !overridden.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "This workspace's .zenith/settings.toml overrides: {}",
+                                    overridden.join(", ")
+                                ))
+                                .small()
+                                .color(p.warning),
+                            );
+                            if ui.small_button("Edit").clicked() {
+                                c.open_workspace_file = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         egui::Grid::new("settings-grid").num_columns(2).spacing([24.0, 10.0]).striped(false).show(
                             ui,

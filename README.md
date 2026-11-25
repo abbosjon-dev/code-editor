@@ -219,6 +219,12 @@ standart AI agent, terminal shell va boshqalar. O'zgarishlar darhol qo'llanadi v
 
 ![Settings](docs/settings.png)
 
+**Loyiha sozlamalari.** `.zenith/settings.toml` (*Preferences: Open Workspace Settings*) — faqat shu papka ochiq
+bo'lganda sizning sozlamalaringiz ustidan qo'llanadi (masalan, `tab_size = 2`, `format_on_save = true`); faylni
+commit qilsangiz, jamoa ham shu sozlamalarni oladi. Xavfsizlik uchun dastur ishga tushiradigan yoki tarmoqqa
+chiqadigan kalitlar (`shell`, `agents`, `language_servers`, sync, registry) bu yerda e'tiborga olinmaydi.
+Sozlamalar oynasi qaysi kalitlar loyiha tomonidan almashtirilganini ko'rsatadi.
+
 ## Sozlamalarni sinxronlash
 
 Sozlamalar → Advanced → **Settings Sync**: o'zingizning Git repo'ingiz manzilini kiriting (masalan, maxfiy GitHub
