@@ -381,7 +381,7 @@ impl HostInfo {
         let cmd: Vec<String> = std::iter::once(exe).chain(args.iter().cloned()).map(|a| sh_quote(&a)).collect();
         let mut a = vec!["ssh".to_string()];
         a.extend(ssh_args(&self.spec, false));
-        a.push(format!("cd {} && exec \"${{SHELL:-sh}}\" -lc {}", sh_quote(&dir), sh_quote(&cmd.join(" "))));
+        a.push(format!("cd {} && exec \"${{SHELL:-sh}}\" -lc {}", sh_quote(dir), sh_quote(&cmd.join(" "))));
         a
     }
 
