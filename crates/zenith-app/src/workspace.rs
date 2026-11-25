@@ -112,57 +112,58 @@ const MAX_LINE_SHOWN: usize = 240;
 
 impl SearchJob {
     /// Search every root; paths in extra roots are shown as `root-name/rel`.
+    /// Files are walked and searched in parallel; each file's bytes are
+    /// searched as a whole first, so files without a match cost one scan.
     pub fn start(roots: &[PathBuf], query: &str, opts: SearchOpts) -> Result<Self, String> {
         let re = build_regex(query, opts)?;
+        let bytes_re = regex::bytes::RegexBuilder::new(re.as_str())
+            .case_insensitive(!opts.case_sensitive)
+            .multi_line(true)
+            .build()
+            .map_err(|e| e.to_string())?;
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let roots = roots.to_vec();
         let c2 = cancel.clone();
         thread::spawn(move || {
-            let mut total = 0;
+            let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for (ri, root) in roots.iter().enumerate() {
                 let prefix = if ri == 0 {
                     String::new()
                 } else {
                     format!("{}/", root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
                 };
-                let walker = ignore::WalkBuilder::new(root).build();
-                for e in walker.flatten() {
-                    if c2.load(Ordering::Relaxed) || total >= MAX_HITS {
-                        break;
-                    }
-                    if !e.file_type().is_some_and(|t| t.is_file()) {
-                        continue;
-                    }
-                    let Ok(meta) = e.metadata() else { continue };
-                    if meta.len() > 4 * 1024 * 1024 {
-                        continue;
-                    }
-                    let Ok(bytes) = std::fs::read(e.path()) else { continue };
-                    if bytes.iter().take(8000).any(|b| *b == 0) {
-                        continue; // binary
-                    }
-                    let text = String::from_utf8_lossy(&bytes);
-                    let rel = format!(
-                        "{prefix}{}",
-                        e.path().strip_prefix(root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/")
-                    );
-                    let mut hits = vec![];
-                    for (i, line) in text.lines().enumerate() {
-                        let found: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
-                        if found.is_empty() {
-                            continue;
+                ignore::WalkBuilder::new(root).build_parallel().run(|| {
+                    let (tx, re, bre, cancel, total, prefix) =
+                        (tx.clone(), re.clone(), bytes_re.clone(), c2.clone(), total.clone(), prefix.clone());
+                    let root = root.clone();
+                    Box::new(move |e| {
+                        use ignore::WalkState;
+                        if cancel.load(Ordering::Relaxed) || total.load(Ordering::Relaxed) >= MAX_HITS {
+                            return WalkState::Quit;
                         }
-                        hits.push(make_hit(e.path(), &rel, i, line, &found));
-                        total += 1;
-                        if total >= MAX_HITS {
-                            break;
+                        let Ok(e) = e else { return WalkState::Continue };
+                        if !e.file_type().is_some_and(|t| t.is_file()) {
+                            return WalkState::Continue;
                         }
-                    }
-                    if !hits.is_empty() && tx.send(hits).is_err() {
-                        return;
-                    }
-                }
+                        if e.metadata().map(|m| m.len()).unwrap_or(0) > 4 * 1024 * 1024 {
+                            return WalkState::Continue;
+                        }
+                        let Ok(bytes) = std::fs::read(e.path()) else { return WalkState::Continue };
+                        if bytes.iter().take(8000).any(|b| *b == 0) || !bre.is_match(&bytes) {
+                            return WalkState::Continue; // binary, or no match
+                        }
+                        let rel = format!(
+                            "{prefix}{}",
+                            e.path().strip_prefix(&root).unwrap_or(e.path()).to_string_lossy().replace('\\', "/")
+                        );
+                        let hits = file_hits(e.path(), &rel, &bytes, &re, &bre, &total);
+                        if !hits.is_empty() && tx.send(hits).is_err() {
+                            return WalkState::Quit;
+                        }
+                        WalkState::Continue
+                    })
+                });
             }
         });
         Ok(Self { rx, cancel, done: false })
@@ -175,6 +176,9 @@ impl SearchJob {
                 Ok(h) => into.extend(h),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Files were searched in parallel: a stable order at the end.
+                    into.truncate(MAX_HITS);
+                    into.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
                     self.done = true;
                     break;
                 }
@@ -187,6 +191,41 @@ impl Drop for SearchJob {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// The matching lines of one file: line numbers are counted only up to
+/// each match, and each matching line is searched once for its ranges.
+fn file_hits(
+    path: &Path,
+    rel: &str,
+    bytes: &[u8],
+    re: &regex::Regex,
+    bre: &regex::bytes::Regex,
+    total: &std::sync::atomic::AtomicUsize,
+) -> Vec<SearchHit> {
+    let mut hits = vec![];
+    let (mut line_no, mut counted_to, mut done_to) = (0usize, 0usize, 0usize);
+    for m in bre.find_iter(bytes) {
+        if m.start() < done_to {
+            continue; // this line is already listed
+        }
+        line_no += bytes[counted_to..m.start()].iter().filter(|&&b| b == b'\n').count();
+        counted_to = m.start();
+        let ls = bytes[..m.start()].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let le = bytes[m.start()..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| m.start() + i);
+        done_to = le + 1;
+        let text = String::from_utf8_lossy(&bytes[ls..le]);
+        let line = text.trim_end_matches('\r');
+        let found: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
+        if found.is_empty() {
+            continue; // e.g. a match spanning lines
+        }
+        hits.push(make_hit(path, rel, line_no, line, &found));
+        if total.fetch_add(1, Ordering::Relaxed) + 1 >= MAX_HITS {
+            break;
+        }
+    }
+    hits
 }
 
 /// Build a result row: trim leading whitespace, truncate, convert byte
@@ -210,6 +249,58 @@ fn make_hit(path: &Path, rel: &str, line_no: usize, line: &str, found: &[(usize,
 mod tests {
     use super::*;
 
+    /// Timings on a large tree: `ZENITH_PERF_DIR=<dir> cargo test --release perf_workspace -- --ignored --nocapture`
+    /// (defaults to the cargo registry's sources).
+    #[test]
+    #[ignore]
+    fn perf_workspace() {
+        use std::time::Instant;
+        let dir = std::env::var("ZENITH_PERF_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+            let base = std::env::var("CARGO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo"));
+            std::fs::read_dir(base.join("registry/src")).unwrap().flatten().next().unwrap().path()
+        });
+        let t = Instant::now();
+        let mut idx = FileIndex::build(&dir);
+        while idx.indexing {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            idx.poll();
+        }
+        println!("index: {} files in {:?}", idx.files.len(), t.elapsed());
+
+        // Quick open: fuzzy-match every path (what the palette does per keystroke).
+        use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+        let mut m = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());
+        for q in ["lib", "src/parser.rs", "srclibrs"] {
+            let t = Instant::now();
+            let pattern = Pattern::parse(q, CaseMatching::Ignore, Normalization::Smart);
+            let mut buf = Vec::new();
+            let n = idx
+                .files
+                .iter()
+                .filter(|f| pattern.score(nucleo_matcher::Utf32Str::new(f, &mut buf), &mut m).is_some())
+                .count();
+            println!("fuzzy {q:?}: {n} matches in {:?}", t.elapsed());
+        }
+
+        for (q, regex) in [("ZenithNeverFound12345", false), ("unsafe", false), (r"fn\s+new\(", true)] {
+            let t = Instant::now();
+            let opts = SearchOpts { regex, ..Default::default() };
+            let mut job = SearchJob::start(std::slice::from_ref(&dir), q, opts).unwrap();
+            let mut hits = vec![];
+            let mut first = None;
+            while !job.done {
+                job.poll(&mut hits);
+                if first.is_none() && !hits.is_empty() {
+                    first = Some(t.elapsed());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            println!("search {q:?}: {} hits, first after {first:?}, done in {:?}", hits.len(), t.elapsed());
+        }
+    }
+
     #[test]
     fn regex_options() {
         let o = |c, w, r| SearchOpts { case_sensitive: c, whole_word: w, regex: r };
@@ -228,6 +319,18 @@ mod tests {
         let re = build_regex("x", o(true, false, false)).unwrap();
         assert_eq!(replace_in_text("x x", &re, "$1", o(true, false, false)).0, "$1 $1");
         assert!(build_regex("(", o(true, false, true)).is_err());
+    }
+
+    #[test]
+    fn hits_have_right_lines() {
+        let text = b"one\r\ntwo salom\n\nthree\nsalom salom\nend";
+        let re = build_regex("salom", SearchOpts::default()).unwrap();
+        let bre = regex::bytes::Regex::new("(?i)salom").unwrap();
+        let total = std::sync::atomic::AtomicUsize::new(0);
+        let h = file_hits(Path::new("a"), "a", text, &re, &bre, &total);
+        assert_eq!(h.iter().map(|h| h.line).collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(h[1].matches, vec![(0, 5), (6, 11)]);
+        assert_eq!(h[0].text, "two salom");
     }
 
     #[test]

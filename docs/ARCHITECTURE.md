@@ -33,6 +33,24 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
                                    └─ PluginHost.poll() ◄── fon oqimi: plugin stdout ─► Action
 ```
 
+## Ishlash tezligi (o'lchovlar)
+
+`cargo test --release -p zenith-app perf_workspace -- --ignored --nocapture` (`ZENITH_PERF_DIR` — istalgan katta
+papka; standart: cargo registry manbalari). 29 853 fayl, ~780 MB, 4 yadro, disk keshi issiq:
+
+| Amal | Oldin | Hozir |
+|---|---|---|
+| Fayl indeksi (Quick Open) | 93 ms | 93–117 ms |
+| Fuzzy qidiruv (har tugma) | 3 ms | 3 ms |
+| Fayllarda qidirish, topilmaydigan so'z (hamma fayl o'qiladi) | 1 380 ms | **147 ms** |
+| Fayllarda qidirish, regex `fn\s+new\(` | 830 ms | **95 ms** |
+| Fayllarda qidirish, ko'p uchraydigan so'z (5 000 natija) | 84 ms | 14 ms |
+
+Nima o'zgardi: fayllar parallel o'qiladi (`ignore` parallel walker); har fayl avval butunligicha bayt-regex bilan
+tekshiriladi (mos kelmasa — qatorlarga bo'linmaydi va UTF-8 ga o'girilmaydi); qator raqami faqat topilgan joygacha
+sanaladi. Natijalar ro'yxati faqat ko'rinadigan qatorlarni chizadi (oldin har kadrda 5 000 qator va fayl sarlavhasi
+uchun O(n²) hisob).
+
 ## Yo'l xaritasi (Roadmap)
 
 **v0.1** — muharrir, terminal, AI agent panel, pluginlar, qidiruv, temalar, CI (3 OS).

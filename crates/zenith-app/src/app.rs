@@ -3474,71 +3474,102 @@ impl ZenithApp {
         let show_rep = self.search.show_replace && !self.search.results.is_empty();
         let replacement = self.search.replacement.clone();
         let font = FontId::monospace(12.0);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut last_file = "";
-            for hit in &self.search.results {
-                if hit.rel != last_file {
-                    last_file = &hit.rel;
-                    ui.add_space(4.0);
-                    let (dir, name) = hit.rel.rsplit_once('/').unwrap_or(("", &hit.rel));
-                    let (icon, color) = theme::file_icon(name);
-                    let count: usize =
-                        self.search.results.iter().filter(|h| h.rel == hit.rel).map(|h| h.matches.len().max(1)).sum();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon).color(color));
-                        ui.label(RichText::new(name).strong());
-                        ui.label(RichText::new(dir).small().color(p.text_dim));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if show_rep
-                                && ui
-                                    .add(egui::Button::new("↔").frame(false))
-                                    .on_hover_text("Replace in this file")
-                                    .clicked()
-                            {
-                                replace_file = Some(hit.path.clone());
+        // One row per file header and per hit; only the visible rows are laid out.
+        enum Row {
+            File(usize, usize),
+            Hit(usize),
+        }
+        let results = &self.search.results;
+        let mut rows = Vec::with_capacity(results.len() + 64);
+        let mut i = 0;
+        while i < results.len() {
+            let j = (i..results.len()).find(|&k| results[k].rel != results[i].rel).unwrap_or(results.len());
+            rows.push(Row::File(i, results[i..j].iter().map(|h| h.matches.len().max(1)).sum()));
+            rows.extend((i..j).map(Row::Hit));
+            i = j;
+        }
+        let row_h = 22.0;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            let w = ui.available_width();
+            for row in &rows[range] {
+                let layout = Layout::left_to_right(Align::Center);
+                ui.allocate_ui_with_layout(egui::vec2(w, row_h), layout, |ui| {
+                    ui.set_min_height(row_h);
+                    match *row {
+                        Row::File(first, count) => {
+                            let hit = &results[first];
+                            let (dir, name) = hit.rel.rsplit_once('/').unwrap_or(("", &hit.rel));
+                            let (icon, color) = theme::file_icon(name);
+                            ui.label(RichText::new(icon).color(color));
+                            ui.label(RichText::new(name).strong());
+                            ui.label(RichText::new(dir).small().color(p.text_dim));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if show_rep
+                                    && ui
+                                        .add(egui::Button::new("↔").frame(false))
+                                        .on_hover_text("Replace in this file")
+                                        .clicked()
+                                {
+                                    replace_file = Some(hit.path.clone());
+                                }
+                                ui.label(RichText::new(count.to_string()).small().color(p.text_faint));
+                            });
+                        }
+                        Row::Hit(k) => {
+                            let hit = &results[k];
+                            // Line text with matches highlighted (and the replacement preview).
+                            let mut job = egui::text::LayoutJob::default();
+                            let fmt = |color: Color32, bg: Color32, strike: bool| egui::TextFormat {
+                                font_id: font.clone(),
+                                color,
+                                background: bg,
+                                strikethrough: if strike { Stroke::new(1.0_f32, color) } else { Stroke::NONE },
+                                ..Default::default()
+                            };
+                            job.append(
+                                &format!("{:>5}  ", hit.line + 1),
+                                0.0,
+                                fmt(p.text_faint, Color32::TRANSPARENT, false),
+                            );
+                            let chars: Vec<char> = hit.text.chars().collect();
+                            let mut at = 0;
+                            for &(a, b) in &hit.matches {
+                                job.append(
+                                    &chars[at..a].iter().collect::<String>(),
+                                    0.0,
+                                    fmt(p.text_dim, Color32::TRANSPARENT, false),
+                                );
+                                let m: String = chars[a..b].iter().collect();
+                                if show_rep {
+                                    job.append(&m, 0.0, fmt(p.error, p.error.gamma_multiply(0.15), true));
+                                    job.append(
+                                        &replacement,
+                                        0.0,
+                                        fmt(p.success, p.success.gamma_multiply(0.15), false),
+                                    );
+                                } else {
+                                    job.append(&m, 0.0, fmt(p.text, p.find_match.gamma_multiply(0.6), false));
+                                }
+                                at = b;
                             }
-                            ui.label(RichText::new(count.to_string()).small().color(p.text_faint));
-                        });
-                    });
-                }
-                // Line text with matches highlighted (and the replacement preview).
-                let mut job = egui::text::LayoutJob::default();
-                let fmt = |color: Color32, bg: Color32, strike: bool| egui::TextFormat {
-                    font_id: font.clone(),
-                    color,
-                    background: bg,
-                    strikethrough: if strike { Stroke::new(1.0_f32, color) } else { Stroke::NONE },
-                    ..Default::default()
-                };
-                job.append(&format!("{:>5}  ", hit.line + 1), 0.0, fmt(p.text_faint, Color32::TRANSPARENT, false));
-                let chars: Vec<char> = hit.text.chars().collect();
-                let mut at = 0;
-                for &(a, b) in &hit.matches {
-                    job.append(
-                        &chars[at..a].iter().collect::<String>(),
-                        0.0,
-                        fmt(p.text_dim, Color32::TRANSPARENT, false),
-                    );
-                    let m: String = chars[a..b].iter().collect();
-                    if show_rep {
-                        job.append(&m, 0.0, fmt(p.error, p.error.gamma_multiply(0.15), true));
-                        job.append(&replacement, 0.0, fmt(p.success, p.success.gamma_multiply(0.15), false));
-                    } else {
-                        job.append(&m, 0.0, fmt(p.text, p.find_match.gamma_multiply(0.6), false));
+                            job.append(
+                                &chars[at..].iter().collect::<String>(),
+                                0.0,
+                                fmt(p.text_dim, Color32::TRANSPARENT, false),
+                            );
+                            job.wrap.max_rows = 1;
+                            job.wrap.max_width = ui.available_width();
+                            job.wrap.break_anywhere = true;
+                            let r = ui.add(egui::Label::new(job).sense(Sense::click()));
+                            if r.hovered() {
+                                ui.painter().rect_filled(r.rect.expand(1.0), 3.0, p.bg_hover.gamma_multiply(0.5));
+                            }
+                            if r.clicked() {
+                                open = Some((hit.path.clone(), hit.line));
+                            }
+                        }
                     }
-                    at = b;
-                }
-                job.append(&chars[at..].iter().collect::<String>(), 0.0, fmt(p.text_dim, Color32::TRANSPARENT, false));
-                job.wrap.max_rows = 1;
-                job.wrap.max_width = ui.available_width();
-                job.wrap.break_anywhere = true;
-                let r = ui.add(egui::Label::new(job).sense(Sense::click()));
-                if r.hovered() {
-                    ui.painter().rect_filled(r.rect.expand(1.0), 3.0, p.bg_hover.gamma_multiply(0.5));
-                }
-                if r.clicked() {
-                    open = Some((hit.path.clone(), hit.line));
-                }
+                });
             }
         });
         if let Some((path, line)) = open {
