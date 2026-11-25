@@ -246,6 +246,8 @@ sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`
   (`rust-analyzer`, `pyright`, `gopls`, `gdb`, `python3 -m debugpy` …, PATH va `~/.cargo/bin`, `~/.local/bin`, `~/go/bin`
   dan) va ularni `ssh` orqali ishga tushiradi; fayl yo'llari mahalliy nusxa ↔ server o'rtasida avtomatik
   almashtiriladi. Debug konfiguratsiyasidagi `build` buyrug'i ham serverda bajariladi.
+- **Testing paneli** ham serverda ishlaydi: `cargo test` / `pytest` testlari serverda topiladi, ishga tushiriladi va
+  debug qilinadi.
 - **Terminal va AI agentlar serverda** ishga tushadi (`ssh -t host 'cd papka && …'`) — `cargo`, `npm`, `claude`
   va boshqalar serverdagi muhitda ishlaydi.
 - Serverdagi o'zgarishlar (agent yoki terminal qilgan) har 4 soniyada olinadi; ochiq fayl o'zgarsa, odatdagi diff

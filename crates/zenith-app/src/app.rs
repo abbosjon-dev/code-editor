@@ -459,6 +459,7 @@ impl ZenithApp {
             self.lsp.remote = None;
             self.lsp.remote_pending = None;
             self.debugger.remote = None;
+            self.tests.set_exec(crate::testing::Exec::default());
         }
         self.index = FileIndex::build(&path);
         self.git = Git::open(&path);
@@ -4391,6 +4392,8 @@ impl ZenithApp {
         for a in zenith_dap::ADAPTERS {
             programs.extend(a.commands.iter().map(|(p, _)| p.to_string()));
         }
+        // Test runners and builds.
+        programs.extend(["cargo", "python3", "go", "npm"].map(String::from));
         programs.sort();
         programs.dedup();
         if let Some(r) = &mut self.remote {
@@ -4426,7 +4429,8 @@ impl ZenithApp {
                 let host = r.host.clone();
                 self.lsp.remote = host.clone();
                 self.lsp.remote_pending = None;
-                self.debugger.remote = host;
+                self.debugger.remote = host.clone();
+                self.tests.set_exec(crate::testing::Exec { host });
                 self.lsp.restart(&mut self.docs);
                 return;
             }
@@ -5759,8 +5763,8 @@ impl ZenithApp {
     /// Run one test under the debugger (breakpoints in the test are hit).
     fn debug_test(&mut self, t: &crate::testing::TestItem) {
         let Some(root) = self.workspace.clone() else { return };
-        if self.remote.is_some() {
-            self.toast("Debugging isn't available for remote folders", NotifyLevel::Info);
+        if self.remote.is_some() && self.debugger.remote.is_none() {
+            self.toast("Still connecting to the host…", NotifyLevel::Info);
             return;
         }
         let dirty: Vec<usize> = (0..self.docs.len()).filter(|&i| self.docs[i].buffer.is_dirty()).collect();

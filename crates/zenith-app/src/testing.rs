@@ -245,19 +245,58 @@ fn python() -> &'static str {
     }
 }
 
+/// Where test commands run: here, or on the SSH host of a remote folder.
+#[derive(Clone, Default)]
+pub struct Exec {
+    pub host: Option<crate::remote::HostInfo>,
+}
+
+impl Exec {
+    /// `program args` in `dir` (a local path, or a host path from cargo's
+    /// output when remote) with extra environment variables.
+    fn cmd(&self, program: &str, args: &[&str], dir: &Path, env: &[(&str, &str)]) -> Command {
+        match &self.host {
+            None => {
+                let mut c = command(program);
+                c.args(args).current_dir(dir).envs(env.iter().copied());
+                c
+            }
+            Some(h) => {
+                let at = h.host_path(dir).unwrap_or_else(|| dir.to_string_lossy().replace('\\', "/"));
+                let mut full: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                let prog = if full.is_empty() { program.to_string() } else { "env".to_string() };
+                if !full.is_empty() {
+                    full.push(program.to_string());
+                }
+                full.extend(args.iter().map(|a| a.to_string()));
+                let argv = h.command_at(&at, &prog, &full);
+                let mut c = command(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            }
+        }
+    }
+
+    fn python(&self) -> &'static str {
+        if self.host.is_some() {
+            "python3"
+        } else {
+            python()
+        }
+    }
+}
+
 /// Build Rust test binaries and list every test.
-fn discover_cargo(root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, String> {
+fn discover_cargo(ex: &Exec, root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, String> {
     let _ = tx.send(Event::Log("$ cargo test --workspace --no-run".into()));
-    let mut c = command("cargo");
-    c.args(["test", "--workspace", "--no-run", "--message-format=json"]).current_dir(root);
+    let c = ex.cmd("cargo", &["test", "--workspace", "--no-run", "--message-format=json"], root, &[]);
     let (out, ok) = run_logged(c, tx)?;
     if !ok {
         return Err("cargo failed to build the tests (see the output)".into());
     }
     let mut items = vec![];
     for (package, target, exe, cwd) in parse_cargo_artifacts(&out) {
-        let mut c = command(&exe.to_string_lossy());
-        c.args(["--list", "--format", "terse"]).current_dir(&cwd);
+        let c = ex.cmd(&exe.to_string_lossy(), &["--list", "--format", "terse"], &cwd, &[]);
         let Ok((list, _)) = run_logged(c, tx) else { continue };
         let group = format!("{package} · {target}");
         for name in parse_libtest_list(&list) {
@@ -278,10 +317,9 @@ fn discover_cargo(root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, Stri
     Ok(items)
 }
 
-fn discover_pytest(root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, String> {
+fn discover_pytest(ex: &Exec, root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, String> {
     let _ = tx.send(Event::Log("$ pytest --collect-only -q".into()));
-    let mut c = command(python());
-    c.args(["-m", "pytest", "--collect-only", "-q"]).current_dir(root);
+    let c = ex.cmd(ex.python(), &["-m", "pytest", "--collect-only", "-q"], root, &[]);
     let (out, _) = run_logged(c, tx)?;
     Ok(parse_pytest_collect(&out)
         .into_iter()
@@ -296,19 +334,19 @@ fn discover_pytest(root: &Path, tx: &Sender<Event>) -> Result<Vec<TestItem>, Str
 }
 
 /// Discover all tests in the background.
-pub fn discover(root: PathBuf, waker: Arc<dyn Fn() + Send + Sync>) -> Receiver<Event> {
+pub fn discover(root: PathBuf, ex: Exec, waker: Arc<dyn Fn() + Send + Sync>) -> Receiver<Event> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let mut items = vec![];
         let mut errors = vec![];
         if has_cargo(&root) {
-            match discover_cargo(&root, &tx) {
+            match discover_cargo(&ex, &root, &tx) {
                 Ok(i) => items.extend(i),
                 Err(e) => errors.push(e),
             }
         }
         if has_pytest(&root) {
-            match discover_pytest(&root, &tx) {
+            match discover_pytest(&ex, &root, &tx) {
                 Ok(i) => items.extend(i),
                 Err(e) => errors.push(e),
             }
@@ -321,7 +359,7 @@ pub fn discover(root: PathBuf, waker: Arc<dyn Fn() + Send + Sync>) -> Receiver<E
 }
 
 /// Run `tests` (all of one runner's tests when they're the whole set).
-pub fn run(root: PathBuf, tests: Vec<TestItem>, waker: Arc<dyn Fn() + Send + Sync>) -> Receiver<Event> {
+pub fn run(root: PathBuf, tests: Vec<TestItem>, ex: Exec, waker: Arc<dyn Fn() + Send + Sync>) -> Receiver<Event> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let wake = || waker();
@@ -334,8 +372,7 @@ pub fn run(root: PathBuf, tests: Vec<TestItem>, waker: Arc<dyn Fn() + Send + Syn
         let cargo: Vec<&TestItem> = tests.iter().filter(|t| matches!(t.kind, Kind::Cargo { .. })).collect();
         if !cargo.is_empty() {
             let _ = tx.send(Event::Log("$ cargo test --workspace --no-run".into()));
-            let mut c = command("cargo");
-            c.args(["test", "--workspace", "--no-run", "--message-format=json"]).current_dir(&root);
+            let c = ex.cmd("cargo", &["test", "--workspace", "--no-run", "--message-format=json"], &root, &[]);
             match run_logged(c, &tx) {
                 Ok((out, true)) => {
                     // Binaries may have new hashes after the rebuild.
@@ -351,12 +388,12 @@ pub fn run(root: PathBuf, tests: Vec<TestItem>, waker: Arc<dyn Fn() + Send + Syn
                             .find(|(p, tg, _, _)| p == package && tg == target)
                             .map(|(_, _, e, _)| e.clone());
                         let Some(exe) = exe else { continue };
-                        let mut c = command(&exe.to_string_lossy());
-                        // Short panic messages (the full backtrace drowns the assertion).
-                        c.current_dir(cwd).arg("--test-threads=4").env("RUST_BACKTRACE", "0");
+                        let mut args = vec!["--test-threads=4"];
                         if items.len() == 1 {
-                            c.args([&items[0].name, "--exact"]);
+                            args.extend([items[0].name.as_str(), "--exact"]);
                         }
+                        // Short panic messages (the full backtrace drowns the assertion).
+                        let c = ex.cmd(&exe.to_string_lossy(), &args, cwd, &[("RUST_BACKTRACE", "0")]);
                         let _ = tx.send(Event::Log(format!("▶ {group}")));
                         let Ok((out, _)) = run_logged(c, &tx) else { continue };
                         let (results, failures) = parse_libtest_results(&out);
@@ -374,9 +411,9 @@ pub fn run(root: PathBuf, tests: Vec<TestItem>, waker: Arc<dyn Fn() + Send + Syn
         // Python.
         let py: Vec<&TestItem> = tests.iter().filter(|t| t.kind == Kind::Pytest).collect();
         if !py.is_empty() {
-            let mut c = command(python());
-            c.args(["-m", "pytest", "-q", "-rA", "--no-header"]).current_dir(&root);
-            c.args(py.iter().map(|t| t.name.as_str()));
+            let mut args = vec!["-m", "pytest", "-q", "-rA", "--no-header"];
+            args.extend(py.iter().map(|t| t.name.as_str()));
+            let c = ex.cmd(ex.python(), &args, &root, &[]);
             let _ = tx.send(Event::Log("$ pytest".into()));
             match run_logged(c, &tx) {
                 Ok((out, _)) => {
@@ -435,6 +472,42 @@ pub fn locate(root: &Path, t: &TestItem) -> Option<(PathBuf, usize)> {
 mod tests {
     use super::*;
 
+    /// Discover and run pytest tests on an SSH host
+    /// (`ZENITH_TEST_SSH=<host alias> cargo test -- --ignored`).
+    #[test]
+    #[ignore]
+    fn runs_tests_over_ssh() {
+        let Ok(host) = std::env::var("ZENITH_TEST_SSH") else { return };
+        let base = std::env::temp_dir().join(format!("zenith-rtest-{}", std::process::id()));
+        let remote_dir = base.join("remote");
+        std::fs::create_dir_all(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("test_r.py"), "def test_ok():\n    assert 1\n\ndef test_bad():\n    assert 0\n")
+            .unwrap();
+        let spec = crate::remote::RemoteSpec { host, port: None, path: remote_dir.to_string_lossy().into_owned() };
+        let cache = base.join("cache");
+        crate::remote::download(&spec, &cache).unwrap();
+        let info = crate::remote::probe(&spec, &cache, &["python3".into()]).unwrap();
+        let ex = Exec { host: Some(info) };
+        let w: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let rx = discover(cache.clone(), ex.clone(), w.clone());
+        let mut items = vec![];
+        for ev in rx.iter() {
+            if let Event::Discovered(i) = ev {
+                items = i;
+            }
+        }
+        assert_eq!(items.len(), 2, "{items:?}");
+        let mut st = HashMap::new();
+        for ev in run(cache, items, ex, w).iter() {
+            if let Event::Status(id, s, _) = ev {
+                st.insert(id, s);
+            }
+        }
+        assert_eq!(st.get("test_r.py#test_r.py::test_ok"), Some(&Status::Passed), "{st:?}");
+        assert_eq!(st.get("test_r.py#test_r.py::test_bad"), Some(&Status::Failed));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn cargo_artifacts_and_lists() {
         let json = r#"{"reason":"compiler-artifact","package_id":"path+file:///w/crates/zenith-core#0.1.0","manifest_path":"/w/crates/zenith-core/Cargo.toml","target":{"kind":["lib"],"name":"zenith_core"},"profile":{"test":true},"executable":"/w/target/debug/deps/zenith_core-abc"}
@@ -489,7 +562,7 @@ mod tests {
             "def test_good():\n    assert 1 + 1 == 2\n\n\ndef test_bad():\n    assert 2 == 3\n",
         )
         .unwrap();
-        let rx = discover(dir.clone(), Arc::new(|| {}));
+        let rx = discover(dir.clone(), Exec::default(), Arc::new(|| {}));
         let mut items = vec![];
         for ev in rx.iter() {
             if let Event::Discovered(i) = ev {
@@ -497,7 +570,7 @@ mod tests {
             }
         }
         assert_eq!(items.len(), 2, "{items:?}");
-        let rx = run(dir.clone(), items.clone(), Arc::new(|| {}));
+        let rx = run(dir.clone(), items.clone(), Exec::default(), Arc::new(|| {}));
         let mut st = HashMap::new();
         for ev in rx.iter() {
             if let Event::Status(id, s, _) = ev {
@@ -586,6 +659,8 @@ pub struct Panel {
     collapsed: std::collections::HashSet<String>,
     filter: String,
     discovered: bool,
+    /// Where tests run (set for remote folders).
+    pub exec: Exec,
 }
 
 impl Panel {
@@ -598,7 +673,7 @@ impl Panel {
         self.busy = true;
         self.discovered = true;
         self.root = Some(root.clone());
-        self.rx = Some(discover(root, waker));
+        self.rx = Some(discover(root, self.exec.clone(), waker));
     }
 
     /// Run these tests (all when `None`).
@@ -617,7 +692,7 @@ impl Panel {
         self.log.clear();
         self.error = None;
         self.busy = true;
-        self.rx = Some(run(root, tests, waker));
+        self.rx = Some(run(root, tests, self.exec.clone(), waker));
     }
 
     /// Ids of tests named `func` (last path segment).
@@ -631,6 +706,15 @@ impl Panel {
             .filter(|t| t.name.rsplit("::").next().and_then(|n| n.split('[').next()) == Some(func))
             .map(TestItem::id)
             .collect()
+    }
+
+    /// Run tests here or on a host; rediscovers when that changes.
+    pub fn set_exec(&mut self, exec: Exec) {
+        if exec.host.as_ref().map(|h| &h.cache) != self.exec.host.as_ref().map(|h| &h.cache) {
+            self.exec = exec;
+            self.discovered = false;
+            self.items.clear();
+        }
     }
 
     pub fn ensure_discovered(&mut self, root: Option<&Path>, waker: Arc<dyn Fn() + Send + Sync>) {

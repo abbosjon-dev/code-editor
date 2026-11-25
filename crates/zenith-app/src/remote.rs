@@ -372,6 +372,11 @@ impl HostInfo {
     /// (no terminal, so binary protocols on stdin/stdout stay intact).
     pub fn command(&self, local: &Path, program: &str, args: &[String]) -> Vec<String> {
         let dir = self.host_path(local).unwrap_or_else(|| self.root.clone());
+        self.command_at(&dir, program, args)
+    }
+
+    /// Like [`command`](Self::command), in a folder given as a host path.
+    pub fn command_at(&self, dir: &str, program: &str, args: &[String]) -> Vec<String> {
         let exe = self.found.get(program).cloned().unwrap_or_else(|| program.to_string());
         let cmd: Vec<String> = std::iter::once(exe).chain(args.iter().cloned()).map(|a| sh_quote(&a)).collect();
         let mut a = vec!["ssh".to_string()];
