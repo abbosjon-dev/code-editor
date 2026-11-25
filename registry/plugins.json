@@ -8,7 +8,10 @@
       "author": "Zenith",
       "repository": "https://github.com/abbosjon-dev/code-editor.git",
       "path": "plugins/examples/todo-tree",
-      "tags": ["productivity", "ai"]
+      "tags": [
+        "productivity",
+        "ai"
+      ]
     },
     {
       "id": "text-tools",
@@ -18,7 +21,23 @@
       "author": "Zenith",
       "repository": "https://github.com/abbosjon-dev/code-editor.git",
       "path": "plugins/examples/text-tools",
-      "tags": ["text", "ai"]
+      "tags": [
+        "text",
+        "ai"
+      ]
+    },
+    {
+      "id": "case-converter",
+      "name": "Case Converter (WASM)",
+      "version": "0.1.0",
+      "description": "snake_case, camelCase, PascalCase, kebab-case and Title Case for the selection. A WebAssembly plugin: runs sandboxed inside Zenith.",
+      "author": "Zenith",
+      "repository": "https://github.com/abbosjon-dev/code-editor.git",
+      "path": "plugins/examples/case-converter",
+      "tags": [
+        "text",
+        "wasm"
+      ]
     }
   ]
 }

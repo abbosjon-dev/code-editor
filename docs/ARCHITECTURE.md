@@ -16,7 +16,7 @@
 |---|---|---|
 | `zenith-core` | `Buffer` (rope), `Selection`, `History` (guruhlangan undo/redo), `find_all` | `ropey` |
 | `zenith-terminal` | PTY'da jarayon ishga tushirish, VT100 parse, DSR/DA so'rovlariga javob, scrollback | `portable-pty`, `vt100` |
-| `zenith-plugin` | Manifest topish, jarayonni boshqarish, JSON-lines protokoli | `serde_json`, `toml` |
+| `zenith-plugin` | Manifest topish, jarayonni boshqarish, JSON-lines protokoli, WASM pluginlar | `serde_json`, `toml`, `wasmtime` |
 | `zenith-lsp` | LSP mijozi: server jarayonlari, Content-Length framing, server so'rovlariga javob, UTF-16 ↔ char | `serde_json`, `url` |
 | `zenith-dap` | DAP mijozi: adapter jarayoni, so'rov/javob/hodisalar, adapterlar ro'yxati, `launch.toml` | `serde_json`, `toml` |
 | `zenith-ai` | Agent profillari, foydalanuvchi agentlarini birlashtirish, kontekst prompt | `which` |
@@ -58,7 +58,7 @@ klaviatura/sichqoncha ─► egui ─► ZenithApp::update
 - [x] Kod bloklarini yig'ish (chekinish asosida, barcha tillar uchun)
 - [x] Tree-sitter asosida ranglash va sintaktik folding (11 til)
 - [x] MCP serverlarini sozlash UI (.mcp.json, test)
-- [ ] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
+- [x] WASM pluginlar (wasmtime) — sandbox'langan, tez yuklanadigan pluginlar uchun qo'shimcha variant
 - [x] Plugin yon panellari (`[[panels]]`, `set_panel`)
 - [x] Plugin UI kengaytmalari: status bar elementlari
 

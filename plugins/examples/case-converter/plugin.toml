@@ -1,0 +1,26 @@
+id = "case-converter"
+name = "Case Converter (WASM)"
+version = "0.1.0"
+description = "Example WebAssembly plugin: snake_case, camelCase, PascalCase, kebab-case and Title Case for the selection. Runs sandboxed inside Zenith."
+# A WASI command module; build it with ./build.sh (cargo build --target wasm32-wasip1).
+wasm = "case_converter.wasm"
+
+[[commands]]
+id = "case.snake"
+title = "Case: snake_case"
+
+[[commands]]
+id = "case.camel"
+title = "Case: camelCase"
+
+[[commands]]
+id = "case.pascal"
+title = "Case: PascalCase"
+
+[[commands]]
+id = "case.kebab"
+title = "Case: kebab-case"
+
+[[commands]]
+id = "case.title"
+title = "Case: Title Case"

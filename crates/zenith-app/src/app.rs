@@ -3741,6 +3741,11 @@ impl ZenithApp {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&pl.manifest.name).strong());
                             ui.label(RichText::new(&pl.manifest.version).small().color(p.text_dim));
+                            if pl.is_wasm() {
+                                ui.label(RichText::new("WASM · sandboxed").small().color(p.accent)).on_hover_text(
+                                    "Runs inside Zenith as WebAssembly: no access to files, network or environment",
+                                );
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let mut en = pl.enabled;
                                 if ui.checkbox(&mut en, "").on_hover_text("Enabled").changed() {

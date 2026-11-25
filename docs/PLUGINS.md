@@ -154,6 +154,26 @@ Plugin status qatoriga o'z elementini qo'yishi mumkin (masalan, so'zlar soni, bu
 `active_editor_changed` hodisasi (`{"path": ...}`) aktiv fayl almashganda keladi. Misol:
 [`plugins/examples/text-tools`](../plugins/examples/text-tools/main.py).
 
+## WebAssembly (WASM) pluginlar
+
+`run` o'rniga `wasm` ko'rsatilsa, plugin **WebAssembly** moduli sifatida Zenith ichida (wasmtime) ishlaydi:
+
+```toml
+id = "case-converter"
+name = "Case Converter (WASM)"
+wasm = "case_converter.wasm"   # WASI command modul (wasm32-wasip1)
+```
+
+- Protokol xuddi shu: stdin'dan JSON qatorlar keladi, stdout'ga javob yoziladi, stderr — log.
+- **Sandbox**: modul faqat editor yuborgan xabarlarni ko'radi — fayllar, tarmoq, muhit o'zgaruvchilari yo'q.
+  Kerakli ma'lumot (`text`, `selection`, ...) `context` da keladi, o'zgarishlar amallar (`replace_selection`,
+  `set_text`, ...) orqali qilinadi. Python yoki Node o'rnatilishi shart emas — bitta `.wasm` fayl hamma OS'da ishlaydi.
+- Plugin o'chirilganda yoki qotib qolsa, Zenith uni darhol to'xtatadi.
+- Istalgan WASI'ni qo'llaydigan til: Rust (`cargo build --target wasm32-wasip1`), Go (`GOOS=wasip1 GOARCH=wasm`),
+  C/C++ (wasi-sdk), Zig va boshqalar.
+
+To'liq misol: [`plugins/examples/case-converter`](../plugins/examples/case-converter) (Rust; `./build.sh` bilan yig'iladi).
+
 ## Marketplace: pluginni e'lon qilish
 
 Plugins panelidagi **MARKETPLACE** bo'limi plugin indeksini o'qiydi — standart holatda shu repodagi

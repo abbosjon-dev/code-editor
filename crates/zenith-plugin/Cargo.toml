@@ -11,3 +11,10 @@ serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 log.workspace = true
+wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+wasi-common = { version = "46", optional = true, default-features = false, features = ["sync", "wasmtime"] }
+
+[features]
+default = ["wasm"]
+# WebAssembly (WASI) plugins, run sandboxed in-process with wasmtime.
+wasm = ["dep:wasmtime", "dep:wasi-common"]

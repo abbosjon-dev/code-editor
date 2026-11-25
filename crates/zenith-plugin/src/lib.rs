@@ -9,9 +9,11 @@
 //! results are polled by the UI once per frame.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+#[cfg(feature = "wasm")]
+mod wasm;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -31,7 +33,13 @@ pub struct Manifest {
     pub description: String,
     /// Command line to start the plugin, e.g. `["python3", "main.py"]`.
     /// Relative paths are resolved inside the plugin folder.
+    #[serde(default)]
     pub run: Vec<String>,
+    /// Or a WebAssembly module (WASI command, `wasm32-wasip1`) in the plugin
+    /// folder, run sandboxed inside the editor: no files, network or
+    /// environment — only the protocol messages.
+    #[serde(default)]
+    pub wasm: String,
     #[serde(default)]
     pub commands: Vec<CommandContribution>,
     /// Editor events the plugin wants: "file_opened", "file_saved".
@@ -215,18 +223,49 @@ pub struct Plugin {
     pub enabled: bool,
 }
 
+/// A started plugin: the process and its stdin, stdout, stderr.
+type Spawned = (Proc, Box<dyn Write + Send>, Box<dyn Read + Send>, Box<dyn Read + Send>);
+
+enum Proc {
+    Native(Child),
+    #[cfg(feature = "wasm")]
+    Wasm(wasm::WasmProcess),
+}
+
 struct Running {
-    child: Child,
-    stdin: ChildStdin,
+    proc: Proc,
+    stdin: Box<dyn Write + Send>,
     next_id: u64,
+}
+
+impl Running {
+    fn alive(&mut self) -> bool {
+        match &mut self.proc {
+            Proc::Native(c) => matches!(c.try_wait(), Ok(None)),
+            #[cfg(feature = "wasm")]
+            Proc::Wasm(w) => w.is_running(),
+        }
+    }
+
+    fn kill(&mut self) {
+        match &mut self.proc {
+            Proc::Native(c) => {
+                let _ = c.kill();
+            }
+            #[cfg(feature = "wasm")]
+            Proc::Wasm(w) => w.kill(),
+        }
+    }
 }
 
 impl Plugin {
     pub fn is_running(&mut self) -> bool {
-        match &mut self.process {
-            Some(r) => matches!(r.child.try_wait(), Ok(None)),
-            None => false,
-        }
+        self.process.as_mut().is_some_and(Running::alive)
+    }
+
+    /// A WebAssembly (sandboxed) plugin.
+    pub fn is_wasm(&self) -> bool {
+        !self.manifest.wasm.is_empty()
     }
 }
 
@@ -367,6 +406,25 @@ impl PluginHost {
         if !plugin.enabled {
             bail!("plugin `{}` is disabled", plugin.manifest.id);
         }
+        let (proc, stdin, stdout, stderr): Spawned = if plugin.is_wasm() {
+            #[cfg(feature = "wasm")]
+            {
+                let path = plugin.dir.join(&plugin.manifest.wasm);
+                let (mut w, out, err) = wasm::spawn(&path, &plugin.manifest.id)
+                    .with_context(|| format!("failed to start plugin `{}`", plugin.manifest.id))?;
+                let stdin = w.stdin.take().context("no stdin")?;
+                (Proc::Wasm(w), Box::new(stdin), Box::new(out), Box::new(err))
+            }
+            #[cfg(not(feature = "wasm"))]
+            bail!("plugin `{}` is WebAssembly, and this build has no WebAssembly support", plugin.manifest.id);
+        } else {
+            Self::spawn_native(plugin)?
+        };
+        let id = plugin.manifest.id.clone();
+        Self::attach(id, proc, stdin, stdout, stderr, self.tx.clone(), self.waker.clone(), plugin)
+    }
+
+    fn spawn_native(plugin: &Plugin) -> Result<Spawned> {
         let (prog, args) = plugin.manifest.run.split_first().context("empty `run` in plugin.toml")?;
         let resolve = |s: &String| -> String {
             let p = plugin.dir.join(s);
@@ -393,11 +451,23 @@ impl PluginHost {
             cmd.spawn().with_context(|| format!("failed to start plugin `{}` ({prog})", plugin.manifest.id))?;
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        Ok((Proc::Native(child), Box::new(stdin), Box::new(stdout), Box::new(stderr)))
+    }
 
-        let id = plugin.manifest.id.clone();
-        let tx = self.tx.clone();
-        let waker = self.waker.clone();
+    /// Read the plugin's output in the background and send `initialize`.
+    #[allow(clippy::too_many_arguments)]
+    fn attach(
+        id: String,
+        proc: Proc,
+        mut stdin: Box<dyn Write + Send>,
+        stdout: Box<dyn Read + Send>,
+        stderr: Box<dyn Read + Send>,
+        tx: Sender<PluginEvent>,
+        waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        plugin: &mut Plugin,
+    ) -> Result<()> {
+        let tx2 = tx.clone();
         thread::Builder::new().name(format!("plugin-{id}")).spawn(move || {
             let wake = || {
                 if let Some(w) = &waker {
@@ -418,7 +488,7 @@ impl PluginHost {
             wake();
         })?;
         let id = plugin.manifest.id.clone();
-        let tx = self.tx.clone();
+        let tx = tx2;
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
                 let _ = tx.send(PluginEvent { plugin_id: id.clone(), kind: PluginEventKind::Log(line) });
@@ -431,7 +501,7 @@ impl PluginHost {
             "params": { "protocol": PROTOCOL_VERSION, "editor": "zenith", "version": env!("CARGO_PKG_VERSION") }
         });
         writeln!(stdin, "{init}")?;
-        plugin.process = Some(Running { child, stdin, next_id: 0 });
+        plugin.process = Some(Running { proc, stdin, next_id: 0 });
         Ok(())
     }
 
@@ -445,7 +515,7 @@ impl PluginHost {
             p.enabled = enabled;
             if !enabled {
                 if let Some(mut r) = p.process.take() {
-                    let _ = r.child.kill();
+                    r.kill();
                 }
             }
         }
@@ -455,7 +525,7 @@ impl PluginHost {
         for p in &mut self.plugins {
             if let Some(mut r) = p.process.take() {
                 let _ = writeln!(r.stdin, "{}", json!({"method": "shutdown"}));
-                let _ = r.child.kill();
+                r.kill();
             }
         }
     }
@@ -473,8 +543,8 @@ pub fn load_manifest(path: &Path) -> Result<Manifest> {
     if m.id.trim().is_empty() {
         bail!("plugin id must not be empty");
     }
-    if m.run.is_empty() {
-        bail!("`run` must contain the command to start the plugin");
+    if m.run.is_empty() && m.wasm.is_empty() {
+        bail!("set `run` (the command that starts the plugin) or `wasm` (a WebAssembly module)");
     }
     Ok(m)
 }
@@ -518,6 +588,36 @@ fn parse_line(line: &str) -> Vec<PluginEventKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example WebAssembly plugin answers like any other plugin.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn runs_a_wasm_plugin() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples");
+        let mut host = PluginHost::default();
+        assert!(host.discover(&[dir]).is_empty());
+        let i = host.plugins.iter().position(|p| p.manifest.id == "case-converter").expect("example plugin");
+        assert!(host.plugins[i].is_wasm());
+        let ctx = EditorContext { selection: "myVariableName\nparseHTTPServer".into(), ..Default::default() };
+        host.execute("case.snake", &ctx).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let text = loop {
+            let ev = host.poll();
+            if let Some(t) = ev.iter().find_map(|e| match &e.kind {
+                PluginEventKind::Action(Action::ReplaceSelection { text }) => Some(text.clone()),
+                _ => None,
+            }) {
+                break t;
+            }
+            assert!(std::time::Instant::now() < deadline, "no answer: {ev:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(text, "my_variable_name\nparse_http_server");
+        assert!(host.plugins[i].is_running());
+        host.shutdown();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!host.plugins[i].is_running());
+    }
 
     #[test]
     fn parses_result_actions() {
@@ -603,6 +703,7 @@ mod tests {
                 version: String::new(),
                 description: String::new(),
                 run: vec!["sh".into(), "p.sh".into()],
+                wasm: String::new(),
                 commands: vec![CommandContribution { id: "t.ping".into(), title: "Ping".into(), keybinding: None }],
                 events: vec![],
                 panels: vec![],
