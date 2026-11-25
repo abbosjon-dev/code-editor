@@ -1,8 +1,8 @@
 //! WebAssembly plugins: a WASI command module (`wasm32-wasip1`) that speaks
 //! the same JSON-lines protocol on stdin/stdout, run in-process with
-//! wasmtime. It is sandboxed: no files, no network, no environment
-//! variables, no clock-based tricks beyond what WASI exposes — it only sees
-//! the messages the editor sends it.
+//! wasmtime. It is sandboxed: no network, no environment variables, and no
+//! files — unless its manifest asks for `read_workspace`, which shows the
+//! workspace at `/workspace`, read-only.
 
 use std::io::{PipeReader, PipeWriter};
 use std::path::Path;
@@ -11,8 +11,11 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
+use wasi_common::dir::{OpenResult, ReaddirCursor, ReaddirEntity};
+use wasi_common::file::{FdFlags, Filestat, OFlags};
 use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasi_common::sync::WasiCtxBuilder;
+use wasi_common::{ErrorExt, WasiDir};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 /// A running WASM plugin.
@@ -45,8 +48,60 @@ fn w(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{e}")
 }
 
+/// A directory the module may read but not change: every call that would
+/// write is refused, and folders opened through it are wrapped the same way.
+struct ReadOnlyDir(Box<dyn WasiDir>);
+
+#[async_trait::async_trait]
+impl WasiDir for ReadOnlyDir {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn open_file(
+        &self,
+        symlink_follow: bool,
+        path: &str,
+        oflags: OFlags,
+        read: bool,
+        write: bool,
+        fdflags: FdFlags,
+    ) -> Result<OpenResult, wasi_common::Error> {
+        if write || oflags.intersects(OFlags::CREATE | OFlags::TRUNCATE | OFlags::EXCLUSIVE) {
+            return Err(wasi_common::Error::perm());
+        }
+        Ok(match self.0.open_file(symlink_follow, path, oflags, read, false, fdflags).await? {
+            OpenResult::Dir(d) => OpenResult::Dir(Box::new(ReadOnlyDir(d))),
+            f => f,
+        })
+    }
+
+    async fn readdir(
+        &self,
+        cursor: ReaddirCursor,
+    ) -> Result<Box<dyn Iterator<Item = Result<ReaddirEntity, wasi_common::Error>> + Send>, wasi_common::Error> {
+        self.0.readdir(cursor).await
+    }
+
+    async fn read_link(&self, path: &str) -> Result<std::path::PathBuf, wasi_common::Error> {
+        self.0.read_link(path).await
+    }
+
+    async fn get_filestat(&self) -> Result<Filestat, wasi_common::Error> {
+        self.0.get_filestat().await
+    }
+
+    async fn get_path_filestat(&self, path: &str, follow: bool) -> Result<Filestat, wasi_common::Error> {
+        self.0.get_path_filestat(path, follow).await
+    }
+}
+
+/// Where a WASM plugin sees the workspace (with `read_workspace`).
+pub const GUEST_WORKSPACE: &str = "/workspace";
+
 /// Compile and start `path`; returns the process and its stdout / stderr.
-pub fn spawn(path: &Path, id: &str) -> Result<(WasmProcess, PipeReader, PipeReader)> {
+/// `workspace`: a folder to show read-only at [`GUEST_WORKSPACE`].
+pub fn spawn(path: &Path, id: &str, workspace: Option<&Path>) -> Result<(WasmProcess, PipeReader, PipeReader)> {
     let mut config = Config::new();
     // Lets `kill` interrupt a plugin stuck in a loop.
     config.epoch_interruption(true);
@@ -63,6 +118,12 @@ pub fn spawn(path: &Path, id: &str) -> Result<(WasmProcess, PipeReader, PipeRead
         .arg(id)
         .map_err(w)?
         .build();
+    if let Some(ws) = workspace {
+        let dir = wasi_common::sync::Dir::open_ambient_dir(ws, wasi_common::sync::ambient_authority())
+            .with_context(|| format!("opening {}", ws.display()))?;
+        let dir = wasi_common::sync::dir::Dir::from_cap_std(dir);
+        wasi.push_preopened_dir(Box::new(ReadOnlyDir(Box::new(dir))), GUEST_WORKSPACE).map_err(w)?;
+    }
     let mut linker: Linker<wasi_common::WasiCtx> = Linker::new(&engine);
     wasi_common::sync::add_to_linker(&mut linker, |s| s).map_err(w)?;
     let mut store = Store::new(&engine, wasi);

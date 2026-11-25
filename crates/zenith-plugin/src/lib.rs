@@ -40,6 +40,11 @@ pub struct Manifest {
     /// environment — only the protocol messages.
     #[serde(default)]
     pub wasm: String,
+    /// What a WASM plugin may do beyond the protocol. `"read_workspace"`:
+    /// read (not change) the open folder, visible to it at `/workspace`.
+    /// Native plugins (`run`) are ordinary programs and aren't limited.
+    #[serde(default)]
+    pub permissions: Vec<String>,
     #[serde(default)]
     pub commands: Vec<CommandContribution>,
     /// Editor events the plugin wants: "file_opened", "file_saved".
@@ -236,6 +241,8 @@ struct Running {
     proc: Proc,
     stdin: Box<dyn Write + Send>,
     next_id: u64,
+    /// Host paths ↔ the plugin's view (`/workspace`), for sandboxed plugins.
+    map: Option<zenith_core::pathmap::PathMap>,
 }
 
 impl Running {
@@ -263,6 +270,11 @@ impl Plugin {
         self.process.as_mut().is_some_and(Running::alive)
     }
 
+    /// A WASM plugin that asked to read the workspace.
+    pub fn may_read_workspace(&self) -> bool {
+        self.is_wasm() && self.manifest.permissions.iter().any(|p| p == "read_workspace")
+    }
+
     /// A WebAssembly (sandboxed) plugin.
     pub fn is_wasm(&self) -> bool {
         !self.manifest.wasm.is_empty()
@@ -277,16 +289,23 @@ pub struct PluginHost {
     commands: HashMap<String, usize>,
     /// Called after a plugin sends something so the UI can wake up.
     waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// The open folder (shown to WASM plugins that may read it).
+    workspace: Option<PathBuf>,
 }
 
 impl Default for PluginHost {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Self { plugins: vec![], tx, rx, commands: HashMap::new(), waker: None }
+        Self { plugins: vec![], tx, rx, commands: HashMap::new(), waker: None, workspace: None }
     }
 }
 
 impl PluginHost {
+    /// The open folder; WASM plugins with `read_workspace` see it read-only.
+    pub fn set_workspace(&mut self, ws: Option<PathBuf>) {
+        self.workspace = ws;
+    }
+
     pub fn set_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
         self.waker = Some(waker);
     }
@@ -388,7 +407,10 @@ impl PluginHost {
         let plugin = &mut self.plugins[idx];
         let running = plugin.process.as_mut().unwrap();
         running.next_id += 1;
-        let msg = json!({ "id": running.next_id, "method": method, "params": params });
+        let mut msg = json!({ "id": running.next_id, "method": method, "params": params });
+        if let Some(m) = &running.map {
+            m.outgoing(&mut msg);
+        }
         let mut line = serde_json::to_string(&msg)?;
         line.push('\n');
         if let Err(e) = running.stdin.write_all(line.as_bytes()).and_then(|_| running.stdin.flush()) {
@@ -406,11 +428,15 @@ impl PluginHost {
         if !plugin.enabled {
             bail!("plugin `{}` is disabled", plugin.manifest.id);
         }
+        #[allow(unused_mut)]
+        let mut map = None;
         let (proc, stdin, stdout, stderr): Spawned = if plugin.is_wasm() {
             #[cfg(feature = "wasm")]
             {
                 let path = plugin.dir.join(&plugin.manifest.wasm);
-                let (mut w, out, err) = wasm::spawn(&path, &plugin.manifest.id)
+                let ws = self.workspace.as_deref().filter(|_| plugin.may_read_workspace());
+                map = ws.map(|w| zenith_core::pathmap::PathMap::new(&w.to_string_lossy(), wasm::GUEST_WORKSPACE, None));
+                let (mut w, out, err) = wasm::spawn(&path, &plugin.manifest.id, ws)
                     .with_context(|| format!("failed to start plugin `{}`", plugin.manifest.id))?;
                 let stdin = w.stdin.take().context("no stdin")?;
                 (Proc::Wasm(w), Box::new(stdin), Box::new(out), Box::new(err))
@@ -421,7 +447,7 @@ impl PluginHost {
             Self::spawn_native(plugin)?
         };
         let id = plugin.manifest.id.clone();
-        Self::attach(id, proc, stdin, stdout, stderr, self.tx.clone(), self.waker.clone(), plugin)
+        Self::attach(id, proc, stdin, stdout, stderr, self.tx.clone(), self.waker.clone(), plugin, map)
     }
 
     fn spawn_native(plugin: &Plugin) -> Result<Spawned> {
@@ -466,8 +492,10 @@ impl PluginHost {
         tx: Sender<PluginEvent>,
         waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
         plugin: &mut Plugin,
+        map: Option<zenith_core::pathmap::PathMap>,
     ) -> Result<()> {
         let tx2 = tx.clone();
+        let in_map = map.clone();
         thread::Builder::new().name(format!("plugin-{id}")).spawn(move || {
             let wake = || {
                 if let Some(w) = &waker {
@@ -479,6 +507,14 @@ impl PluginHost {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // Paths the sandboxed plugin knows (/workspace/...) back to host paths.
+                let line = match (&in_map, serde_json::from_str::<Value>(&line)) {
+                    (Some(m), Ok(mut v)) => {
+                        m.incoming(&mut v);
+                        v.to_string()
+                    }
+                    _ => line,
+                };
                 for kind in parse_line(&line) {
                     let _ = tx.send(PluginEvent { plugin_id: id.clone(), kind });
                 }
@@ -501,7 +537,7 @@ impl PluginHost {
             "params": { "protocol": PROTOCOL_VERSION, "editor": "zenith", "version": env!("CARGO_PKG_VERSION") }
         });
         writeln!(stdin, "{init}")?;
-        plugin.process = Some(Running { proc, stdin, next_id: 0 });
+        plugin.process = Some(Running { proc, stdin, next_id: 0, map });
         Ok(())
     }
 
@@ -588,6 +624,52 @@ fn parse_line(line: &str) -> Vec<PluginEventKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run a command and wait for its first notification.
+    #[cfg(feature = "wasm")]
+    fn notification(host: &mut PluginHost, command: &str) -> (String, NotifyLevel) {
+        host.execute(command, &EditorContext::default()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            for e in host.poll() {
+                if let PluginEventKind::Action(Action::Notify { message, level }) = e.kind {
+                    return (message, level);
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "no answer to {command}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// `read_workspace` shows the folder read-only; without it nothing is visible.
+    #[cfg(feature = "wasm")]
+    #[test]
+    fn wasm_workspace_is_read_only() {
+        let ws = std::env::temp_dir().join(format!("zenith-wasm-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        std::fs::write(ws.join("b.py"), "x = 1\n").unwrap();
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples");
+        let mut host = PluginHost::default();
+        host.set_workspace(Some(ws.clone()));
+        assert!(host.discover(&[examples]).is_empty());
+        let (msg, _) = notification(&mut host, "stats.count");
+        assert!(msg.starts_with("3 lines") && msg.contains(".rs: 2 lines in 1 files"), "{msg}");
+        let (msg, level) = notification(&mut host, "stats.sandbox");
+        assert!(msg.contains("write allowed: false") && msg.contains("mkdir allowed: false"), "{msg}");
+        assert_eq!(level, NotifyLevel::Info);
+        assert!(!ws.join("zenith-sandbox-test.txt").exists() && !ws.join("zenith-sandbox-dir").exists());
+        host.shutdown();
+
+        // The same plugin without the permission sees no workspace.
+        let i = host.plugins.iter().position(|p| p.manifest.id == "workspace-stats").unwrap();
+        host.plugins[i].manifest.permissions.clear();
+        let (msg, _) = notification(&mut host, "stats.count");
+        assert!(msg.contains("No workspace"), "{msg}");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     /// The example WebAssembly plugin answers like any other plugin.
     #[cfg(feature = "wasm")]
@@ -704,6 +786,7 @@ mod tests {
                 description: String::new(),
                 run: vec!["sh".into(), "p.sh".into()],
                 wasm: String::new(),
+                permissions: vec![],
                 commands: vec![CommandContribution { id: "t.ping".into(), title: "Ping".into(), keybinding: None }],
                 events: vec![],
                 panels: vec![],

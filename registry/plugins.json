@@ -38,6 +38,19 @@
         "text",
         "wasm"
       ]
+    },
+    {
+      "id": "workspace-stats",
+      "name": "Workspace Stats (WASM)",
+      "version": "0.1.0",
+      "description": "Lines of code per language. A WebAssembly plugin with one permission: it may read the workspace, never change it.",
+      "author": "Zenith",
+      "repository": "https://github.com/abbosjon-dev/code-editor.git",
+      "path": "plugins/examples/workspace-stats",
+      "tags": [
+        "stats",
+        "wasm"
+      ]
     }
   ]
 }

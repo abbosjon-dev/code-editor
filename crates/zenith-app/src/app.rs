@@ -625,6 +625,7 @@ impl ZenithApp {
         }
         let mut host = PluginHost::default();
         host.set_waker(self.waker.clone());
+        host.set_workspace(self.workspace.clone());
         let errors = host.discover(&dirs);
         self.plugins = host;
         for e in errors {
@@ -3741,7 +3742,11 @@ impl ZenithApp {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&pl.manifest.name).strong());
                             ui.label(RichText::new(&pl.manifest.version).small().color(p.text_dim));
-                            if pl.is_wasm() {
+                            if pl.may_read_workspace() {
+                                ui.label(RichText::new("WASM · reads workspace").small().color(p.warning)).on_hover_text(
+                                    "Runs inside Zenith as WebAssembly. It may read the open folder (not change it); no network or environment",
+                                );
+                            } else if pl.is_wasm() {
                                 ui.label(RichText::new("WASM · sandboxed").small().color(p.accent)).on_hover_text(
                                     "Runs inside Zenith as WebAssembly: no access to files, network or environment",
                                 );

@@ -5998,12 +5998,14 @@ name = "zenith-plugin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "log",
  "serde",
  "serde_json",
  "toml 0.8.23",
  "wasi-common",
  "wasmtime",
+ "zenith-core",
 ]
 
 [[package]]

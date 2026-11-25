@@ -168,6 +168,10 @@ wasm = "case_converter.wasm"   # WASI command modul (wasm32-wasip1)
 - **Sandbox**: modul faqat editor yuborgan xabarlarni ko'radi — fayllar, tarmoq, muhit o'zgaruvchilari yo'q.
   Kerakli ma'lumot (`text`, `selection`, ...) `context` da keladi, o'zgarishlar amallar (`replace_selection`,
   `set_text`, ...) orqali qilinadi. Python yoki Node o'rnatilishi shart emas — bitta `.wasm` fayl hamma OS'da ishlaydi.
+- **Ruxsatlar**: `permissions = ["read_workspace"]` — plugin ochiq papkani `/workspace` sifatida **faqat o'qiy oladi**
+  (yozish, yaratish, o'chirish rad etiladi). `context` dagi va javobdagi yo'llar avtomatik almashtiriladi
+  (`/workspace/src/a.rs` ↔ haqiqiy yo'l). Plugins panelida "WASM · reads workspace" deb ko'rinadi.
+  Misol: [`plugins/examples/workspace-stats`](../plugins/examples/workspace-stats).
 - Plugin o'chirilganda yoki qotib qolsa, Zenith uni darhol to'xtatadi.
 - Istalgan WASI'ni qo'llaydigan til: Rust (`cargo build --target wasm32-wasip1`), Go (`GOOS=wasip1 GOARCH=wasm`),
   C/C++ (wasi-sdk), Zig va boshqalar.

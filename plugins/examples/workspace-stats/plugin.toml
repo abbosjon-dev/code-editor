@@ -1,0 +1,15 @@
+id = "workspace-stats"
+name = "Workspace Stats (WASM)"
+version = "0.1.0"
+description = "Example WebAssembly plugin with a permission: counts files and lines of code per language. It may read the workspace, never change it."
+wasm = "workspace_stats.wasm"
+# The workspace is visible to the module at /workspace, read-only.
+permissions = ["read_workspace"]
+
+[[commands]]
+id = "stats.count"
+title = "Workspace Stats: Count Lines of Code"
+
+[[commands]]
+id = "stats.sandbox"
+title = "Workspace Stats: Check the Sandbox"
