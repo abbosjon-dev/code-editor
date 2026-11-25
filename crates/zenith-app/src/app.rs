@@ -519,6 +519,28 @@ impl ZenithApp {
             .map_or(0, |(i, _)| i)
     }
 
+    /// Stage or unstage the git change at `line` of the active file.
+    fn stage_hunk(&mut self, line: usize, stage: bool) {
+        self.stage_hunk_in(self.active, line, stage);
+    }
+
+    fn stage_hunk_in(&mut self, doc: usize, line: usize, stage: bool) {
+        let Some((path, text)) = self.docs.get(doc).and_then(|d| Some((d.path()?.to_path_buf(), d.buffer.text())))
+        else {
+            return;
+        };
+        let slot = self.repo_index(Some(&path));
+        let r = self.with_repo(slot, |app| {
+            let g = app.git.as_mut().filter(|g| path.starts_with(&g.root))?;
+            Some(if stage { g.stage_hunk(&path, &text, line) } else { g.unstage_hunk(&path, &text, line) })
+        });
+        match r {
+            Some(Ok(msg)) => self.toast(msg, NotifyLevel::Info),
+            Some(Err(e)) => self.toast(e, NotifyLevel::Warning),
+            None => self.toast("This file isn't in a Git repository", NotifyLevel::Info),
+        }
+    }
+
     fn git_for(&self, path: &Path) -> Option<&Git> {
         self.repo_slot(self.repo_index(Some(path))).as_ref().filter(|g| path.starts_with(&g.root))
     }
@@ -1561,6 +1583,11 @@ impl ZenithApp {
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
             Cmd::OpenSettings => self.show_settings = true,
+            Cmd::StageChangeAtCursor | Cmd::UnstageChangeAtCursor => {
+                if let Some(line) = self.docs.get(self.active).map(|d| d.buffer.cursor_pos().line) {
+                    self.stage_hunk(line, cmd == Cmd::StageChangeAtCursor);
+                }
+            }
             Cmd::OpenWorkspaceSettings => {
                 let Some(ws) = self.workspace.clone() else {
                     self.toast("Open a folder first", NotifyLevel::Info);
@@ -4110,11 +4137,22 @@ impl ZenithApp {
         }
         if self.docs.get(shown).is_some_and(|d| d.show_git_diff) {
             let fs = self.settings.editor_font_size;
+            let mut hunk_act = None;
             if let Some(doc) = self.docs.get_mut(shown) {
-                if let Some(crate::diff_view::DiffAction::Close) = crate::diff_view::ui(ui, doc, &p, fs) {
-                    doc.show_git_diff = false;
-                    self.focus_editor = true;
+                match crate::diff_view::ui(ui, doc, &p, fs) {
+                    Some(crate::diff_view::DiffAction::Close) => {
+                        doc.show_git_diff = false;
+                        self.focus_editor = true;
+                    }
+                    Some(crate::diff_view::DiffAction::StageHunk(line)) => hunk_act = Some((line, true)),
+                    Some(crate::diff_view::DiffAction::RevertHunk(line)) => {
+                        doc.revert_git_hunk(line);
+                    }
+                    None => {}
                 }
+            }
+            if let Some((line, stage)) = hunk_act {
+                self.stage_hunk_in(shown, line, stage);
             }
             return;
         }
@@ -4235,6 +4273,7 @@ impl ZenithApp {
                 }
                 EditorAction::GotoDefinition { idx } => self.goto_definition(idx),
                 EditorAction::Run(cmd) => self.run(ctx, cmd),
+                EditorAction::StageHunk { line, stage } => self.stage_hunk(line, stage),
                 EditorAction::SignatureHelp => {
                     let root = self.active_root();
                     if let Some(doc) = self.docs.get_mut(self.active) {
@@ -5560,7 +5599,7 @@ impl ZenithApp {
                             let old: Vec<&str> = base.lines().collect();
                             let new: Vec<&str> = cur.lines().collect();
                             let id = ui.make_persistent_id(("agent-diff", rel));
-                            crate::diff_view::rows_ui(ui, id, rows, &changes, &old, &new, &p, font_size, None);
+                            crate::diff_view::rows_ui(ui, id, rows, &changes, &old, &new, &p, font_size, None, false);
                         }
                     });
                 });

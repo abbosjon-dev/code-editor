@@ -10,6 +10,16 @@ use crate::theme::Palette;
 
 pub enum DiffAction {
     Close,
+    /// Stage the change that starts at this line of the file.
+    StageHunk(usize),
+    /// Restore the committed lines of the change at this line.
+    RevertHunk(usize),
+}
+
+/// A button on one change of a diff.
+pub enum RowAction {
+    Stage(usize),
+    Revert(usize),
 }
 
 /// Cached alignment for a document version.
@@ -88,7 +98,11 @@ pub fn ui(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, font_size: f32) ->
         };
         doc.git_diff.jump_to = target.map(|&c| c.saturating_sub(3));
     }
-    rows_ui(ui, id, &rows, &changes, &old_lines, &new_lines, p, font_size, doc.git_diff.jump_to.take());
+    match rows_ui(ui, id, &rows, &changes, &old_lines, &new_lines, p, font_size, doc.git_diff.jump_to.take(), true) {
+        Some(RowAction::Stage(l)) => action = Some(DiffAction::StageHunk(l)),
+        Some(RowAction::Revert(l)) => action = Some(DiffAction::RevertHunk(l)),
+        None => {}
+    }
     action
 }
 
@@ -105,7 +119,9 @@ pub fn rows_ui(
     p: &Palette,
     font_size: f32,
     jump_to: Option<usize>,
-) {
+    hunk_buttons: bool,
+) -> Option<RowAction> {
+    let mut action = None;
     let font = FontId::monospace(font_size);
     let row_h = (font_size * 1.45).round();
     let char_w = crate::theme::mono_metrics(ui, &font).0;
@@ -165,6 +181,27 @@ pub fn rows_ui(
                 }
             }
             painter.vline(rect.min.x + half, rect.y_range(), Stroke::new(1.0_f32, p.border));
+            // Buttons on the first row of each change.
+            if hunk_buttons && r.changed && (i == 0 || !rows[i - 1].changed) {
+                // The change's first line in the file (after a deletion: the line that follows).
+                let line = rows[i..].iter().find_map(|r| r.new).unwrap_or(new_lines.len());
+                let at = egui::pos2(rect.max.x - 150.0, rect.min.y);
+                let r = Rect::from_min_size(at, egui::vec2(146.0, row_h));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("+ Stage").on_hover_text("Stage only this change").clicked() {
+                            action = Some(RowAction::Stage(line));
+                        }
+                        if ui
+                            .small_button(RichText::new("↺ Revert").color(p.error))
+                            .on_hover_text("Restore the committed lines")
+                            .clicked()
+                        {
+                            action = Some(RowAction::Revert(line));
+                        }
+                    });
+                });
+            }
         }
     });
     // Overview of change positions on the right edge.
@@ -179,4 +216,5 @@ pub fn rows_ui(
             );
         }
     }
+    action
 }

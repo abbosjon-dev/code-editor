@@ -37,6 +37,11 @@ pub enum EditorAction {
     Run(crate::commands::Cmd),
     /// Ask for parameter hints at the caret.
     SignatureHelp,
+    /// Stage / unstage just the git change at this line.
+    StageHunk {
+        line: usize,
+        stage: bool,
+    },
     /// Show a message (e.g. an unknown Vim `:` command).
     Notify(String),
     /// Edit a breakpoint's condition (`log` = logpoint message, `hit` = hit count).
@@ -1064,7 +1069,9 @@ pub fn editor_ui(
 
     // --- git change popup ---
     if let Some(anchor) = hunk_anchor {
-        hunk_popup(ui, doc, p, anchor, id, &m);
+        if let Some(a) = hunk_popup(ui, doc, p, anchor, id, &m) {
+            actions.push(a);
+        }
     }
 
     // --- parameter hints ---
@@ -1201,12 +1208,20 @@ fn completion_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, pos: Pos
 }
 
 /// Popup for a git change: old vs new lines with a Revert button.
-fn hunk_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, anchor: Pos2, id: egui::Id, m: &Metrics) {
-    let Some(line) = doc.hunk_popup else { return };
+fn hunk_popup(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    p: &Palette,
+    anchor: Pos2,
+    id: egui::Id,
+    m: &Metrics,
+) -> Option<EditorAction> {
+    let line = doc.hunk_popup?;
     let Some(base) = doc.git_base.clone() else {
         doc.hunk_popup = None;
-        return;
+        return None;
     };
+    let mut action = None;
     let text = doc.buffer.text();
     let hunks = crate::review::hunks(&base, &text);
     let Some(h) = hunks
@@ -1218,7 +1233,7 @@ fn hunk_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, anchor: Pos2, 
         .cloned()
     else {
         doc.hunk_popup = None;
-        return;
+        return None;
     };
     let mut close = ui.input(|i| i.key_pressed(Key::Escape));
     let mut revert = false;
@@ -1250,6 +1265,18 @@ fn hunk_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, anchor: Pos2, 
                         {
                             revert = true;
                         }
+                        if ui.small_button("− Unstage").on_hover_text("Take this change out of the index").clicked() {
+                            action = Some(EditorAction::StageHunk { line: h.new_start, stage: false });
+                            close = true;
+                        }
+                        if ui
+                            .small_button("+ Stage")
+                            .on_hover_text("Stage only this change (the rest of the file stays unstaged)")
+                            .clicked()
+                        {
+                            action = Some(EditorAction::StageHunk { line: h.new_start, stage: true });
+                            close = true;
+                        }
                     });
                 });
                 let font = FontId::monospace(m.font.size * 0.9);
@@ -1272,20 +1299,13 @@ fn hunk_popup(ui: &mut egui::Ui, doc: &mut Document, p: &Palette, anchor: Pos2, 
         close = true;
     }
     if revert {
-        let start = doc.buffer.rope().line_to_char(h.new_start.min(doc.buffer.len_lines()));
-        let end_line = h.new_start + h.new_lines.len();
-        let end = if end_line >= doc.buffer.len_lines() {
-            doc.buffer.len_chars()
-        } else {
-            doc.buffer.rope().line_to_char(end_line)
-        };
-        let old: String = h.old_lines.concat();
-        doc.buffer.apply_edits(vec![(start, end, old)]);
+        doc.revert_git_hunk(h.new_start);
         close = true;
     }
     if close {
         doc.hunk_popup = None;
     }
+    action
 }
 
 fn signature_popup(

@@ -292,6 +292,24 @@ pub fn git(spec: &RemoteSpec, args: &[&str]) -> Result<String, String> {
     run(ssh(spec, &script)).map(|o| String::from_utf8_lossy(&o).into_owned())
 }
 
+/// `git <args>` on the host with `input` on stdin.
+pub fn git_input(spec: &RemoteSpec, args: &[&str], input: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let words: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    let mut c = ssh(spec, &format!("cd {} && git {}", spec.qpath(), words.join(" ")));
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("ssh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).map_err(|e| e.to_string())?;
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Separator between the parts of [`git_state`]'s output.
 const PART: &str = "\n--zenith-part--\n";
 

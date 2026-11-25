@@ -73,6 +73,61 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// `git` with `input` on stdin.
+fn git_input(root: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).map_err(|e| e.to_string())?;
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Replace hunk `h` of `base` (lines `old_start..+old_lines`) with `with`.
+fn splice(base: &str, h: &crate::review::Hunk, with: &[String]) -> String {
+    let lines: Vec<&str> = base.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(base.len());
+    for l in &lines[..h.old_start.min(lines.len())] {
+        out.push_str(l);
+    }
+    for l in with {
+        out.push_str(l);
+    }
+    for l in lines.iter().skip(h.old_start + h.old_lines.len()) {
+        out.push_str(l);
+    }
+    out
+}
+
+/// Replace the new side of hunk `h` in `text` (lines `new_start..+new_lines`) with `with`.
+fn splice_new(text: &str, h: &crate::review::Hunk, with: &[String]) -> String {
+    let flipped = crate::review::Hunk {
+        old_start: h.new_start,
+        old_lines: h.new_lines.clone(),
+        new_start: h.old_start,
+        new_lines: h.old_lines.clone(),
+    };
+    splice(text, &flipped, with)
+}
+
+/// The hunk of `hunks` that covers `line` (a line of the "new" side).
+fn hunk_at(hunks: &[crate::review::Hunk], line: usize) -> Option<&crate::review::Hunk> {
+    hunks.iter().find(|h| h.new_start <= line && line < h.new_start + h.new_lines.len().max(1))
+}
+
 /// Where git commands run: here, or in the folder on an SSH host.
 #[derive(Clone)]
 struct Runner {
@@ -85,6 +140,13 @@ impl Runner {
         match &self.remote {
             None => git(&self.root, args),
             Some(spec) => crate::remote::git(spec, args),
+        }
+    }
+
+    fn git_input(&self, args: &[&str], input: &[u8]) -> Result<String, String> {
+        match &self.remote {
+            None => git_input(&self.root, args, input),
+            Some(spec) => crate::remote::git_input(spec, args, input),
         }
     }
 }
@@ -485,6 +547,61 @@ impl Git {
         self.run.git(&["add", "--", rel]).map(|_| self.refresh_now())
     }
 
+    /// Write `content` as the staged version of `rel`.
+    fn set_index(&mut self, rel: &str, content: &str) -> Result<(), String> {
+        let mode = self
+            .run
+            .git(&["ls-files", "-s", "--", rel])?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+            .unwrap_or_else(|| "100644".into());
+        let sha =
+            self.run.git_input(&["hash-object", "-w", "--stdin", &format!("--path={rel}")], content.as_bytes())?;
+        self.run.git(&["update-index", "--cacheinfo", &format!("{mode},{},{rel}", sha.trim())])?;
+        self.refresh_now();
+        Ok(())
+    }
+
+    /// Stage only the change at `line` of `text` (the editor's content).
+    pub fn stage_hunk(&mut self, path: &Path, text: &str, line: usize) -> Result<String, String> {
+        let rel = self.rel(path).ok_or("not in this repository")?;
+        let Ok(index) = self.run.git(&["show", &format!(":./{rel}")]) else {
+            // Not in the index yet (a new file): stage it whole.
+            self.stage(&rel)?;
+            return Ok(format!("Staged {rel}"));
+        };
+        let index = index.replace("\r\n", "\n");
+        let hunks = crate::review::hunks(&index, text);
+        let h = hunk_at(&hunks, line).ok_or("This change is already staged")?;
+        let staged = splice(&index, h, &h.new_lines);
+        self.set_index(&rel, &staged)?;
+        Ok(format!("Staged the change at line {}", line + 1))
+    }
+
+    /// Take the staged change at `line` (of `text`) back out of the index.
+    pub fn unstage_hunk(&mut self, path: &Path, text: &str, line: usize) -> Result<String, String> {
+        let rel = self.rel(path).ok_or("not in this repository")?;
+        let index = self.run.git(&["show", &format!(":./{rel}")]).map_err(|_| "Nothing staged in this file")?;
+        let index = index.replace("\r\n", "\n");
+        let head = self.run.git(&["show", &format!("HEAD:./{rel}")]).unwrap_or_default().replace("\r\n", "\n");
+        // The editor's line in the index: shift by the unstaged changes above it.
+        let unstaged = crate::review::hunks(&index, text);
+        let mut index_line = line as isize;
+        for h in &unstaged {
+            if h.new_start + h.new_lines.len() <= line {
+                index_line += h.old_lines.len() as isize - h.new_lines.len() as isize;
+            } else if h.new_start <= line {
+                return Err("This change isn't staged".into());
+            }
+        }
+        let staged = crate::review::hunks(&head, &index);
+        let h = hunk_at(&staged, index_line.max(0) as usize).ok_or("No staged change here")?;
+        let back = splice_new(&index, h, &h.old_lines);
+        self.set_index(&rel, &back)?;
+        Ok(format!("Unstaged the change at line {}", line + 1))
+    }
+
     pub fn unstage(&mut self, rel: &str) -> Result<(), String> {
         self.run
             .git(&["reset", "-q", "HEAD", "--", rel])
@@ -602,6 +719,40 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_and_unstage_one_hunk() {
+        let dir = std::env::temp_dir().join(format!("zenith-hunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if git(&dir, &["init", "-q"]).is_err() {
+            return;
+        }
+        let _ = git(&dir, &["config", "user.email", "t@example.com"]);
+        let _ = git(&dir, &["config", "user.name", "Test"]);
+        let base: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("a.txt"), &base).unwrap();
+        git(&dir, &["add", "-A"]).unwrap();
+        git(&dir, &["commit", "-qm", "init"]).unwrap();
+        // Two separate changes: line 2 and line 18.
+        let text = base.replace("line 2\n", "line two\n").replace("line 18\n", "line 18\nadded\n");
+        std::fs::write(dir.join("a.txt"), &text).unwrap();
+        let mut g = Git::open(&dir).unwrap();
+        let path = g.root.join("a.txt");
+        g.stage_hunk(&path, &text, 18).unwrap();
+        let staged = git(&g.root, &["diff", "--cached"]).unwrap();
+        assert!(staged.contains("+added") && !staged.contains("line two"), "{staged}");
+        assert!(g.stage_hunk(&path, &text, 18).unwrap_err().contains("already"));
+        g.stage_hunk(&path, &text, 1).unwrap();
+        assert!(git(&g.root, &["diff", "--cached"]).unwrap().contains("+line two"));
+        // Unstage the second one again.
+        g.unstage_hunk(&path, &text, 18).unwrap();
+        let staged = git(&g.root, &["diff", "--cached"]).unwrap();
+        assert!(!staged.contains("+added") && staged.contains("+line two"), "{staged}");
+        // The working tree is untouched.
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_porcelain() {

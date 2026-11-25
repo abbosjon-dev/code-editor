@@ -408,6 +408,25 @@ impl Document {
         self.update_find();
     }
 
+    /// Restore the committed lines of the git change covering `line`.
+    pub fn revert_git_hunk(&mut self, line: usize) -> bool {
+        let Some(base) = self.git_base.clone() else { return false };
+        let hunks = crate::review::hunks(&base, &self.buffer.text());
+        let Some(h) = hunks.iter().find(|h| h.new_start <= line && line < h.new_start + h.new_lines.len().max(1))
+        else {
+            return false;
+        };
+        let start = self.buffer.rope().line_to_char(h.new_start.min(self.buffer.len_lines()));
+        let end_line = h.new_start + h.new_lines.len();
+        let end = if end_line >= self.buffer.len_lines() {
+            self.buffer.len_chars()
+        } else {
+            self.buffer.rope().line_to_char(end_line)
+        };
+        self.buffer.apply_edits(vec![(start, end, h.old_lines.concat())]);
+        true
+    }
+
     pub fn set_git_base(&mut self, base: Option<String>) {
         self.git_base = base.map(|b| b.replace("\r\n", "\n"));
         self.git_hunks_version = None;
