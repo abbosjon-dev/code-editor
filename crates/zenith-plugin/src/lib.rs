@@ -164,6 +164,27 @@ pub enum Action {
         #[serde(default)]
         buttons: Vec<PanelButton>,
     },
+    /// Write a file (relative to the workspace, or absolute inside it).
+    /// WASM plugins need the `write_workspace` permission, and the user
+    /// confirms the write.
+    WriteFile {
+        path: String,
+        text: String,
+    },
+    /// An HTTP request made by the editor for the plugin; the answer comes
+    /// back as an `http_response` message with the same `request_id`.
+    /// WASM plugins may only reach hosts named in `network:<host>`
+    /// permissions.
+    HttpRequest {
+        request_id: Value,
+        url: String,
+        #[serde(default)]
+        method: String,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        body: Option<String>,
+    },
     /// Add or update a status bar item (empty `text` removes it).
     SetStatus {
         id: String,
@@ -270,6 +291,20 @@ impl Plugin {
         self.process.as_mut().is_some_and(Running::alive)
     }
 
+    /// A WASM plugin that may ask to write files (each write is confirmed).
+    pub fn may_write_workspace(&self) -> bool {
+        self.is_wasm() && self.manifest.permissions.iter().any(|p| p == "write_workspace")
+    }
+
+    /// Hosts a WASM plugin may reach through `http_request`
+    /// (`network:<host>` permissions); `None` for native plugins, which
+    /// aren't sandboxed anyway.
+    pub fn network_hosts(&self) -> Option<Vec<String>> {
+        self.is_wasm().then(|| {
+            self.manifest.permissions.iter().filter_map(|p| p.strip_prefix("network:")).map(str::to_lowercase).collect()
+        })
+    }
+
     /// A WASM plugin that asked to read the workspace.
     pub fn may_read_workspace(&self) -> bool {
         self.is_wasm() && self.manifest.permissions.iter().any(|p| p == "read_workspace")
@@ -291,12 +326,76 @@ pub struct PluginHost {
     waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// The open folder (shown to WASM plugins that may read it).
     workspace: Option<PathBuf>,
+    /// Answers to plugins' HTTP requests: (plugin id, request id, result).
+    http_tx: Sender<HttpAnswer>,
+    http_rx: Receiver<HttpAnswer>,
+}
+
+type HttpAnswer = (String, Value, Result<(u16, String), String>);
+
+/// Whether `url` may be fetched: http(s) only, and for sandboxed plugins
+/// only the listed hosts (`None` = any host).
+pub fn url_allowed(url: &str, hosts: Option<&[String]>) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| format!("only http(s) URLs are allowed: {url}"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = if host.starts_with('[') {
+        host.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or("")
+    }
+    .to_lowercase();
+    match hosts {
+        None => Ok(()),
+        Some(h) if h.iter().any(|a| *a == host) => Ok(()),
+        Some(_) => Err(format!("the plugin has no permission to reach {host} (add \"network:{host}\")")),
+    }
+}
+
+/// Make an HTTP request with curl; returns (status, body).
+fn http(
+    url: &str,
+    method: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
+    let mut c = Command::new("curl");
+    c.args(["-sS", "--max-time", "30", "--max-filesize", "10485760", "-X"])
+        .arg(if method.is_empty() { "GET" } else { method })
+        .args(["-w", "\n%{http_code}"]);
+    for (k, v) in headers {
+        c.arg("-H").arg(format!("{k}: {v}"));
+    }
+    if body.is_some() {
+        c.args(["--data-binary", "@-"]);
+    }
+    c.arg("--").arg(url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let mut child = c.spawn().map_err(|e| format!("curl: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(body.unwrap_or("").as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    Ok((code.trim().parse().unwrap_or(0), body.to_string()))
 }
 
 impl Default for PluginHost {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Self { plugins: vec![], tx, rx, commands: HashMap::new(), waker: None, workspace: None }
+        let (http_tx, http_rx) = channel();
+        Self { plugins: vec![], tx, rx, commands: HashMap::new(), waker: None, workspace: None, http_tx, http_rx }
     }
 }
 
@@ -542,8 +641,44 @@ impl PluginHost {
     }
 
     /// Drain pending plugin messages (call once per frame).
+    /// Drain pending plugin messages (call once per frame). HTTP requests
+    /// are handled here: allowed ones run in the background and their
+    /// answers are sent back to the plugin.
     pub fn poll(&mut self) -> Vec<PluginEvent> {
-        self.rx.try_iter().collect()
+        let mut out = vec![];
+        for ev in self.rx.try_iter().collect::<Vec<_>>() {
+            match ev.kind {
+                PluginEventKind::Action(Action::HttpRequest { request_id, url, method, headers, body }) => {
+                    let Some(i) = self.plugins.iter().position(|p| p.manifest.id == ev.plugin_id) else { continue };
+                    if let Err(e) = url_allowed(&url, self.plugins[i].network_hosts().as_deref()) {
+                        let _ = self.send(i, "http_response", json!({ "request_id": request_id, "error": e }));
+                        continue;
+                    }
+                    let tx = self.http_tx.clone();
+                    let waker = self.waker.clone();
+                    let id = ev.plugin_id.clone();
+                    thread::spawn(move || {
+                        let r = http(&url, &method, &headers, body.as_deref());
+                        let _ = tx.send((id, request_id, r));
+                        if let Some(w) = waker {
+                            w();
+                        }
+                    });
+                }
+                kind => out.push(PluginEvent { plugin_id: ev.plugin_id, kind }),
+            }
+        }
+        for (id, request_id, r) in self.http_rx.try_iter().collect::<Vec<_>>() {
+            let Some(i) = self.plugins.iter().position(|p| p.manifest.id == id) else { continue };
+            let params = match r {
+                Ok((status, body)) => json!({ "request_id": request_id, "status": status, "body": body }),
+                Err(e) => json!({ "request_id": request_id, "error": e }),
+            };
+            if let Err(e) = self.send(i, "http_response", params) {
+                out.push(PluginEvent { plugin_id: id, kind: PluginEventKind::Error(format!("{e:#}")) });
+            }
+        }
+        out
     }
 
     pub fn set_enabled(&mut self, idx: usize, enabled: bool) {
@@ -624,6 +759,80 @@ fn parse_line(line: &str) -> Vec<PluginEventKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_permissions() {
+        let hosts = vec!["api.example.com".to_string()];
+        assert!(url_allowed("https://api.example.com/v1?q=1", Some(&hosts)).is_ok());
+        assert!(url_allowed("https://API.example.com:443/", Some(&hosts)).is_ok());
+        assert!(url_allowed("https://evil.com/api.example.com", Some(&hosts)).is_err());
+        assert!(url_allowed("https://api.example.com@evil.com/", Some(&hosts)).is_err());
+        assert!(url_allowed("file:///etc/passwd", None).is_err());
+        assert!(url_allowed("https://anything.org", None).is_ok());
+    }
+
+    /// An http_request is answered with http_response (a native plugin and
+    /// a local server; native plugins may reach any host).
+    #[cfg(unix)]
+    #[test]
+    fn answers_http_requests() {
+        use std::io::{Read as _, Write as _};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = server.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nsalom");
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("zenith-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Ask once, then report what came back as a notification.
+        std::fs::write(
+            dir.join("p.sh"),
+            format!(
+                "read init; read cmd; echo '{{\"method\":\"action\",\"params\":{{\"type\":\"http_request\",\"request_id\":7,\"url\":\"http://127.0.0.1:{port}/x\"}}}}'\n\
+                 read resp; printf '%s\\n' \"{{\\\"method\\\":\\\"action\\\",\\\"params\\\":{{\\\"type\\\":\\\"notify\\\",\\\"message\\\":$(printf '%s' \"$resp\" | sed 's/\\\"/\\\\\\\"/g' | sed 's/^/\\\"/;s/$/\\\"/')}}}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut host = PluginHost::default();
+        host.add(
+            Manifest {
+                id: "h".into(),
+                name: "H".into(),
+                version: String::new(),
+                description: String::new(),
+                run: vec!["sh".into(), "p.sh".into()],
+                wasm: String::new(),
+                permissions: vec![],
+                commands: vec![CommandContribution { id: "h.go".into(), title: "Go".into(), keybinding: None }],
+                events: vec![],
+                panels: vec![],
+            },
+            dir.clone(),
+        );
+        host.execute("h.go", &EditorContext::default()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let msg = loop {
+            if let Some(m) = host.poll().into_iter().find_map(|e| match e.kind {
+                PluginEventKind::Action(Action::Notify { message, .. }) => Some(message),
+                _ => None,
+            }) {
+                break m;
+            }
+            assert!(std::time::Instant::now() < deadline, "no answer");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["method"], "http_response");
+        assert_eq!(v["params"]["request_id"], 7);
+        assert_eq!(v["params"]["status"], 200);
+        assert_eq!(v["params"]["body"], "salom");
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Run a command and wait for its first notification.
     #[cfg(feature = "wasm")]

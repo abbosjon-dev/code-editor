@@ -124,6 +124,12 @@ enum Dialog {
     Update(crate::update::Release),
     /// The update is installed: restart now?
     Restart(String),
+    /// A sandboxed plugin wants to write a file.
+    PluginWrite {
+        plugin: String,
+        path: PathBuf,
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -201,6 +207,8 @@ pub struct ZenithApp {
     /// Test explorer.
     tests: crate::testing::Panel,
     market: crate::marketplace::Market,
+    /// Plugins the user let write files without asking again (this session).
+    plugin_write_ok: std::collections::HashSet<String>,
     /// Ctrl+K: an AI edit of the selection in progress.
     inline_edit: Option<crate::inline_ai::InlineEdit>,
     /// settings.toml as written (without the workspace's overrides).
@@ -325,6 +333,7 @@ impl ZenithApp {
             tests: Default::default(),
             market: Default::default(),
             inline_edit: None,
+            plugin_write_ok: Default::default(),
             user_settings: settings.clone(),
             ws_overrides: vec![],
             sync_rx: None,
@@ -1996,8 +2005,65 @@ impl ZenithApp {
         }
     }
 
+    /// A plugin's `write_file`: native plugins write directly; sandboxed
+    /// ones need the permission, stay inside the workspace, and the user
+    /// confirms (or allowed the plugin already).
+    fn plugin_write_file(&mut self, plugin: &str, path: String, text: String) {
+        let Some(pl) = self.plugins.plugins.iter().find(|p| p.manifest.id == plugin) else { return };
+        let (sandboxed, may) = (pl.is_wasm(), pl.may_write_workspace());
+        let Some(ws) = self.workspace.clone() else {
+            self.toast(format!("{plugin}: no folder is open to write into"), NotifyLevel::Warning);
+            return;
+        };
+        let p = Path::new(&path);
+        let full = if p.is_absolute() { p.to_path_buf() } else { ws.join(p) };
+        // Resolve `..` without touching the disk, then require the workspace.
+        let mut clean = PathBuf::new();
+        for c in full.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    clean.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => clean.push(c),
+            }
+        }
+        if sandboxed && (!may || !clean.starts_with(&ws)) {
+            let why = if may { "outside the workspace" } else { "without the write_workspace permission" };
+            self.toast(format!("{plugin}: refused to write {path} ({why})"), NotifyLevel::Warning);
+            return;
+        }
+        if sandboxed && !self.plugin_write_ok.contains(plugin) {
+            self.dialog = Some(Dialog::PluginWrite { plugin: plugin.to_string(), path: clean, text });
+            return;
+        }
+        self.write_plugin_file(plugin, &clean, &text);
+    }
+
+    fn write_plugin_file(&mut self, plugin: &str, path: &Path, text: &str) {
+        let r = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(path, text));
+        match r {
+            Ok(()) => {
+                if let Some(r) = &self.remote {
+                    r.upload(path);
+                }
+                if let Some(parent) = path.parent() {
+                    for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
+                        t.refresh_dir(parent);
+                    }
+                }
+                let shown = self.workspace.as_ref().and_then(|w| path.strip_prefix(w).ok()).unwrap_or(path);
+                self.toast(format!("{plugin} wrote {}", shown.display()), NotifyLevel::Info);
+            }
+            Err(e) => self.toast(format!("{plugin}: writing {} failed: {e}", path.display()), NotifyLevel::Error),
+        }
+    }
+
     fn apply_plugin_action(&mut self, plugin: &str, a: Action) {
         match a {
+            Action::WriteFile { path, text } => self.plugin_write_file(plugin, path, text),
+            // Answered by the plugin host itself.
+            Action::HttpRequest { .. } => {}
             Action::Notify { message, level } => self.toast(format!("{plugin}: {message}"), level),
             Action::ReplaceSelection { text } | Action::Insert { text } => {
                 if let Some(doc) = self.active_doc() {
@@ -3799,7 +3865,11 @@ impl ZenithApp {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&pl.manifest.name).strong());
                             ui.label(RichText::new(&pl.manifest.version).small().color(p.text_dim));
-                            if pl.may_read_workspace() {
+                            if pl.may_write_workspace() {
+                                ui.label(RichText::new("WASM · writes (asks)").small().color(p.warning)).on_hover_text(
+                                    "Runs inside Zenith as WebAssembly; may ask to write files in the workspace (you confirm)",
+                                );
+                            } else if pl.may_read_workspace() {
                                 ui.label(RichText::new("WASM · reads workspace").small().color(p.warning)).on_hover_text(
                                     "Runs inside Zenith as WebAssembly. It may read the open folder (not change it); no network or environment",
                                 );
@@ -5393,6 +5463,53 @@ impl ZenithApp {
                     next = Some(Dialog::Restart(version));
                 } else {
                     self.restart_exe = None;
+                }
+            }
+            Dialog::PluginWrite { plugin, path, text } => {
+                let mut choice = None;
+                let shown =
+                    self.workspace.as_ref().and_then(|w| path.strip_prefix(w).ok()).unwrap_or(&path).to_path_buf();
+                let exists = path.exists();
+                window("Plugin wants to write a file").show(ctx, |ui| {
+                    ui.label(RichText::new(&plugin).strong().color(self.colors.accent));
+                    ui.label(format!(
+                        "{} {} ({} lines)",
+                        if exists { "Overwrite" } else { "Create" },
+                        shown.display(),
+                        text.lines().count()
+                    ));
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        let preview: String = text.lines().take(40).collect::<Vec<_>>().join("\n");
+                        ui.label(RichText::new(preview).monospace().size(11.5).color(self.colors.text_dim));
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Allow").color(Color32::WHITE))
+                                    .fill(self.colors.accent),
+                            )
+                            .clicked()
+                        {
+                            choice = Some(1);
+                        }
+                        if ui.button("Always allow this plugin").on_hover_text("Until Zenith restarts").clicked() {
+                            choice = Some(2);
+                        }
+                        if ui.button("Deny").clicked() {
+                            choice = Some(0);
+                        }
+                    });
+                });
+                match choice {
+                    Some(0) => self.toast(format!("{plugin}: write denied"), NotifyLevel::Info),
+                    Some(c) => {
+                        if c == 2 {
+                            self.plugin_write_ok.insert(plugin.clone());
+                        }
+                        self.write_plugin_file(&plugin, &path, &text);
+                    }
+                    None => next = Some(Dialog::PluginWrite { plugin, path, text }),
                 }
             }
             Dialog::About => {

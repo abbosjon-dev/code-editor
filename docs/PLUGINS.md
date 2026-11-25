@@ -88,6 +88,8 @@ stderr'ga yozilgan hamma narsa log hisoblanadi.
 | `run_in_terminal` | `command` | Yangi terminalda buyruqni bajaradi |
 | `send_to_agent` | `text`, `agent`? | AI agentga matn yuboradi (kerak bo'lsa ishga tushiradi) |
 | `set_panel` | `panel`, `items`, `message`?, `buttons`? | Plugin panelining tarkibini almashtiradi (pastga qarang) |
+| `write_file` | `path`, `text` | Faylni yozadi (nisbiy = workspace'dan). WASM: `write_workspace` ruxsati va tasdiq kerak |
+| `http_request` | `request_id`, `url`, `method`?, `headers`?, `body`? | Editor so'rovni bajaradi va pluginga `{"method":"http_response","params":{"request_id":…,"status":200,"body":"…"}}` (yoki `"error"`) yuboradi. WASM: faqat `network:<host>` dagi hostlar |
 | `set_status` | `id`, `text`, `tooltip`?, `command`?, `align`? (`left`/`right`), `color`? | Status qatoriga element qo'shadi/yangilaydi; bo'sh `text` — o'chiradi. Bosilganda `command` chaqiriladi |
 
 ## Yon panel (sidebar panel)
@@ -168,7 +170,15 @@ wasm = "case_converter.wasm"   # WASI command modul (wasm32-wasip1)
 - **Sandbox**: modul faqat editor yuborgan xabarlarni ko'radi — fayllar, tarmoq, muhit o'zgaruvchilari yo'q.
   Kerakli ma'lumot (`text`, `selection`, ...) `context` da keladi, o'zgarishlar amallar (`replace_selection`,
   `set_text`, ...) orqali qilinadi. Python yoki Node o'rnatilishi shart emas — bitta `.wasm` fayl hamma OS'da ishlaydi.
-- **Ruxsatlar**: `permissions = ["read_workspace"]` — plugin ochiq papkani `/workspace` sifatida **faqat o'qiy oladi**
+- **Ruxsatlar** (`permissions = [...]`):
+
+  | Ruxsat | Nima beradi |
+  |---|---|
+  | `read_workspace` | Ochiq papka `/workspace` da, faqat o'qish uchun |
+  | `write_workspace` | `write_file` amali bilan fayl yozishni **so'rash** — har safar foydalanuvchi tasdiqlaydi (Allow / Always allow / Deny), faqat workspace ichida |
+  | `network:<host>` | `http_request` amali bilan faqat shu hostga HTTP so'rov (so'rovni editor bajaradi; modul ichida tarmoq yo'q) |
+
+  `read_workspace`: plugin ochiq papkani `/workspace` sifatida **faqat o'qiy oladi**
   (yozish, yaratish, o'chirish rad etiladi). `context` dagi va javobdagi yo'llar avtomatik almashtiriladi
   (`/workspace/src/a.rs` ↔ haqiqiy yo'l). Plugins panelida "WASM · reads workspace" deb ko'rinadi.
   Misol: [`plugins/examples/workspace-stats`](../plugins/examples/workspace-stats).

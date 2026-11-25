@@ -1,14 +1,24 @@
 id = "workspace-stats"
 name = "Workspace Stats (WASM)"
 version = "0.1.0"
-description = "Example WebAssembly plugin with a permission: counts files and lines of code per language. It may read the workspace, never change it."
+description = "Example WebAssembly plugin with permissions: counts lines of code per language (reads the workspace), writes STATS.md (asks you first) and checks Zenith's latest release (api.github.com only)."
 wasm = "workspace_stats.wasm"
-# The workspace is visible to the module at /workspace, read-only.
-permissions = ["read_workspace"]
+# read_workspace: the folder is visible at /workspace, read-only.
+# write_workspace: may ask to write files (each write is confirmed by you).
+# network:<host>: may make HTTP requests to that host, through the editor.
+permissions = ["read_workspace", "write_workspace", "network:api.github.com"]
 
 [[commands]]
 id = "stats.count"
 title = "Workspace Stats: Count Lines of Code"
+
+[[commands]]
+id = "stats.report"
+title = "Workspace Stats: Write STATS.md"
+
+[[commands]]
+id = "stats.release"
+title = "Workspace Stats: Latest Zenith Release"
 
 [[commands]]
 id = "stats.sandbox"

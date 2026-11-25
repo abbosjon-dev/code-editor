@@ -1,5 +1,9 @@
-//! Zenith example WebAssembly plugin that asks for a permission:
-//! `read_workspace` shows the open folder at `/workspace`, read-only.
+//! Zenith example WebAssembly plugin that asks for permissions:
+//! - `read_workspace` shows the open folder at `/workspace`, read-only;
+//! - `write_workspace` lets it ask the editor to write a file (`write_file`
+//!   action; the user confirms);
+//! - `network:api.github.com` lets it ask the editor for HTTP requests to
+//!   that host (`http_request` action, answered by an `http_response`).
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -32,17 +36,38 @@ fn notify(msg: String, level: &str) -> Value {
     json!([{ "type": "notify", "message": msg, "level": level }])
 }
 
+/// Lines per extension, biggest first.
+fn stats(root: &Path) -> Vec<(String, (usize, usize))> {
+    let mut by_ext = BTreeMap::new();
+    count(root, &mut by_ext);
+    let mut rows: Vec<_> = by_ext.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    rows
+}
+
 fn run(command: &str) -> Value {
+    if command == "stats.release" {
+        // Answered later, when the editor sends the http_response.
+        return json!([{ "type": "http_request", "request_id": "release",
+            "url": "https://api.github.com/repos/abbosjon-dev/code-editor/releases/latest",
+            "headers": { "Accept": "application/vnd.github+json" } }]);
+    }
     let root = Path::new("/workspace");
     if !root.exists() {
         return notify("No workspace is open (or the plugin has no permission to read it)".into(), "warning");
     }
     match command {
+        "stats.report" => {
+            let rows = stats(root);
+            let mut md = String::from("# Workspace stats\n\n| Extension | Files | Lines |\n|---|---:|---:|\n");
+            for (ext, (files, lines)) in &rows {
+                md.push_str(&format!("| .{ext} | {files} | {lines} |\n"));
+            }
+            // The editor asks the user before writing.
+            json!([{ "type": "write_file", "path": "/workspace/STATS.md", "text": md }])
+        }
         "stats.count" => {
-            let mut by_ext = BTreeMap::new();
-            count(root, &mut by_ext);
-            let mut rows: Vec<_> = by_ext.into_iter().collect();
-            rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let rows = stats(root);
             let total: usize = rows.iter().map(|r| r.1 .1).sum();
             let top: Vec<String> =
                 rows.iter().take(5).map(|(ext, (files, lines))| format!(".{ext}: {lines} lines in {files} files")).collect();
@@ -67,6 +92,21 @@ fn main() {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
         match msg.get("method").and_then(Value::as_str) {
             Some("shutdown") => break,
+            Some("http_response") => {
+                let p = &msg["params"];
+                let text = match (p["status"].as_u64(), p["error"].as_str()) {
+                    (_, Some(e)) => format!("Request failed: {e}"),
+                    (Some(200), _) => {
+                        let v: Value = serde_json::from_str(p["body"].as_str().unwrap_or("")).unwrap_or_default();
+                        format!("Latest Zenith release: {}", v["tag_name"].as_str().unwrap_or("?"))
+                    }
+                    (Some(404), _) => "Zenith has no published release yet".to_string(),
+                    (s, _) => format!("GitHub answered {}", s.unwrap_or(0)),
+                };
+                let note = json!({ "method": "action", "params": { "type": "notify", "message": text } });
+                let _ = writeln!(stdout, "{note}");
+                let _ = stdout.flush();
+            }
             Some("execute") => {
                 let command = msg["params"]["command"].as_str().unwrap_or("");
                 let reply = json!({ "id": msg["id"], "result": { "actions": run(command) } });
