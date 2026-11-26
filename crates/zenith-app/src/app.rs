@@ -247,6 +247,11 @@ pub struct ZenithApp {
     sidebar: SidebarView,
     show_sidebar: bool,
     show_terminal: bool,
+    /// Zen mode: only the editor, full screen (`Some(was the window already
+    /// full screen)` while on).
+    zen: Option<bool>,
+    /// When Escape was last pressed (Esc Esc leaves zen mode).
+    last_esc: f64,
     show_ai: bool,
     bottom: TermPanel,
     ai: TermPanel,
@@ -371,6 +376,8 @@ impl ZenithApp {
             untitled: 0,
             sidebar: SidebarView::Explorer,
             show_sidebar: true,
+            zen: None,
+            last_esc: f64::MIN,
             show_terminal: false,
             show_ai: false,
             bottom: TermPanel::default(),
@@ -1876,6 +1883,25 @@ impl ZenithApp {
             Cmd::ToggleWordWrap => {
                 self.settings.word_wrap = !self.settings.word_wrap;
                 self.write_settings();
+            }
+            Cmd::ToggleZenMode => {
+                match self.zen.take() {
+                    Some(was_full) => {
+                        if !was_full {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        }
+                    }
+                    None => {
+                        let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        self.zen = Some(full);
+                        if !full {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        }
+                        let key = Cmd::ToggleZenMode.shortcut();
+                        self.toast(format!("Zen mode — {key} or Esc Esc to leave"), NotifyLevel::Info);
+                    }
+                }
+                self.focus_editor = true;
             }
             Cmd::ToggleMinimap => {
                 self.settings.show_minimap = !self.settings.show_minimap;
@@ -3418,6 +3444,7 @@ impl ZenithApp {
             (cs, Key::M, Cmd::ShowProblems, true),
             (ca, Key::P, Cmd::MarkdownPreview, false),
             (Modifiers::ALT, Key::Z, Cmd::ToggleWordWrap, false),
+            (ca, Key::Z, Cmd::ToggleZenMode, true),
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
@@ -3610,6 +3637,7 @@ impl ZenithApp {
                 item(ui, Cmd::ToggleAiPanel, "Toggle AI Panel");
                 item(ui, Cmd::ToggleMinimap, "Toggle Minimap");
                 item(ui, Cmd::ToggleWordWrap, "Toggle Word Wrap");
+                item(ui, Cmd::ToggleZenMode, "Zen Mode");
                 item(ui, Cmd::SplitEditor, "Split Editor");
                 ui.separator();
                 item(ui, Cmd::SelectTheme, "Color Theme…");
@@ -4689,10 +4717,13 @@ impl ZenithApp {
     fn editor_pane(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, right: bool) {
         let p = self.colors.clone();
         let shown = self.pane_doc(right);
-        egui::Frame::new().fill(p.bg_panel).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            self.tab_bar(ui, right);
-        });
+        let zen = self.zen.is_some();
+        if !zen {
+            egui::Frame::new().fill(p.bg_panel).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.tab_bar(ui, right);
+            });
+        }
         // Breadcrumbs.
         let is_md = self.docs.get(shown).is_some_and(|d| d.language().starts_with("Markdown"));
         if let Some((line, col)) = self.crumb_jump.take() {
@@ -4704,7 +4735,7 @@ impl ZenithApp {
                 self.focus_editor = true;
             }
         }
-        if let Some(path) = self.docs.get(shown).and_then(|d| d.path()).map(|p| self.rel_path(p)) {
+        if let Some(path) = self.docs.get(shown).and_then(|d| d.path()).map(|p| self.rel_path(p)).filter(|_| !zen) {
             let mut jump = None;
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
@@ -7307,7 +7338,48 @@ impl ZenithApp {
             }
         }
 
+        // Esc twice in a row leaves zen mode.
+        if self.zen.is_some()
+            && self.dialog.is_none()
+            && !self.palette.open
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
+            let now = ctx.input(|i| i.time);
+            if now - self.last_esc < 0.6 {
+                self.handle_palette(ctx, PaletteAction::Command(Cmd::ToggleZenMode));
+            } else {
+                self.last_esc = now;
+            }
+        }
         let p = self.colors.clone();
+        let zen = self.zen.is_some();
+        if zen {
+            // Only the editor, centered on wide screens.
+            self.terminal_focused = false;
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ctx, |ui| {
+                let full = ui.max_rect();
+                let w = full.width().min(1100.0);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(full.center().x - w / 2.0, full.min.y + 12.0),
+                    egui::vec2(w, full.height() - 12.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    if self.docs.is_empty() {
+                        self.welcome(ctx, ui);
+                    } else {
+                        let right = self.split && self.focus_right;
+                        self.editor_pane(ctx, ui, right);
+                    }
+                });
+            });
+        } else {
+            self.main_layout(ctx, &p);
+        }
+        self.after_layout(ctx, &p);
+    }
+
+    fn main_layout(&mut self, ctx: &egui::Context, p: &Palette) {
+        let p = p.clone();
         egui::TopBottomPanel::top("menu")
             .frame(egui::Frame::new().fill(p.bg_sidebar).inner_margin(egui::Margin::symmetric(8, 4)))
             .show(ctx, |ui| self.menu_bar(ctx, ui));
@@ -7389,7 +7461,11 @@ impl ZenithApp {
                 self.editor_pane(ctx, ui, false);
             }
         });
+    }
 
+    /// Windows and overlays drawn over either layout.
+    fn after_layout(&mut self, ctx: &egui::Context, p: &Palette) {
+        let p = p.clone();
         if let Some(action) = self.palette.ui(ctx, &p) {
             self.handle_palette(ctx, action);
         }
