@@ -276,6 +276,14 @@ sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`
 - **Xato hisoboti:** Zenith qulasa, `<config>/crashes/` ga hisobot yoziladi (xabar, joy, backtrace — fayl matnlari
   emas). Keyingi ochilishda u ko'rsatiladi: nusxa olish yoki GitHub'da issue ochish.
 
+## Accessibility
+
+- **Screen reader** (AccessKit: NVDA / JAWS, VoiceOver, Orca): tugma va panellar nomi bilan o'qiladi; muharrir
+  "fayl, qator, ustun" va joriy qator matnini beradi.
+- **Klaviatura bilan boshqarish:** `Ctrl+1` — muharrirga, `Alt+F1` — chap paneldagi ikonalarga (`Tab` / `Shift+Tab`
+  bilan yurish, `Enter` bilan ochish; fokus sariq ramka bilan ko'rinadi). Barcha buyruqlar `Ctrl+Shift+P` da.
+- **Yuqori kontrast tema:** Settings → Appearance → *Zenith High Contrast* (qora fon, oq matn, aniq chegaralar).
+
 ## Klaviatura
 
 **O'z tugmalaringiz:** *Preferences: Keyboard Shortcuts (TOML)* (yoki Sozlamalar → Editor → "Edit keybindings.toml")

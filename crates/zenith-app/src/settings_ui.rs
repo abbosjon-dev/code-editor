@@ -139,11 +139,14 @@ fn slider<T: egui::emath::Numeric>(
 fn appearance(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     row_label(ui, "Color theme", "");
     egui::ComboBox::from_id_salt("theme")
-        .selected_text(if s.theme == "zenith-daylight" { "Zenith Daylight" } else { "Zenith Midnight" })
+        .selected_text(
+            crate::theme::Palette::THEMES
+                .iter()
+                .find(|(id, _)| *id == s.theme)
+                .map_or("Zenith Midnight (dark)", |t| t.1),
+        )
         .show_ui(ui, |ui| {
-            for (id, name) in
-                [("zenith-midnight", "Zenith Midnight (dark)"), ("zenith-daylight", "Zenith Daylight (light)")]
-            {
+            for &(id, name) in crate::theme::Palette::THEMES {
                 if ui.selectable_value(&mut s.theme, id.to_string(), name).changed() {
                     c.style = true;
                     c.any = true;

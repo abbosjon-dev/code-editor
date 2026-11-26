@@ -297,6 +297,17 @@ pub fn editor_ui(
                 let size = egui::vec2(content_w.max(ui.available_width()), content_h);
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 let resp = ui.interact(rect, id, Sense::click_and_drag()).on_hover_cursor(CursorIcon::Text);
+                // For screen readers: which file, where the caret is, and that line's text.
+                {
+                    let cur = doc.buffer.cursor_pos();
+                    let label = format!("{} editor, line {}, column {}", doc.title(), cur.line + 1, cur.col + 1);
+                    let line = doc.buffer.line_text(cur.line).trim_end_matches(['\n', '\r']).to_string();
+                    resp.widget_info(|| {
+                        let mut info = egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, &label);
+                        info.current_text_value = Some(line.clone());
+                        info
+                    });
+                }
                 let clip = ui.clip_rect();
                 let text_x = rect.min.x + gutter_w + TEXT_PAD;
 
@@ -2137,4 +2148,37 @@ fn find_bar(ui: &mut egui::Ui, doc: &mut Document, p: &Palette) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The editor tells screen readers the file, caret position and line text.
+    #[test]
+    fn editor_is_accessible() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut doc = Document::new_untitled(1, 1, crate::highlight::load_theme("OneHalfDark"));
+        doc.buffer.set_text("fn main() {}\nsecond line\n");
+        doc.buffer.set_cursor(0, false);
+        let p = Palette::midnight();
+        let settings = Settings::default();
+        let mut found = None;
+        for _ in 0..2 {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editor_ui(ui, &mut doc, &p, &settings, 0.0, 0);
+                });
+            });
+            if let Some(update) = out.platform_output.accesskit_update {
+                for (_, node) in update.nodes {
+                    if node.label().is_some_and(|l| l.contains("editor, line 1, column 1")) {
+                        found = node.value().map(str::to_string);
+                    }
+                }
+            }
+        }
+        assert_eq!(found.as_deref(), Some("fn main() {}"));
+    }
 }

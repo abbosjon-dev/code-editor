@@ -1679,15 +1679,14 @@ impl ZenithApp {
                 self.write_settings();
             }
             Cmd::SelectTheme => {
-                let items =
-                    [("Zenith Midnight (dark)", "zenith-midnight"), ("Zenith Daylight (light)", "zenith-daylight")]
-                        .iter()
-                        .map(|(l, id)| Item {
-                            label: l.to_string(),
-                            detail: String::new(),
-                            action: PaletteAction::SetTheme(id.to_string()),
-                        })
-                        .collect();
+                let items = crate::theme::Palette::THEMES
+                    .iter()
+                    .map(|(id, l)| Item {
+                        label: l.to_string(),
+                        detail: String::new(),
+                        action: PaletteAction::SetTheme(id.to_string()),
+                    })
+                    .collect();
                 self.palette.show(Mode::Pick, items, "Select color theme");
             }
             Cmd::SelectSyntaxTheme => {
@@ -1713,6 +1712,13 @@ impl ZenithApp {
                 self.palette.show(Mode::Pick, items, "Select language mode");
             }
             Cmd::OpenSettings => self.show_settings = true,
+            Cmd::FocusEditor => self.focus_editor = true,
+            Cmd::FocusActivityBar => {
+                // Then Tab / Shift+Tab move between the views, Enter opens one.
+                if let Some(id) = ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new("activity-first"))) {
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+            }
             Cmd::InlineAiEdit | Cmd::InlineAiEditFile => {
                 let Some(doc) = self.docs.get(self.active) else { return };
                 let file = doc
@@ -3113,6 +3119,8 @@ impl ZenithApp {
             (cmd, Key::Plus, Cmd::ZoomIn, true),
             (cmd, Key::Minus, Cmd::ZoomOut, true),
             (cmd, Key::Num0, Cmd::ZoomReset, true),
+            (cmd, Key::Num1, Cmd::FocusEditor, true),
+            (Modifiers::ALT, Key::F1, Cmd::FocusActivityBar, true),
             (cmd, Key::Comma, Cmd::OpenSettings, true),
             (cmd, Key::Q, Cmd::Quit, false),
         ];
@@ -3393,8 +3401,15 @@ impl ZenithApp {
                         p.accent,
                     );
                 }
-                let color = if active || resp.hovered() { p.text } else { p.text_faint };
+                let color = if active || resp.hovered() || resp.has_focus() { p.text } else { p.text_faint };
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(19.0), color);
+                // Screen readers get the name, not the glyph; Tab shows where focus is.
+                let name = tip.split(" (").next().unwrap_or(&tip).to_string();
+                if view == SidebarView::Explorer {
+                    ui.data_mut(|d| d.insert_temp(egui::Id::new("activity-first"), resp.id));
+                }
+                resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, &name));
+                focus_ring(ui, &resp, &p);
                 if resp.on_hover_text(tip).clicked() {
                     if active {
                         self.show_sidebar = false;
@@ -3417,6 +3432,8 @@ impl ZenithApp {
                     FontId::proportional(18.0),
                     if resp.hovered() { p.text } else { p.text_faint },
                 );
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Settings"));
+                focus_ring(ui, &resp, &p);
                 if resp.on_hover_text("Settings").clicked() {
                     self.run(ui.ctx(), Cmd::OpenSettings);
                 }
@@ -7014,6 +7031,13 @@ impl ZenithApp {
             }
             self.save_session();
         }
+    }
+}
+
+/// A visible outline around a custom widget that has keyboard focus.
+pub fn focus_ring(ui: &egui::Ui, resp: &egui::Response, p: &Palette) {
+    if resp.has_focus() {
+        ui.painter().rect_stroke(resp.rect.shrink(2.0), 4.0, Stroke::new(2.0_f32, p.accent), egui::StrokeKind::Inside);
     }
 }
 

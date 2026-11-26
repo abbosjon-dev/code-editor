@@ -91,6 +91,52 @@ impl Palette {
         }
     }
 
+    /// "Zenith High Contrast" — black background, white text, strong
+    /// borders and selection (for low vision; meets WCAG AAA contrast).
+    pub fn high_contrast() -> Self {
+        Self {
+            dark: true,
+            bg: hex(0x000000),
+            bg_sidebar: hex(0x000000),
+            bg_panel: hex(0x000000),
+            bg_elevated: hex(0x0c0c0c),
+            bg_hover: hex(0x1f1f1f),
+            bg_active: hex(0x303030),
+            border: hex(0x6fc3df),
+            text: hex(0xffffff),
+            text_dim: hex(0xe0e0e0),
+            text_faint: hex(0xb0b0b0),
+            accent: hex(0xffd400),
+            accent_soft: hexa(0xffd400, 70),
+            selection: hexa(0x0f6fff, 140),
+            current_line: hexa(0xffffff, 18),
+            find_match: hexa(0xff9e00, 150),
+            cursor: hex(0xffffff),
+            success: hex(0x5cff8a),
+            warning: hex(0xffd400),
+            error: hex(0xff6b6b),
+            indent_guide: hexa(0xffffff, 40),
+            ansi: [
+                hex(0x000000),
+                hex(0xff6b6b),
+                hex(0x5cff8a),
+                hex(0xffd400),
+                hex(0x6fc3df),
+                hex(0xff8cff),
+                hex(0x5ff7f7),
+                hex(0xe0e0e0),
+                hex(0x9a9a9a),
+                hex(0xff8f8f),
+                hex(0x8fffaa),
+                hex(0xffe566),
+                hex(0x9ad8ef),
+                hex(0xffb3ff),
+                hex(0x9ffcfc),
+                hex(0xffffff),
+            ],
+        }
+    }
+
     /// "Zenith Daylight" — light theme.
     pub fn daylight() -> Self {
         Self {
@@ -139,9 +185,17 @@ impl Palette {
     pub fn by_name(name: &str) -> Self {
         match name {
             "zenith-daylight" | "light" => Self::daylight(),
+            "zenith-high-contrast" | "high-contrast" => Self::high_contrast(),
             _ => Self::midnight(),
         }
     }
+
+    /// UI themes: (setting value, display name).
+    pub const THEMES: &'static [(&'static str, &'static str)] = &[
+        ("zenith-midnight", "Zenith Midnight (dark)"),
+        ("zenith-daylight", "Zenith Daylight (light)"),
+        ("zenith-high-contrast", "Zenith High Contrast"),
+    ];
 
     /// Map a 256-color index to RGB.
     pub fn ansi_256(&self, idx: u8) -> Color32 {
