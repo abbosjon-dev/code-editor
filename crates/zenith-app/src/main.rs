@@ -5,6 +5,7 @@ mod app;
 mod changeset;
 mod commands;
 mod conflicts;
+mod crash;
 mod debug;
 mod diff_view;
 mod document;
@@ -78,6 +79,7 @@ fn main() -> eframe::Result {
         println!("zenith {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    crash::install(settings::config_dir());
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Zenith {} — fast, extensible, AI-native code editor\n\nUSAGE:\n    zenith [PATH]\n\nPATH may be a folder (opened as workspace) or a file.", env!("CARGO_PKG_VERSION"));
         return Ok(());

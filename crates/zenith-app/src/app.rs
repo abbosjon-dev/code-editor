@@ -124,6 +124,8 @@ enum Dialog {
     Update(crate::update::Release),
     /// The update is installed: restart now?
     Restart(String),
+    /// The last run crashed: show its report.
+    Crash(PathBuf, String),
     /// A sandboxed plugin wants to write a file.
     PluginWrite {
         plugin: String,
@@ -443,6 +445,9 @@ impl ZenithApp {
                     app.restore_session_state(&saved);
                 }
             }
+        }
+        if let Some((path, text)) = crate::crash::unseen(&settings::config_dir()) {
+            app.dialog = Some(Dialog::Crash(path, text));
         }
         app
     }
@@ -5465,6 +5470,55 @@ impl ZenithApp {
                     self.restart_exe = None;
                 }
             }
+            Dialog::Crash(path, text) => {
+                let mut done = false;
+                let mut open = false;
+                egui::Window::new("Zenith closed unexpectedly")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(640.0)
+                    .anchor(Align2::CENTER_TOP, [0.0, 90.0])
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "The last session crashed. Unsaved changes were kept where possible. \
+                             The report below helps fix it; it contains no file contents.",
+                        );
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            ui.label(RichText::new(&text).monospace().size(11.0).color(self.colors.text_dim));
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy report").clicked() {
+                                ui.ctx().copy_text(text.clone());
+                                self.toast("Crash report copied", NotifyLevel::Info);
+                            }
+                            if ui
+                                .button("Report on GitHub")
+                                .on_hover_text("Opens a new issue in your browser")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(text.clone());
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(crate::crash::issue_url(&text)));
+                            }
+                            if ui.button("Open file").clicked() {
+                                done = true;
+                                open = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                done = true;
+                            }
+                        });
+                    });
+                if done {
+                    crate::crash::mark_seen(&path);
+                    if open {
+                        self.open_file(&path.with_extension("seen"));
+                    }
+                } else {
+                    next = Some(Dialog::Crash(path, text));
+                }
+            }
             Dialog::PluginWrite { plugin, path, text } => {
                 let mut choice = None;
                 let shown =
@@ -6664,6 +6718,9 @@ impl eframe::App for ZenithApp {
 
 impl ZenithApp {
     fn update_inner(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::env::var_os("ZENITH_TEST_CRASH").is_some() && ctx.cumulative_pass_nr() > 5 {
+            panic!("ZENITH_TEST_CRASH was set");
+        }
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
             self.style_dirty = false;
