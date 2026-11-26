@@ -62,7 +62,7 @@ impl Kind {
                 ("⟳ Reload", "r", "Reload the app on connected devices (r)"),
                 ("Android", "a", "Open on an Android device / emulator (a)"),
                 ("iOS", "i", "Open on the iOS simulator (i)"),
-                ("Web", "w", "Open in the web browser (w)"),
+                ("Web", "w", "Show the web version (in the preview, or the browser)"),
             ],
             _ => &[],
         }
@@ -346,6 +346,27 @@ pub fn find_urls(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Expo's app URLs (`exp://192.168.1.5:8081`) to open in Expo Go.
+pub fn find_expo_urls(lines: &[String]) -> Vec<String> {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"exps?://[^\s'\x22<>)\]]+").unwrap());
+    let mut out: Vec<String> = vec![];
+    for l in lines {
+        for m in RE.find_iter(l) {
+            let u = m.as_str().trim_end_matches(['.', ',']).to_string();
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
+/// A URL another device on the network can open (not localhost).
+pub fn is_lan_url(u: &str) -> bool {
+    !(u.contains("://localhost") || u.contains("://127.") || u.contains("://[::"))
+}
+
 /// Join lines that a program broke itself at the terminal width (Flutter
 /// wraps its messages): a full-width line followed by one that doesn't start
 /// with a space continues it.
@@ -455,6 +476,12 @@ mod tests {
         ];
         assert_eq!(find_urls(&out), ["http://localhost:5173/", "http://192.168.1.5:5173/", "http://localhost:8000"]);
         assert_eq!(port_of("http://localhost:5173/"), Some(5173));
+        let expo = [
+            "› Metro waiting on exp://192.168.1.20:8081".to_string(),
+            "› Web is waiting on http://localhost:8081".to_string(),
+        ];
+        assert_eq!(find_expo_urls(&expo), ["exp://192.168.1.20:8081"]);
+        assert!(is_lan_url("http://192.168.1.5:5173/") && !is_lan_url("http://localhost:5173/"));
         let wrapped = [
             "The DevTools debugger is available at: http://127".to_string(),
             ".0.0.1:4233/x/".to_string(),

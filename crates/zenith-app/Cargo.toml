@@ -52,6 +52,7 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 sha2 = "0.10"
+qrcode = { version = "0.15", default-features = false }
 
 # Embedded web preview: the system WebView (WKWebView / WebView2) on macOS
 # and Windows; on Linux WebKitGTK, opt-in with `--features webview`

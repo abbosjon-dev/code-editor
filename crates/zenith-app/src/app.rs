@@ -146,6 +146,10 @@ struct RunSession {
     scanned: Instant,
     /// Open the first URL in the preview when it appears (Flutter web-server).
     auto_preview: bool,
+    /// Expo app URLs (exp://…) for Expo Go.
+    expo_urls: Vec<String>,
+    /// The URL whose QR code is shown (to open it on a phone).
+    qr: Option<String>,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
     /// failed: the port is taken on this computer or ssh refused).
     forwards: Vec<(u16, std::process::Child, bool)>,
@@ -6958,6 +6962,7 @@ impl ZenithApp {
         if let Some(i) = self.runs.sessions.iter().position(|r| r.config == cfg) {
             let tab = self.runs.sessions[i].tab;
             self.runs.sessions[i].urls.clear();
+            self.runs.sessions[i].expo_urls.clear();
             self.runs.sessions[i].forwards.clear();
             if let Some(pos) = self.bottom.tabs.iter().position(|t| t.id == tab) {
                 let waker = self.waker.clone();
@@ -6986,6 +6991,8 @@ impl ZenithApp {
             urls: vec![],
             scanned: Instant::now(),
             auto_preview,
+            expo_urls: vec![],
+            qr: None,
             forwards: vec![],
         });
     }
@@ -7077,6 +7084,10 @@ impl ZenithApp {
             let mut found = r.config.url.iter().cloned().collect::<Vec<_>>();
             found.extend(crate::run::find_urls(&lines[start..]));
             r.urls = crate::run::merge_urls(std::mem::take(&mut r.urls), found);
+            if r.config.kind == crate::run::Kind::Expo {
+                let expo = crate::run::find_expo_urls(&lines[start..]);
+                r.expo_urls = crate::run::merge_urls(std::mem::take(&mut r.expo_urls), expo);
+            }
             for (_, c, failed) in &mut r.forwards {
                 if !*failed && c.try_wait().ok().flatten().is_some() {
                     *failed = true;
@@ -7256,6 +7267,7 @@ impl ZenithApp {
         }
         // Running and finished sessions.
         let mut preview_url: Option<String> = None;
+        let mut qr_toggle: Option<(usize, Option<String>)> = None;
         let mut act: Option<(usize, &str)> = None;
         let mut keys: Option<(usize, &'static str)> = None;
         for i in 0..self.runs.sessions.len() {
@@ -7323,6 +7335,11 @@ impl ZenithApp {
                             {
                                 preview_url = Some(u.clone());
                             }
+                            if crate::run::is_lan_url(u)
+                                && ui.small_button("▦").on_hover_text("QR code: open it on your phone").clicked()
+                            {
+                                qr_toggle = Some((i, if r.qr.as_ref() == Some(u) { None } else { Some(u.clone()) }));
+                            }
                             match fwd {
                                 Some(false) => {
                                     ui.label(RichText::new("⇄ forwarded").small().color(p.text_faint))
@@ -7337,11 +7354,50 @@ impl ZenithApp {
                             }
                         });
                     }
+                    // Expo: scan the app URL with Expo Go (Android) or the camera (iOS).
+                    if let Some(u) = r.expo_urls.first().filter(|_| alive) {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Scan with Expo Go (Android) or the Camera app (iOS)")
+                                .small()
+                                .color(p.text_dim),
+                        );
+                        ui.horizontal(|ui| {
+                            crate::qr::ui(ui, u, 150.0).on_hover_text(u.as_str());
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(u).small().monospace().color(p.text));
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(u.clone());
+                                }
+                            });
+                        });
+                    }
+                    if let Some(u) = &r.qr {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            crate::qr::ui(ui, u, 150.0);
+                            ui.label(
+                                RichText::new("Scan with your phone (same Wi-Fi network)").small().color(p.text_dim),
+                            );
+                        });
+                    }
                 },
             );
         }
+        if let Some((i, q)) = qr_toggle {
+            self.runs.sessions[i].qr = q;
+        }
         if let Some((i, k)) = keys {
-            self.run_send(i, k);
+            let r = &self.runs.sessions[i];
+            // Expo Web: Metro serves the web app on its own port — show it in
+            // the preview instead of the system browser.
+            let metro = r.expo_urls.first().and_then(|u| crate::run::port_of(u));
+            match metro
+                .filter(|_| k == "w" && r.config.kind == crate::run::Kind::Expo && crate::preview::embedded_supported())
+            {
+                Some(port) => preview_url = Some(format!("http://localhost:{port}")),
+                None => self.run_send(i, k),
+            }
         }
         if let Some(u) = preview_url {
             self.open_preview(&u);

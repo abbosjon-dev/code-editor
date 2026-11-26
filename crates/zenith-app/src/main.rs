@@ -29,6 +29,7 @@ mod mention;
 mod outline;
 mod palette;
 mod preview;
+mod qr;
 mod remote;
 mod review;
 mod run;
