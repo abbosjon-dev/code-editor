@@ -22,6 +22,8 @@ pub enum TreeAction {
     Delete(PathBuf),
     RevealInTerminal(PathBuf),
     CopyPath(PathBuf),
+    SelectForCompare(PathBuf),
+    CompareWithSelected(PathBuf),
 }
 
 pub struct FileTree {
@@ -33,6 +35,8 @@ pub struct FileTree {
     pub git: HashMap<PathBuf, char>,
     /// Folders that contain changed files.
     git_dirs: HashSet<PathBuf>,
+    /// A file picked with "Select for Compare".
+    pub compare_base: Option<PathBuf>,
 }
 
 const HIDDEN: &[&str] = &[".git", ".DS_Store", "Thumbs.db"];
@@ -41,7 +45,15 @@ impl FileTree {
     pub fn new(root: PathBuf) -> Self {
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
-        Self { root, expanded, cache: HashMap::new(), selected: None, git: HashMap::new(), git_dirs: HashSet::new() }
+        Self {
+            root,
+            expanded,
+            cache: HashMap::new(),
+            selected: None,
+            git: HashMap::new(),
+            git_dirs: HashSet::new(),
+            compare_base: None,
+        }
     }
 
     pub fn set_git_status(&mut self, status: HashMap<PathBuf, char>) {
@@ -255,6 +267,20 @@ impl FileTree {
                 if ui.button("Delete").clicked() {
                     *action = Some(TreeAction::Delete(entry.path.clone()));
                     ui.close_menu();
+                }
+                if !entry.is_dir {
+                    ui.separator();
+                    if ui.button("Select for Compare").clicked() {
+                        *action = Some(TreeAction::SelectForCompare(entry.path.clone()));
+                        ui.close_menu();
+                    }
+                    if let Some(base) = self.compare_base.as_ref().filter(|b| **b != entry.path) {
+                        let name = base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(format!("Compare with '{name}'")).clicked() {
+                            *action = Some(TreeAction::CompareWithSelected(entry.path.clone()));
+                            ui.close_menu();
+                        }
+                    }
                 }
                 ui.separator();
                 if ui.button("Copy Path").clicked() {

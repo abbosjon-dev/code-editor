@@ -18,6 +18,8 @@ pub enum PaletteAction {
     Command(Cmd),
     PluginCommand(String),
     OpenFile(String),
+    /// Compare the active file with this one (same path form as `OpenFile`).
+    CompareWith(String),
     GotoLine(usize),
     SetTheme(String),
     SetSyntaxTheme(String),

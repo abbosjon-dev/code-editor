@@ -250,6 +250,10 @@ pub struct ZenithApp {
     /// Zen mode: only the editor, full screen (`Some(was the window already
     /// full screen)` while on).
     zen: Option<bool>,
+    /// Two files side by side.
+    compare: Option<crate::compare::Compare>,
+    /// A paste was requested for "Compare With Clipboard".
+    pending_clipboard_compare: bool,
     /// When Escape was last pressed (Esc Esc leaves zen mode).
     last_esc: f64,
     show_ai: bool,
@@ -377,6 +381,8 @@ impl ZenithApp {
             sidebar: SidebarView::Explorer,
             show_sidebar: true,
             zen: None,
+            compare: None,
+            pending_clipboard_compare: false,
             last_esc: f64::MIN,
             show_terminal: false,
             show_ai: false,
@@ -1647,33 +1653,25 @@ impl ZenithApp {
                 }
             }
             Cmd::QuickOpen => {
-                self.index.poll();
-                let items = self
-                    .index
-                    .files
-                    .iter()
-                    .map(|f| Item {
-                        label: f.clone(),
-                        detail: String::new(),
-                        action: PaletteAction::OpenFile(f.clone()),
-                    })
-                    .collect::<Vec<_>>();
-                let mut items = items;
-                for (t, idx) in self.extra_trees.iter().zip(self.extra_index.iter_mut()) {
-                    idx.poll();
-                    let name = t.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    items.extend(idx.files.iter().map(|f| Item {
-                        label: format!("{name}/{f}"),
-                        detail: String::new(),
-                        action: PaletteAction::OpenFile(t.root.join(f).to_string_lossy().into_owned()),
-                    }));
-                }
+                let items = self.file_items(PaletteAction::OpenFile);
                 let ph = if self.workspace.is_some() {
                     "Search files by name"
                 } else {
                     "Open a folder first (Ctrl+Shift+O)"
                 };
                 self.palette.show(Mode::Files, items, ph);
+            }
+            Cmd::CompareActiveWith => {
+                if self.docs.get(self.active).and_then(|d| d.path()).is_none() {
+                    self.toast("Save the file first to compare it", NotifyLevel::Info);
+                } else {
+                    let items = self.file_items(PaletteAction::CompareWith);
+                    self.palette.show(Mode::Files, items, "Compare the active file with…");
+                }
+            }
+            Cmd::CompareWithClipboard => {
+                self.pending_clipboard_compare = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
             Cmd::CommandPalette => {
                 let mut extra: Vec<Item> = self
@@ -2374,6 +2372,13 @@ impl ZenithApp {
                     self.open_file(&ws.join(rel));
                 }
             }
+            PaletteAction::CompareWith(rel) => {
+                let cur = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
+                if let (Some(ws), Some(cur)) = (self.workspace.clone(), cur) {
+                    use crate::compare::Source;
+                    self.open_compare(Source::File(cur), Source::File(ws.join(rel)));
+                }
+            }
             PaletteAction::GotoLine(n) => {
                 if let Some(doc) = self.active_doc() {
                     doc.goto_line(n);
@@ -2726,6 +2731,20 @@ impl ZenithApp {
             }
             TreeAction::Delete(p) => self.dialog = Some(Dialog::ConfirmDelete(p)),
             TreeAction::CopyPath(p) => ctx.copy_text(p.to_string_lossy().into_owned()),
+            TreeAction::SelectForCompare(p) => {
+                for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
+                    t.compare_base = Some(p.clone());
+                }
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.toast(format!("'{name}' selected — right-click another file › Compare with"), NotifyLevel::Info);
+            }
+            TreeAction::CompareWithSelected(p) => {
+                let base = self.tree.as_ref().and_then(|t| t.compare_base.clone());
+                if let Some(base) = base {
+                    use crate::compare::Source;
+                    self.open_compare(Source::File(base), Source::File(p));
+                }
+            }
             TreeAction::RevealInTerminal(dir) => {
                 self.new_terminal(Some(dir));
             }
@@ -3613,6 +3632,9 @@ impl ZenithApp {
                 item(ui, Cmd::Save, "Save");
                 item(ui, Cmd::SaveAs, "Save As…");
                 item(ui, Cmd::SaveAll, "Save All");
+                ui.separator();
+                item(ui, Cmd::CompareActiveWith, "Compare Active File With…");
+                item(ui, Cmd::CompareWithClipboard, "Compare With Clipboard");
                 ui.separator();
                 item(ui, Cmd::OpenSettings, "Settings");
                 ui.separator();
@@ -7338,6 +7360,28 @@ impl ZenithApp {
             }
         }
 
+        // "Compare With Clipboard": take the paste before the editor sees it.
+        if self.pending_clipboard_compare {
+            let pasted = ctx.input_mut(|i| {
+                let pos = i.events.iter().position(|e| matches!(e, egui::Event::Paste(_)))?;
+                match i.events.remove(pos) {
+                    egui::Event::Paste(t) => Some(t),
+                    _ => None,
+                }
+            });
+            if let Some(text) = pasted {
+                self.pending_clipboard_compare = false;
+                let cur = self.docs.get(self.active).map(|d| match d.path() {
+                    Some(p) => crate::compare::Source::File(p.to_path_buf()),
+                    None => crate::compare::Source::Text { label: d.title(), text: d.buffer.text() },
+                });
+                if let Some(cur) = cur {
+                    let clip =
+                        crate::compare::Source::Text { label: "Clipboard".into(), text: text.replace("\r\n", "\n") };
+                    self.open_compare(clip, cur);
+                }
+            }
+        }
         // Esc twice in a row leaves zen mode.
         if self.zen.is_some()
             && self.dialog.is_none()
@@ -7463,6 +7507,33 @@ impl ZenithApp {
         });
     }
 
+    /// Every workspace file as a palette item running `make(path)`.
+    fn file_items(&mut self, make: fn(String) -> PaletteAction) -> Vec<Item> {
+        self.index.poll();
+        let items = self
+            .index
+            .files
+            .iter()
+            .map(|f| Item { label: f.clone(), detail: String::new(), action: make(f.clone()) })
+            .collect::<Vec<_>>();
+        let mut items = items;
+        for (t, idx) in self.extra_trees.iter().zip(self.extra_index.iter_mut()) {
+            idx.poll();
+            let name = t.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            items.extend(idx.files.iter().map(|f| Item {
+                label: format!("{name}/{f}"),
+                detail: String::new(),
+                action: make(t.root.join(f).to_string_lossy().into_owned()),
+            }));
+        }
+        items
+    }
+
+    /// Compare two sources in the compare window.
+    fn open_compare(&mut self, a: crate::compare::Source, b: crate::compare::Source) {
+        self.compare = Some(crate::compare::Compare::new(a, b));
+    }
+
     /// Windows and overlays drawn over either layout.
     fn after_layout(&mut self, ctx: &egui::Context, p: &Palette) {
         let p = p.clone();
@@ -7483,6 +7554,19 @@ impl ZenithApp {
             }
             if let Some(crate::history::Action::OpenFile(rel)) = action {
                 self.open_file(&root.join(rel));
+            }
+        }
+        if let Some(c) = &mut self.compare {
+            let mut open = true;
+            c.refresh(&self.docs);
+            let fs = self.settings.editor_font_size;
+            let root = self.workspace.clone();
+            let act = c.ui(ctx, &p, fs, root.as_deref(), &mut open);
+            if !open {
+                self.compare = None;
+            }
+            if let Some(crate::compare::Action::Open(f)) = act {
+                self.open_file(&f);
             }
         }
         self.toasts_ui(ctx);

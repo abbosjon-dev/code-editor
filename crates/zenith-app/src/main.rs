@@ -5,6 +5,7 @@ mod app;
 mod backup;
 mod changeset;
 mod commands;
+mod compare;
 mod conflicts;
 mod crash;
 mod debug;
