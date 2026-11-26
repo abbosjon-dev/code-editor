@@ -101,3 +101,6 @@ uchun O(n²) hisob).
 - [x] Sozlamalarni Git repo orqali sinxronlash
 - [x] Test paneli (cargo test, pytest), testni debugger ostida ishga tushirish
 - [x] SSH orqali uzoqdan ishlash (mahalliy nusxa + serverda terminal/agentlar/git/LSP/debugger)
+- [x] Sticky scroll (tree-sitter fold diapazonlari yoki chekinish asosida), Zen rejimi
+- [x] Ikki faylni / fayl va clipboard'ni yonma-yon solishtirish
+- [x] Avtomatik import (`additionalTextEdits`, `completionItem/resolve`), Organize Imports (LSP + o'rnatilgan saralash)
