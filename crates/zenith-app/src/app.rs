@@ -209,6 +209,9 @@ pub struct ZenithApp {
     /// Test explorer.
     tests: crate::testing::Panel,
     market: crate::marketplace::Market,
+    /// Copies of unsaved changes, for a crash.
+    backups: crate::backup::Backups,
+    last_backup: Instant,
     /// Plugins the user let write files without asking again (this session).
     plugin_write_ok: std::collections::HashSet<String>,
     /// Ctrl+K: an AI edit of the selection in progress.
@@ -336,6 +339,8 @@ impl ZenithApp {
             market: Default::default(),
             inline_edit: None,
             plugin_write_ok: Default::default(),
+            backups: Default::default(),
+            last_backup: Instant::now(),
             user_settings: settings.clone(),
             ws_overrides: vec![],
             sync_rx: None,
@@ -449,7 +454,48 @@ impl ZenithApp {
         if let Some((path, text)) = crate::crash::unseen(&settings::config_dir()) {
             app.dialog = Some(Dialog::Crash(path, text));
         }
+        app.restore_backups();
         app
+    }
+
+    /// Reopen unsaved changes left by a session that didn't exit normally.
+    fn restore_backups(&mut self) {
+        let dir = crate::backup::dir(&settings::config_dir());
+        let backups = crate::backup::load_all(&dir);
+        if backups.is_empty() {
+            return;
+        }
+        let mut n = 0;
+        for b in backups {
+            match &b.path {
+                Some(p) => {
+                    // Same as on disk: nothing was lost.
+                    if std::fs::read_to_string(p).is_ok_and(|t| t.replace("\r\n", "\n") == b.text) {
+                        continue;
+                    }
+                    if !self.open_file(p) {
+                        // The file is gone: keep the text in a new tab.
+                        self.new_file();
+                    }
+                }
+                None => self.new_file(),
+            }
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                if doc.buffer.text() != b.text {
+                    // Undoable, and the tab shows unsaved changes.
+                    let end = doc.buffer.len_chars();
+                    doc.buffer.apply_edits(vec![(0, end, b.text.clone())]);
+                    n += 1;
+                }
+            }
+        }
+        crate::backup::clear(&dir);
+        if n > 0 {
+            self.toast(
+                format!("Restored unsaved changes in {n} file{}", if n == 1 { "" } else { "s" }),
+                NotifyLevel::Info,
+            );
+        }
     }
 
     fn id(&mut self) -> u64 {
@@ -6691,6 +6737,8 @@ fn open_in_os(path: &Path) {
 
 impl eframe::App for ZenithApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A normal exit: unsaved changes were saved or discarded on purpose.
+        crate::backup::clear(&crate::backup::dir(&settings::config_dir()));
         // Restart into the freshly installed version.
         if let Some(exe) = self.restart_exe.take() {
             let args: Vec<String> = std::env::args().skip(1).collect();
@@ -6893,6 +6941,10 @@ impl ZenithApp {
         // Agents may edit files on disk; poll for external changes now and then.
         ctx.request_repaint_after(Duration::from_secs(2));
 
+        if self.last_backup.elapsed() > Duration::from_secs(2) {
+            self.last_backup = Instant::now();
+            self.backups.sync(&self.docs, &crate::backup::dir(&settings::config_dir()));
+        }
         if self.last_session_save.elapsed() > Duration::from_secs(5) {
             if self.settings.auto_save {
                 for i in 0..self.docs.len() {

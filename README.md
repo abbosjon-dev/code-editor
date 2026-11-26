@@ -268,6 +268,14 @@ sozlangan bo'lishi kerak (Windows 10+ va macOS/Linux'da `ssh` bor; serverda `sh`
   (pull, checkout, stash), ular darhol mahalliy nusxaga olinadi; serverda o'chirilgan fayllar nusxadan ham o'chadi.
 - Oxirgi ulanishlar eslab qolinadi; Zenith qayta ochilganda uzoq papka avtomatik qayta ulanadi.
 
+## Xavfsizlik to'ri: zaxira va xato hisobotlari
+
+- **Saqlanmagan o'zgarishlar zaxirasi (hot exit):** saqlanmagan har bir fayl (va yangi "Untitled" tablar) 2 soniyada
+  bir marta `<config>/backups/` ga nusxalanadi. Zenith yoki kompyuter kutilmaganda o'chsa, keyingi ochilishda ular
+  **saqlanmagan o'zgarish sifatida qaytadi** (Undo bilan bekor qilish mumkin). Oddiy yopilishda zaxira o'chiriladi.
+- **Xato hisoboti:** Zenith qulasa, `<config>/crashes/` ga hisobot yoziladi (xabar, joy, backtrace — fayl matnlari
+  emas). Keyingi ochilishda u ko'rsatiladi: nusxa olish yoki GitHub'da issue ochish.
+
 ## Klaviatura
 
 **O'z tugmalaringiz:** *Preferences: Keyboard Shortcuts (TOML)* (yoki Sozlamalar → Editor → "Edit keybindings.toml")
