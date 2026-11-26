@@ -11,4 +11,11 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=../../packaging/icon.ico");
+    // `cfg(webview)`: an embedded web view is built in (always on macOS and
+    // Windows; on Linux with `--features webview`).
+    println!("cargo::rustc-check-cfg=cfg(webview)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if os == "macos" || os == "windows" || std::env::var_os("CARGO_FEATURE_WEBVIEW").is_some() {
+        println!("cargo::rustc-cfg=webview");
+    }
 }

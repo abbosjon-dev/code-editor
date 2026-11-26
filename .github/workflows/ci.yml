@@ -26,6 +26,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev
       - name: Test
         run: cargo test --workspace
+      - name: Check the embedded web preview build (Linux, WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libwebkit2gtk-4.1-dev
+          cargo check -p zenith-app --features webview
       - name: Install packaging tools
         shell: bash
         run: |

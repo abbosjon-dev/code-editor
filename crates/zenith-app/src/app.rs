@@ -98,6 +98,8 @@ enum InputKind {
     RemoteFolder,
     /// Edit an option of the breakpoint at (document id, line).
     Breakpoint(u64, usize, crate::editor_view::BpField),
+    /// A page to show in the web preview.
+    PreviewUrl,
 }
 
 enum Dialog {
@@ -288,6 +290,8 @@ pub struct ZenithApp {
     show_ai: bool,
     bottom: TermPanel,
     runs: RunState,
+    /// The web preview panel.
+    preview: Option<crate::preview::Preview>,
     ai: TermPanel,
     focus_terminal: Option<u64>,
     terminal_focused: bool,
@@ -420,6 +424,7 @@ impl ZenithApp {
             show_ai: false,
             bottom: TermPanel::default(),
             runs: RunState::default(),
+            preview: None,
             ai: TermPanel::default(),
             focus_terminal: None,
             terminal_focused: false,
@@ -1072,6 +1077,9 @@ impl ZenithApp {
                 let path = doc.path().map(Path::to_path_buf);
                 if let (Some(r), Some(p)) = (&self.remote, &path) {
                     r.upload(p);
+                }
+                if let Some(pv) = self.preview.as_mut().filter(|p| p.reload_on_save) {
+                    pv.reload();
                 }
                 if let Some(p) = &path {
                     if let Some(parent) = p.parent() {
@@ -1843,6 +1851,19 @@ impl ZenithApp {
                         self.show_sidebar = true;
                     }
                 }
+            }
+            Cmd::OpenPreview => {
+                let url = self
+                    .current_run()
+                    .and_then(|i| self.runs.sessions[i].urls.first().cloned())
+                    .or_else(|| self.preview.as_ref().map(|p| p.url.clone()))
+                    .unwrap_or_else(|| "http://localhost:3000".into());
+                self.dialog = Some(Dialog::Input {
+                    title: "Preview URL".into(),
+                    value: url,
+                    kind: InputKind::PreviewUrl,
+                    focus: true,
+                });
             }
             Cmd::ShowRunOutput => {
                 if let Some(i) = self.current_run() {
@@ -6364,6 +6385,16 @@ impl ZenithApp {
                 self.save_session();
                 return;
             }
+            InputKind::PreviewUrl => {
+                let mut u = name.trim().to_string();
+                if !u.is_empty() {
+                    if !u.contains("://") {
+                        u = format!("http://{u}");
+                    }
+                    self.open_preview(&u);
+                }
+                Ok(())
+            }
             InputKind::Breakpoint(id, line, field) => {
                 use crate::editor_view::BpField;
                 if let Some(doc) = self.docs.iter_mut().find(|d| d.id == *id) {
@@ -7017,6 +7048,18 @@ impl ZenithApp {
         }
     }
 
+    /// Show `url` in the preview panel (or the browser without a web view).
+    fn open_preview(&mut self, url: &str) {
+        if !crate::preview::embedded_supported() {
+            open_url(url);
+            return;
+        }
+        match &mut self.preview {
+            Some(p) => p.load(url),
+            None => self.preview = Some(crate::preview::Preview::new(url)),
+        }
+    }
+
     /// The Run section at the top of Run and Debug.
     fn run_section_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let (configs, err) = self.run_configurations();
@@ -7069,6 +7112,7 @@ impl ZenithApp {
             self.runs.selected = new_sel;
         }
         // Running and finished sessions.
+        let mut preview_url: Option<String> = None;
         let mut act: Option<(usize, &str)> = None;
         let mut keys: Option<(usize, &'static str)> = None;
         for i in 0..self.runs.sessions.len() {
@@ -7123,6 +7167,14 @@ impl ZenithApp {
                             {
                                 open_url(u);
                             }
+                            if crate::preview::embedded_supported()
+                                && ui
+                                    .small_button("◧ Preview")
+                                    .on_hover_text("Show the page next to the code")
+                                    .clicked()
+                            {
+                                preview_url = Some(u.clone());
+                            }
                             match fwd {
                                 Some(false) => {
                                     ui.label(RichText::new("⇄ forwarded").small().color(p.text_faint))
@@ -7142,6 +7194,9 @@ impl ZenithApp {
         }
         if let Some((i, k)) = keys {
             self.run_send(i, k);
+        }
+        if let Some(u) = preview_url {
+            self.open_preview(&u);
         }
         if let Some((i, a)) = act {
             match a {
@@ -7751,6 +7806,26 @@ impl eframe::App for ZenithApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let started = Instant::now();
         self.update_inner(ctx, frame);
+        // The native web view sits above everything egui draws: hide it while
+        // a menu, dialog or window could be under it.
+        let covered = self.palette.open
+            || self.dialog.is_some()
+            || self.show_settings
+            || self.show_changes
+            || self.compare.is_some()
+            || self.history.is_some()
+            || self.inline_edit.is_some()
+            || ctx.memory(|m| m.any_popup_open());
+        if let Some(pv) = &mut self.preview {
+            if covered {
+                pv.hide();
+            }
+            pv.sync(frame, ctx.pixels_per_point());
+            if cfg!(target_os = "linux") {
+                // GTK needs its loop advanced even when nothing changes in egui.
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+        }
         // Slow frames are logged (RUST_LOG=warn) to find what stalls the UI.
         let took = started.elapsed();
         if took > Duration::from_millis(100) {
@@ -7943,6 +8018,28 @@ impl ZenithApp {
                 .show(ctx, |ui| self.sidebar_ui(ctx, ui));
         }
         self.terminal_focused = false;
+        if self.preview.is_some() {
+            let mut act = None;
+            egui::SidePanel::right("preview")
+                .default_width(520.0)
+                .width_range(280.0..=1600.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.bg_panel)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .stroke(Stroke::new(1.0_f32, p.border)),
+                )
+                .show(ctx, |ui| {
+                    if let Some(pv) = &mut self.preview {
+                        act = pv.ui(ui, &p);
+                    }
+                });
+            match act {
+                Some(crate::preview::Action::Close) => self.preview = None,
+                Some(crate::preview::Action::OpenInBrowser(u)) => open_url(&u),
+                None => {}
+            }
+        }
         if self.show_ai {
             egui::SidePanel::right("ai-panel")
                 .default_width(460.0)

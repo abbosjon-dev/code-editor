@@ -27,6 +27,7 @@ mod mcp_ui;
 mod mention;
 mod outline;
 mod palette;
+mod preview;
 mod remote;
 mod review;
 mod run;
