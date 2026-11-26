@@ -26,6 +26,7 @@ mod lsp;
 mod marketplace;
 mod mcp_ui;
 mod mention;
+mod mirror;
 mod outline;
 mod palette;
 mod preview;

@@ -177,6 +177,8 @@ struct RunState {
     device: Option<String>,
     /// Look for devices again then (an emulator is booting).
     rescan_at: Option<Instant>,
+    /// A command waiting for a scan to finish (then shown again).
+    pending_pick: Option<Cmd>,
 }
 
 #[derive(Default)]
@@ -305,6 +307,8 @@ pub struct ZenithApp {
     runs: RunState,
     /// The web preview panel.
     preview: Option<crate::preview::Preview>,
+    /// A phone / emulator / simulator screen.
+    mirror: Option<crate::mirror::Mirror>,
     ai: TermPanel,
     focus_terminal: Option<u64>,
     terminal_focused: bool,
@@ -438,6 +442,7 @@ impl ZenithApp {
             bottom: TermPanel::default(),
             runs: RunState::default(),
             preview: None,
+            mirror: None,
             ai: TermPanel::default(),
             focus_terminal: None,
             terminal_focused: false,
@@ -1893,6 +1898,64 @@ impl ZenithApp {
                     focus: true,
                 });
             }
+            Cmd::RefreshDevices => {
+                self.scan_devices(true);
+                self.toast("Looking for devices and emulators…", NotifyLevel::Info);
+            }
+            Cmd::StartEmulator | Cmd::ShowDeviceScreen => {
+                let Some(found) = self.runs.found.clone() else {
+                    if self.workspace.is_none() {
+                        self.toast("Open a folder first", NotifyLevel::Info);
+                        return;
+                    }
+                    self.runs.pending_pick = Some(cmd);
+                    if self.runs.scanning.is_none() {
+                        self.scan_devices(true);
+                    }
+                    self.toast("Looking for devices and emulators…", NotifyLevel::Info);
+                    return;
+                };
+                let items: Vec<Item> = if cmd == Cmd::StartEmulator {
+                    found
+                        .emulators
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| Item {
+                            label: format!("{} {}", if e.platform == "ios" { "◆" } else { "▲" }, e.name),
+                            detail: if e.booted { "running".into() } else { e.platform.clone() },
+                            action: PaletteAction::StartEmulator(i),
+                        })
+                        .collect()
+                } else {
+                    let mut v: Vec<Item> = found
+                        .devices
+                        .iter()
+                        .filter(|d| d.platform == "android")
+                        .map(|d| Item {
+                            label: d.label(),
+                            detail: d.id.clone(),
+                            action: PaletteAction::DeviceScreen(d.id.clone()),
+                        })
+                        .collect();
+                    v.extend(found.emulators.iter().filter(|e| e.platform == "ios" && e.booted).map(|e| Item {
+                        label: format!("◆ {}", e.name),
+                        detail: "iOS simulator (view only)".into(),
+                        action: PaletteAction::DeviceScreen(e.id.clone()),
+                    }));
+                    v
+                };
+                if items.is_empty() {
+                    let what = if cmd == Cmd::StartEmulator {
+                        "No emulators or simulators found (Android SDK emulator, Xcode)"
+                    } else {
+                        "No connected Android device or running iOS simulator found"
+                    };
+                    self.toast(what, NotifyLevel::Info);
+                } else {
+                    let ph = if cmd == Cmd::StartEmulator { "Start…" } else { "Show the screen of…" };
+                    self.palette.show(Mode::Pick, items, ph);
+                }
+            }
             Cmd::ShowRunOutput => {
                 if let Some(i) = self.current_run() {
                     self.show_run_output(i);
@@ -2541,6 +2604,27 @@ impl ZenithApp {
             PaletteAction::OpenFile(rel) => {
                 if let Some(ws) = self.workspace.clone() {
                     self.open_file(&ws.join(rel));
+                }
+            }
+            PaletteAction::StartEmulator(i) => {
+                if let Some(found) = self.runs.found.clone() {
+                    if let Some(e) = found.emulators.get(i) {
+                        self.launch_emulator(e, &found.tools);
+                    }
+                }
+            }
+            PaletteAction::DeviceScreen(id) => {
+                let found = self.runs.found.clone().unwrap_or_default();
+                let target = match found.devices.iter().find(|d| d.id == id) {
+                    Some(d) => Some((crate::mirror::Target::Android { serial: d.id.clone() }, d.name.clone())),
+                    None => found
+                        .emulators
+                        .iter()
+                        .find(|e| e.id == id)
+                        .map(|e| (crate::mirror::Target::Ios { udid: e.id.clone() }, e.name.clone())),
+                };
+                if let Some((t, name)) = target {
+                    self.show_device_screen(ctx, t, name);
                 }
             }
             PaletteAction::RunConfig(i) => {
@@ -3896,6 +3980,10 @@ impl ZenithApp {
                 item(ui, Cmd::HotReload, "Hot Reload");
                 item(ui, Cmd::StopRun, "Stop");
                 item(ui, Cmd::ShowRunOutput, "Show Output");
+                ui.separator();
+                item(ui, Cmd::StartEmulator, "Start Emulator / Simulator…");
+                item(ui, Cmd::ShowDeviceScreen, "Show Device Screen…");
+                item(ui, Cmd::OpenPreview, "Web Preview…");
                 ui.separator();
                 item(ui, Cmd::DebugStart, "Start Debugging");
                 item(ui, Cmd::OpenRunConfig, "Open run.toml");
@@ -7049,6 +7137,9 @@ impl ZenithApp {
                 self.runs.device = None;
             }
             self.runs.found = Some(found);
+            if let Some(c) = self.runs.pending_pick.take() {
+                self.run(&egui::Context::default(), c);
+            }
         }
         let ready: Vec<String> = self
             .runs
@@ -7172,6 +7263,27 @@ impl ZenithApp {
                 self.scan_devices(flutter);
             }
         });
+        // Phones and emulators that can be mirrored here.
+        let mut screen: Option<(crate::mirror::Target, String)> = None;
+        for d in found.devices.iter().filter(|d| d.platform == "android") {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(d.label()).small().color(p.text));
+                if ui.small_button("📱 Screen").on_hover_text("Show and control its screen here").clicked() {
+                    screen = Some((crate::mirror::Target::Android { serial: d.id.clone() }, d.name.clone()));
+                }
+            });
+        }
+        for e in found.emulators.iter().filter(|e| e.platform == "ios" && e.booted && e.id.len() == 36) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("◆ {} (running)", e.name)).small().color(p.text));
+                if ui.small_button("📱 Screen").on_hover_text("Show its screen here (view only)").clicked() {
+                    screen = Some((crate::mirror::Target::Ios { udid: e.id.clone() }, e.name.clone()));
+                }
+            });
+        }
+        if let Some((t, name)) = screen {
+            self.show_device_screen(ui.ctx(), t, name);
+        }
         if !found.emulators.is_empty() {
             ui.menu_button(RichText::new("▶ Start an emulator / simulator…").small(), |ui| {
                 for e in &found.emulators {
@@ -7193,6 +7305,11 @@ impl ZenithApp {
         if let Some(e) = launch {
             self.launch_emulator(&e, &found.tools);
         }
+    }
+
+    fn show_device_screen(&mut self, ctx: &egui::Context, target: crate::mirror::Target, name: String) {
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.mirror = Some(crate::mirror::Mirror::start(target, name, remote, ctx.clone()));
     }
 
     /// Start an emulator / simulator in the background, then look for
@@ -8228,6 +8345,26 @@ impl ZenithApp {
                 .show(ctx, |ui| self.sidebar_ui(ctx, ui));
         }
         self.terminal_focused = false;
+        if self.mirror.is_some() {
+            let mut close = false;
+            egui::SidePanel::right("device-mirror")
+                .default_width(380.0)
+                .width_range(240.0..=900.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.bg_panel)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .stroke(Stroke::new(1.0_f32, p.border)),
+                )
+                .show(ctx, |ui| {
+                    if let Some(m) = &mut self.mirror {
+                        close = m.ui(ui, &p);
+                    }
+                });
+            if close {
+                self.mirror = None;
+            }
+        }
         if self.preview.is_some() {
             let mut act = None;
             egui::SidePanel::right("preview")

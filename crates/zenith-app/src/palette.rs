@@ -22,6 +22,10 @@ pub enum PaletteAction {
     CompareWith(String),
     /// Start run configuration `i`.
     RunConfig(usize),
+    /// Start emulator `i` of the last device scan.
+    StartEmulator(usize),
+    /// Mirror the device / simulator with this id.
+    DeviceScreen(String),
     GotoLine(usize),
     SetTheme(String),
     SetSyntaxTheme(String),
