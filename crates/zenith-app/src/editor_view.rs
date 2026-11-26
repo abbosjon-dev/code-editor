@@ -1825,6 +1825,13 @@ fn handle_keys(ui: &mut egui::Ui, doc: &mut Document, page: isize) -> (bool, Vec
 }
 
 fn handle_key(doc: &mut Document, key: Key, mods: Modifiers, mac: bool, page: isize) -> bool {
+    // Snippets: Tab expands a prefix or moves to the next field.
+    if key == Key::Tab && !mods.command && !mods.alt && crate::snippets::handle_tab(doc, mods.shift) {
+        return true;
+    }
+    if key == Key::Escape {
+        doc.snippet = None;
+    }
     if let Some(r) = multi_key(doc, key, mods, mac) {
         return r;
     }

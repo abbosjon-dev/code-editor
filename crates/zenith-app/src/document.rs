@@ -96,6 +96,8 @@ pub struct Document {
     pub loading: Option<Receiver<std::io::Result<(Buffer, usize)>>>,
     /// Line to show once loading finished.
     pub goto_after_load: Option<usize>,
+    /// An expanded snippet whose fields Tab moves through.
+    pub snippet: Option<crate::snippets::Session>,
     longest_line: (u64, usize),
     longest_dirty: Option<(usize, usize)>,
     longest_full_at: Option<std::time::Instant>,
@@ -235,6 +237,7 @@ impl Document {
             disk_mtime: None,
             loading: None,
             goto_after_load: None,
+            snippet: None,
             longest_line: (u64::MAX, 0),
             longest_dirty: None,
             longest_full_at: None,

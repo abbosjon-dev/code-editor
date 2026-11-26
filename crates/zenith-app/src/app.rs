@@ -466,6 +466,9 @@ impl ZenithApp {
             app.dialog = Some(Dialog::Crash(path, text));
         }
         app.restore_backups();
+        for e in crate::snippets::reload(&settings::config_dir()) {
+            app.toast(format!("Snippets: {e}"), NotifyLevel::Error);
+        }
         app
     }
 
@@ -1012,6 +1015,13 @@ impl ZenithApp {
                         || self.workspace.as_ref().is_some_and(|w| p == &settings::workspace_settings_path(w))
                     {
                         self.reload_settings();
+                    }
+                    if p.starts_with(settings::config_dir().join("snippets")) {
+                        let errors = crate::snippets::reload(&settings::config_dir());
+                        match errors.first() {
+                            Some(e) => self.toast(format!("Snippets: {e}"), NotifyLevel::Error),
+                            None => self.toast("Snippets reloaded", NotifyLevel::Info),
+                        }
                     }
                     if p == &crate::keymap::path() || p.canonicalize().ok() == crate::keymap::path().canonicalize().ok()
                     {
@@ -1880,6 +1890,43 @@ impl ZenithApp {
             }
             Cmd::OpenSettings => self.show_settings = true,
             Cmd::FocusEditor => self.focus_editor = true,
+            Cmd::InsertSnippet => {
+                let lang = self.docs.get(self.active).map(|d| d.language().to_string()).unwrap_or_default();
+                let items: Vec<Item> = crate::snippets::for_language(&lang)
+                    .into_iter()
+                    .map(|s| Item {
+                        label: format!("{}  —  {}", s.prefix, s.description),
+                        detail: s.body.lines().next().unwrap_or("").replace('\t', " ").chars().take(50).collect(),
+                        action: PaletteAction::InsertSnippet(s.body),
+                    })
+                    .collect();
+                if items.is_empty() {
+                    self.toast(
+                        format!("No snippets for {lang} (add some with Snippets: Edit User Snippets)"),
+                        NotifyLevel::Info,
+                    );
+                } else {
+                    self.palette.show(Mode::Pick, items, "Insert snippet (or type its prefix and press Tab)");
+                }
+            }
+            Cmd::EditSnippets => {
+                let lang =
+                    self.docs.get(self.active).map(|d| d.language().to_lowercase()).unwrap_or_else(|| "all".into());
+                let dir = settings::config_dir().join("snippets");
+                let path = dir.join(format!("{}.toml", lang.replace(' ', "_")));
+                if !path.exists() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        &path,
+                        format!(
+                            "# Snippets for {lang} (all.toml: every language). Type the prefix and press Tab.\n\
+                             # Fields: $1, $2 … ${{1:default}}; $0 is where the caret ends. \\t = one indent level.\n\n\
+                             [[snippet]]\nprefix = \"todo\"\ndescription = \"TODO comment\"\nbody = \"// TODO(${{1:me}}): $0\"\n"
+                        ),
+                    );
+                }
+                self.open_file(&path);
+            }
             Cmd::SwitchProject => {
                 let home = std::env::var("HOME").unwrap_or_default();
                 let short = |p: &Path| {
@@ -2288,6 +2335,13 @@ impl ZenithApp {
             }
             PaletteAction::OpenRecent(p) => self.open_workspace(p),
             PaletteAction::SwitchProject(p) => self.switch_project(p),
+            PaletteAction::InsertSnippet(body) => {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    let (a, b) = (doc.buffer.sel.start(), doc.buffer.sel.end());
+                    crate::snippets::insert(doc, &body, a, b);
+                    self.focus_editor = true;
+                }
+            }
             PaletteAction::SwitchRemote(text) => {
                 if self.docs.iter().any(|d| d.buffer.is_dirty()) {
                     self.toast("Save or close the unsaved files first", NotifyLevel::Warning);

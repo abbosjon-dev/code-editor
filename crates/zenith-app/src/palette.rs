@@ -9,6 +9,8 @@ use crate::theme::Palette as Colors;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteAction {
+    /// Insert a snippet body at the caret.
+    InsertSnippet(String),
     /// Switch to a recent project (local folder).
     SwitchProject(std::path::PathBuf),
     /// Open a recent remote folder ("host:/path").
