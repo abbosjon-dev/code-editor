@@ -123,7 +123,7 @@ pub fn scan(text: &str, language: &str) -> Vec<Symbol> {
 /// The symbol the caret is in: the last one starting at or before its line,
 /// preferring deeper ones.
 pub fn current(symbols: &[Symbol], line: usize) -> Option<usize> {
-    symbols.iter().enumerate().filter(|(_, s)| s.line as usize <= line).map(|(i, _)| i).last()
+    symbols.iter().enumerate().filter(|(_, s)| s.line as usize <= line).map(|(i, _)| i).next_back()
 }
 
 #[derive(Default)]
