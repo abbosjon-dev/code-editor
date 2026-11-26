@@ -165,6 +165,13 @@ languages = ["python"]
 - **▶ Run** (`Ctrl+F5`) — har konfiguratsiya o'z terminal tabida ishlaydi (ranglar, interaktiv kiritish). Panelda: ■ Stop, ↻ Restart,
   chiqishda topilgan URL'lar (bosing — brauzerda), status qatorida `▶ nomi  http://localhost:5173`.
 - **SSH papkada** buyruq serverda ishlaydi, `localhost` portlari esa avtomatik sizning kompyuteringizga forward qilinadi (`ssh -L`).
+- **Xatolar → Problems.** Run chiqishidagi kompilyatsiya va runtime xatolari (rustc/cargo, gcc/clang, Go, Dart/Flutter,
+  TypeScript, Python traceback) Problems panelida chiqadi va bosganda kerakli qatorga o'tadi; keyingi muvaffaqiyatli
+  yig'ish (hot reload, "Compiled successfully"…) eskilarini tozalaydi. Sessiya kartasida `⊗ 2  ⚠ 1`.
+- **🔨 Build.** Flutter: APK, App Bundle (Play Store), IPA va macOS (macOS'da), web, desktop, `flutter install`.
+  Expo: EAS cloud build (Android/iOS), lokal `run:android` / `run:ios`, web eksport. Cargo/Go/Compose/`npm run build`.
+  Tugagach kartada nima yig'ilgani (📦 APK, `build/web/`…) — **Reveal** va APK uchun **Install on device** (`adb install -r`).
+  `android/key.properties` bo'lmasa — release imzo haqida eslatma va qo'llanma havolasi.
 
 ### Web preview
 
@@ -180,6 +187,8 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
   ilova kompilyatsiya bo'lgach to'g'ridan-to'g'ri editor ichidagi preview'da ochiladi.
 - **⟳ Hot reload / ↻ Hot restart** tugmalari, *Run: Hot Reload*, va `.dart` faylni **saqlaganda avtomatik hot reload**
   (Sozlamalar → *Flutter: hot reload on save*).
+- **Bir nechta qurilmada birdaniga**: Device ro'yxatida bir nechtasini belgilang — har biri o'z sessiyasida ishlaydi,
+  hot reload (tugma, buyruq yoki saqlash) hammasiga boradi.
 - **Debug** (`F5`): Flutter ilovalari debug konfiguratsiyasi sifatida avtomatik topiladi (`flutter debug_adapter`) —
   breakpoint'lar, qadam-baqadam, o'zgaruvchilar; tanlangan qurilmada ishlaydi, hot reload debug paytida ham ishlaydi.
 
@@ -193,7 +202,8 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
 - *Run → Start Emulator / Simulator…* — Android AVD'lar (`emulator`), iOS simulatorlar (`xcrun simctl`, macOS), Flutter emulatorlari.
 - *Run → Show Device Screen…* (yoki qurilma yonidagi **📱 Screen**) — **telefon/emulator ekrani editor ichida**: bosish = tap,
   sudrash = swipe, g'ildirak = scroll, ◁ ○ ▢ ⏻ tugmalari, matn yozish. Ishlaydi har qanday Android qurilma bilan (USB orqali
-  ulangan haqiqiy telefon ham) — faqat `adb` kerak. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
+  ulangan haqiqiy telefon ham) — faqat `adb` kerak. Ekran "raw" rejimda olinadi (PNG siqishsiz, ikki parallel oqim) —
+  tez qurilmada ~25 fps; `scrcpy` o'rnatilgan bo'lsa, **↗ scrcpy** tugmasi to'liq tezlik va ovoz bilan ochadi. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
 
 ## Testlar
 

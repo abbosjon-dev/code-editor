@@ -109,3 +109,5 @@ uchun O(n²) hisob).
 - [x] Flutter: qurilmalar, web-server preview, hot reload (saqlaganda), DAP debug
 - [x] Expo: Expo Go QR kodi, web preview
 - [x] Emulator/simulator ishga tushirish, qurilma ekrani (adb screencap + input; iOS — ko'rish)
+- [x] Run chiqishidagi xatolar Problems panelida; Build menyusi (APK/AAB/IPA/web, EAS) va APK o'rnatish
+- [x] Bir nechta qurilmada birdaniga ishga tushirish; tezroq qurilma ekrani (raw screencap, scrcpy)
