@@ -77,6 +77,15 @@ impl Backups {
     }
 }
 
+impl Backups {
+    /// Remove the backups this window wrote (a normal exit).
+    pub fn clear_own(&mut self) {
+        for (_, (_, file)) in self.written.drain() {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
 /// Backups left by a session that didn't exit normally.
 pub fn load_all(dir: &Path) -> Vec<Backup> {
     let mut out: Vec<Backup> = std::fs::read_dir(dir)

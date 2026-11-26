@@ -210,6 +210,8 @@ pub struct ZenithApp {
     /// Test explorer.
     tests: crate::testing::Panel,
     market: crate::marketplace::Market,
+    /// An extra window (`--new-window`): no session of its own.
+    secondary: bool,
     /// Copies of unsaved changes, for a crash.
     backups: crate::backup::Backups,
     last_backup: Instant,
@@ -349,6 +351,7 @@ impl ZenithApp {
             inline_edit: None,
             plugin_write_ok: Default::default(),
             backups: Default::default(),
+            secondary: false,
             last_backup: Instant::now(),
             user_settings: settings.clone(),
             ws_overrides: vec![],
@@ -424,15 +427,29 @@ impl ZenithApp {
             app.toast(e, NotifyLevel::Error);
         }
 
-        // CLI argument: a folder or file to open. Otherwise restore the last session.
-        let arg = args.get(1).map(PathBuf::from);
-        match arg {
-            Some(p) if p.is_dir() => app.open_workspace(p),
-            Some(p) => {
-                if let Some(parent) = p.canonicalize().ok().and_then(|c| c.parent().map(Path::to_path_buf)) {
-                    app.open_workspace(parent);
+        // CLI: folders / files to open (`--new-window`: an extra window that
+        // leaves the main session alone). Otherwise restore the last session.
+        app.secondary = args.iter().any(|a| a == "--new-window");
+        let paths: Vec<PathBuf> = args.iter().skip(1).filter(|a| !a.starts_with("--")).map(PathBuf::from).collect();
+        let first = if paths.is_empty() && app.secondary { Some(PathBuf::new()) } else { paths.first().cloned() };
+        match first {
+            Some(p) if p.as_os_str().is_empty() => {}
+            Some(_) => {
+                for p in &paths {
+                    if p.is_dir() {
+                        if app.workspace.is_none() {
+                            app.open_workspace(p.clone());
+                        }
+                    } else {
+                        if app.workspace.is_none() {
+                            if let Some(parent) = p.canonicalize().ok().and_then(|c| c.parent().map(Path::to_path_buf))
+                            {
+                                app.open_workspace(parent);
+                            }
+                        }
+                        app.open_file(p);
+                    }
                 }
-                app.open_file(&p);
             }
             None => {
                 // open_workspace() saves the (still empty) session, so keep a copy first.
@@ -468,7 +485,9 @@ impl ZenithApp {
         if let Some((path, text)) = crate::crash::unseen(&settings::config_dir()) {
             app.dialog = Some(Dialog::Crash(path, text));
         }
-        app.restore_backups();
+        if !app.secondary {
+            app.restore_backups();
+        }
         for e in crate::snippets::reload(&settings::config_dir()) {
             app.toast(format!("Snippets: {e}"), NotifyLevel::Error);
         }
@@ -1212,6 +1231,10 @@ impl ZenithApp {
     }
 
     fn save_session(&mut self) {
+        // Extra windows don't write over the main window's session.
+        if self.secondary {
+            return;
+        }
         self.remember_project();
         self.session.workspace = self.workspace.clone();
         self.session.open_files = self.docs.iter().filter_map(|d| d.path().map(Path::to_path_buf)).collect();
@@ -1893,6 +1916,22 @@ impl ZenithApp {
             }
             Cmd::OpenSettings => self.show_settings = true,
             Cmd::FocusEditor => self.focus_editor = true,
+            Cmd::NewWindow => spawn_window(&[]),
+            Cmd::MoveToNewWindow => {
+                let Some(doc) = self.docs.get(self.active) else { return };
+                let Some(path) = doc.path().map(Path::to_path_buf) else {
+                    self.toast("Save the file first", NotifyLevel::Info);
+                    return;
+                };
+                if doc.buffer.is_dirty() {
+                    self.toast("Save the file first", NotifyLevel::Info);
+                    return;
+                }
+                let mut args: Vec<String> = self.workspace.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+                args.push(path.to_string_lossy().into_owned());
+                spawn_window(&args);
+                self.close_doc(self.active, false);
+            }
             Cmd::InsertSnippet => {
                 let lang = self.docs.get(self.active).map(|d| d.language().to_string()).unwrap_or_default();
                 let items: Vec<Item> = crate::snippets::for_language(&lang)
@@ -3404,6 +3443,7 @@ impl ZenithApp {
             (cmd, Key::O, Cmd::OpenFile, false),
             (cmd, Key::S, Cmd::Save, false),
             (cmd, Key::N, Cmd::NewFile, false),
+            (cs, Key::N, Cmd::NewWindow, true),
             (cmd, Key::W, Cmd::CloseTab, false),
             (cmd, Key::G, Cmd::GotoLine, false),
             (cmd, Key::F, Cmd::Find, false),
@@ -3529,6 +3569,7 @@ impl ZenithApp {
             ui.menu_button("File", |ui| {
                 ui.set_min_width(240.0);
                 item(ui, Cmd::NewFile, "New File");
+                item(ui, Cmd::NewWindow, "New Window");
                 item(ui, Cmd::OpenFile, "Open File…");
                 item(ui, Cmd::OpenFolder, "Open Folder…");
                 item(ui, Cmd::AddFolderToWorkspace, "Add Folder to Workspace…");
@@ -7155,7 +7196,8 @@ fn open_in_os(path: &Path) {
 impl eframe::App for ZenithApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // A normal exit: unsaved changes were saved or discarded on purpose.
-        crate::backup::clear(&crate::backup::dir(&settings::config_dir()));
+        // Only this window's backups (another window may be running).
+        self.backups.clear_own();
         // Restart into the freshly installed version.
         if let Some(exe) = self.restart_exe.take() {
             let args: Vec<String> = std::env::args().skip(1).collect();
@@ -7386,6 +7428,13 @@ impl ZenithApp {
             }
             self.save_session();
         }
+    }
+}
+
+/// Start another Zenith window (a new process) opening `args`.
+fn spawn_window(args: &[String]) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--new-window").args(args).spawn();
     }
 }
 
