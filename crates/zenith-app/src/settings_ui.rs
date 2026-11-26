@@ -238,6 +238,12 @@ fn appearance(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= slider(ui, &mut s.terminal_font_size, 9.0..=28.0, "Terminal font size", "");
     c.any |= slider(ui, &mut s.line_height, 1.0..=2.2, "Line height", "Multiple of the font size");
     c.any |= checkbox(ui, &mut s.show_minimap, "Minimap", "Code overview on the right");
+    c.any |= checkbox(
+        ui,
+        &mut s.sticky_scroll,
+        "Sticky scroll",
+        "Keep the current function / class header at the top while scrolling",
+    );
     c.any |= checkbox(ui, &mut s.word_wrap, "Word wrap", "Wrap long lines to the window (Alt+Z)");
     c.any |=
         checkbox(ui, &mut s.inline_diagnostics, "Inline problems", "Show error/warning text at the end of the line");

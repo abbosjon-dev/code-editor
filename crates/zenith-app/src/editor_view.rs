@@ -1078,6 +1078,17 @@ pub fn editor_ui(
         doc.resolve_conflict(i, r);
     }
 
+    // --- sticky scroll: headers of the scopes the top line is in ---
+    if s.sticky_scroll {
+        if let Some(line) = sticky_scroll(ui, doc, p, &m, &out, &fm, gutter_w, id, editor_rect.min.y) {
+            doc.buffer.clear_extra();
+            let idx = doc.buffer.pos_to_char(Position::new(line, 0));
+            doc.buffer.set_cursor(idx, false);
+            doc.reveal_line = Some(line);
+            ui.memory_mut(|mem| mem.request_focus(id));
+        }
+    }
+
     // --- minimap ---
     if show_minimap {
         let mm = Rect::from_min_max(egui::pos2(editor_rect.max.x, full.min.y), full.max);
@@ -1145,6 +1156,89 @@ pub fn editor_ui(
 
     ui.allocate_rect(full, Sense::hover());
     actions
+}
+
+/// Most header lines sticky scroll shows.
+const STICKY_MAX: usize = 5;
+
+/// Paint the sticky headers over the top of the editor; returns the line
+/// of a header that was clicked.
+#[allow(clippy::too_many_arguments)]
+fn sticky_scroll(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    p: &Palette,
+    m: &Metrics,
+    out: &egui::scroll_area::ScrollAreaOutput<()>,
+    fm: &crate::folding::FoldMap,
+    gutter_w: f32,
+    id: egui::Id,
+    top_y: f32,
+) -> Option<usize> {
+    let rows = fm.row_count();
+    let first_row = (out.state.offset.y / m.line_h).floor().max(0.0) as usize;
+    if first_row == 0 || first_row >= rows {
+        return None;
+    }
+    let sf = doc.syntax_folds();
+    let headers_at = |row: usize| {
+        let top = fm.line_at(row.min(rows - 1));
+        crate::folding::sticky_headers(&doc.buffer, top, sf.as_deref(), STICKY_MAX)
+    };
+    // The headers take rows themselves: look at the line just below them.
+    let mut hs = headers_at(first_row);
+    if !hs.is_empty() {
+        hs = headers_at(first_row + hs.len());
+    }
+    if hs.is_empty() {
+        return None;
+    }
+    let view = Rect::from_min_max(egui::pos2(out.inner_rect.min.x, top_y), out.inner_rect.max);
+    let font_num = FontId::monospace(m.font.size * 0.86);
+    let mut clicked = None;
+    // The scroll area's content spills a few pixels above it: cover that too.
+    let spill = ui.visuals().clip_rect_margin;
+    let painter = ui.painter_at(view.with_min_y(top_y - spill));
+    painter.rect_filled(
+        Rect::from_min_max(egui::pos2(view.min.x, top_y - spill), egui::pos2(view.max.x, top_y)),
+        0.0,
+        p.bg_panel,
+    );
+    for (i, &line) in hs.iter().enumerate() {
+        let y = view.min.y + i as f32 * m.line_h;
+        let row = Rect::from_min_size(egui::pos2(view.min.x, y), egui::vec2(view.width(), m.line_h));
+        let resp = ui.interact(row, id.with(("sticky", i)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+        painter.rect_filled(row, 0.0, if resp.hovered() { p.bg_hover } else { p.bg_panel });
+        painter.text(
+            egui::pos2(view.min.x + gutter_w - 22.0, y + m.line_h / 2.0),
+            Align2::RIGHT_CENTER,
+            (line + 1).to_string(),
+            font_num.clone(),
+            p.text_faint,
+        );
+        let chars = line_chars(doc, line);
+        let vc = line_vcols(doc, line, &chars, m.tab);
+        let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
+        let text_x = view.min.x - out.state.offset.x + gutter_w + TEXT_PAD + vc[lead] as f32 * m.char_w;
+        let body: Vec<char> = chars[lead..].iter().map(|&c| if c == '\t' { ' ' } else { c }).collect();
+        let spans = doc.highlight.line(line).map(|sp| slice_spans(sp, lead, chars.len()));
+        let job = layout_line(&body, spans.as_deref(), m, p);
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let text_clip = Rect::from_min_max(egui::pos2(view.min.x + gutter_w, row.min.y), row.max);
+        ui.painter_at(text_clip).galley(egui::pos2(text_x, y + (m.line_h - m.row_h) / 2.0), galley, p.text);
+        if resp.clicked() {
+            clicked = Some(line);
+        }
+        resp.on_hover_text_at_pointer(format!("Go to line {}", line + 1));
+    }
+    let bottom = view.min.y + hs.len() as f32 * m.line_h;
+    painter.hline(view.x_range(), bottom, Stroke::new(1.0_f32, p.border));
+    // A soft shadow under the last header.
+    for k in 1..=4 {
+        let a = (40 / k) as u8;
+        painter.hline(view.x_range(), bottom + k as f32, Stroke::new(1.0_f32, Color32::from_black_alpha(a)));
+    }
+    clicked
 }
 
 fn severity_color(p: &Palette, s: Severity) -> Color32 {

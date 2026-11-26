@@ -79,6 +79,36 @@ pub fn enclosing_header(buf: &Buffer, line: usize, ranges: Option<&Ranges>) -> O
         .find(|&l| indent_of(buf, l).is_some_and(|i| i < base) && fold_end(buf, l, None).is_some_and(|e| e >= line))
 }
 
+/// Innermost foldable header strictly above `line` whose region reaches it.
+/// The indentation fallback looks at most `limit` lines up.
+pub fn parent_header(buf: &Buffer, line: usize, ranges: Option<&Ranges>, limit: usize) -> Option<usize> {
+    if let Some(r) = ranges {
+        return r.range(..line).rev().take(limit).find(|(_, &e)| e >= line).map(|(&h, _)| h);
+    }
+    let lo = line.saturating_sub(limit);
+    let base = (lo..=line).rev().find_map(|l| indent_of(buf, l))?;
+    // The nearest line above that is indented less opens the scope (the
+    // fold covers every deeper line after it, so it reaches `line`).
+    (lo..line).rev().find(|&l| indent_of(buf, l).is_some_and(|i| i < base))
+}
+
+/// Sticky scroll: the headers of the scopes around `top` (outermost first),
+/// at most `max` of them.
+pub fn sticky_headers(buf: &Buffer, top: usize, ranges: Option<&Ranges>, max: usize) -> Vec<usize> {
+    let mut out = vec![];
+    let mut line = top;
+    while let Some(h) = parent_header(buf, line, ranges, 4000) {
+        out.push(h);
+        if h == 0 {
+            break;
+        }
+        line = h;
+    }
+    out.reverse();
+    out.truncate(max);
+    out
+}
+
 /// Mapping between document lines and visible rows (folding + soft wrap).
 ///
 /// Each row is `(document line, first char column of the row)`. With no
@@ -306,5 +336,21 @@ mod tests {
         assert_eq!(m.row_of_pos(1, 12), 3);
         assert_eq!(m.line_at(5), 2);
         assert!(!m.is_hidden(1));
+    }
+
+    #[test]
+    fn sticky_headers_by_indent_and_ranges() {
+        let src = "impl A {\n    fn a() {\n        let x = 1;\n\n        x\n    }\n}\nfn b() {}\n";
+        let b = Buffer::from_str(src);
+        assert_eq!(sticky_headers(&b, 2, None, 5), [0, 1]);
+        assert_eq!(sticky_headers(&b, 3, None, 5), [0, 1]); // blank line inside
+        assert_eq!(sticky_headers(&b, 5, None, 5), [0]); // `}` of a()
+        assert_eq!(sticky_headers(&b, 7, None, 5), Vec::<usize>::new());
+        assert_eq!(sticky_headers(&b, 2, None, 1), [0]);
+        let mut r = Ranges::new();
+        r.insert(0, 5);
+        r.insert(1, 4);
+        assert_eq!(sticky_headers(&b, 4, Some(&r), 5), [0, 1]);
+        assert_eq!(sticky_headers(&b, 6, Some(&r), 5), Vec::<usize>::new());
     }
 }

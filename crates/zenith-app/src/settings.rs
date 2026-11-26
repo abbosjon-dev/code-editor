@@ -20,6 +20,8 @@ pub struct Settings {
     pub insert_spaces: bool,
     pub show_indent_guides: bool,
     pub show_minimap: bool,
+    /// Keep the headers of the scopes being read at the top of the editor.
+    pub sticky_scroll: bool,
     /// Soft-wrap long lines to the window width.
     pub word_wrap: bool,
     /// Show problem messages at the end of their line.
@@ -78,6 +80,7 @@ impl Default for Settings {
             insert_spaces: true,
             show_indent_guides: true,
             show_minimap: true,
+            sticky_scroll: true,
             word_wrap: false,
             inline_diagnostics: true,
             inline_blame: true,
