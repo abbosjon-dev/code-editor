@@ -152,6 +152,8 @@ struct RunSession {
     problems: Vec<crate::run_problems::Problem>,
     /// The output was read after the process ended.
     final_scan: bool,
+    /// Flutter device it runs on.
+    device: Option<String>,
     /// The URL whose QR code is shown (to open it on a phone).
     qr: Option<String>,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
@@ -177,8 +179,9 @@ struct RunState {
     /// Devices / emulators found, and a scan in progress.
     found: Option<crate::devices::Found>,
     scanning: Option<std::sync::mpsc::Receiver<crate::devices::Found>>,
-    /// Device to run Flutter apps on (id); `None` = Flutter's choice.
-    device: Option<String>,
+    /// Devices to run Flutter apps on (ids); empty = Flutter's choice,
+    /// several = one session per device.
+    devices: Vec<String>,
     /// Look for devices again then (an emulator is booting).
     rescan_at: Option<Instant>,
     /// A command waiting for a scan to finish (then shown again).
@@ -1969,11 +1972,23 @@ impl ZenithApp {
                 Some(i) => self.stop_run(i),
                 None => self.toast("Nothing is running", NotifyLevel::Info),
             },
-            Cmd::RestartRun => match self.runs.sessions.last().map(|r| r.config.clone()) {
-                Some(c) => self.start_run(c),
+            Cmd::RestartRun => match self.runs.sessions.last().map(|r| (r.config.clone(), r.device.clone())) {
+                Some((c, d)) => self.start_run_on(c, d),
                 None => self.run(ctx, Cmd::RunProject),
             },
             Cmd::HotReload if self.debugger.hot_reload(false) => {}
+            Cmd::HotReload
+                if (0..self.runs.sessions.len()).any(|i| {
+                    self.runs.sessions[i].config.kind == crate::run::Kind::Flutter && self.run_session_alive(i)
+                }) =>
+            {
+                // Every running Flutter app (several devices at once).
+                for i in 0..self.runs.sessions.len() {
+                    if self.runs.sessions[i].config.kind == crate::run::Kind::Flutter && self.run_session_alive(i) {
+                        self.run_send(i, "r");
+                    }
+                }
+            }
             Cmd::HotReload => match self.current_run() {
                 Some(i) => match self.runs.sessions[i].config.kind.keys().first() {
                     Some((_, k, _)) => self.run_send(i, k),
@@ -7057,18 +7072,35 @@ impl ZenithApp {
     /// Start a configuration in its own terminal tab (restarting it if it
     /// is already running).
     fn start_run(&mut self, cfg: crate::run::RunConfig) {
-        let Some(ws) = self.workspace.clone() else {
+        if self.workspace.is_none() {
             self.toast("Open a folder first", NotifyLevel::Info);
             return;
-        };
+        }
         // Unsaved edits would not be in the build.
         for i in 0..self.docs.len() {
             if self.docs[i].buffer.is_dirty() && self.docs[i].path().is_some() {
                 self.save_doc(i, false);
             }
         }
-        // Flutter: the device picked in the Run panel.
-        let device = self.runs.device.clone().filter(|_| cfg.kind == crate::run::Kind::Flutter);
+        // Flutter on several devices: a session each (hot reload reaches all).
+        let picked = if cfg.kind == crate::run::Kind::Flutter { self.runs.devices.clone() } else { vec![] };
+        if picked.len() > 1 {
+            let mut names = self.runs.found.as_ref().map(|f| f.devices.clone()).unwrap_or_default();
+            names.push(crate::devices::Device { name: "Web".into(), ..crate::devices::web_server() });
+            for d in picked {
+                let label = names.iter().find(|x| x.id == d).map_or(d.clone(), |x| x.name.clone());
+                let mut c = cfg.clone();
+                c.name = format!("{} · {label}", cfg.name);
+                self.start_run_on(c, Some(d));
+            }
+            return;
+        }
+        self.start_run_on(cfg, picked.into_iter().next());
+    }
+
+    /// Start (or restart) one session; `device` is Flutter's `-d`.
+    fn start_run_on(&mut self, cfg: crate::run::RunConfig, device: Option<String>) {
+        let Some(ws) = self.workspace.clone() else { return };
         let extra = device.as_ref().map(|d| format!("-d {}", crate::remote::sh_quote(d))).unwrap_or_default();
         let auto_preview = device.as_deref() == Some("web-server");
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
@@ -7089,6 +7121,7 @@ impl ZenithApp {
                 t.spec = spec;
                 t.restart(waker);
                 self.runs.sessions[i].auto_preview = auto_preview;
+                self.runs.sessions[i].device = device;
                 self.bottom.active = pos;
                 self.show_terminal = true;
                 return;
@@ -7110,6 +7143,7 @@ impl ZenithApp {
             expo_urls: vec![],
             problems: vec![],
             final_scan: false,
+            device: device.clone(),
             qr: None,
             forwards: vec![],
         });
@@ -7162,10 +7196,7 @@ impl ZenithApp {
         if let Some(found) = self.runs.scanning.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.runs.scanning = None;
             // Keep the chosen device if it is still there.
-            if self.runs.device.as_ref().is_some_and(|d| d != "web-server" && !found.devices.iter().any(|x| &x.id == d))
-            {
-                self.runs.device = None;
-            }
+            self.runs.devices.retain(|d| d == "web-server" || found.devices.iter().any(|x| &x.id == d));
             self.runs.found = Some(found);
             if let Some(c) = self.runs.pending_pick.take() {
                 self.run(&egui::Context::default(), c);
@@ -7281,20 +7312,31 @@ impl ZenithApp {
             if flutter {
                 let mut all = found.devices.clone();
                 all.push(crate::devices::web_server());
-                let current = self
-                    .runs
-                    .device
-                    .as_ref()
-                    .and_then(|id| all.iter().find(|d| &d.id == id))
-                    .map(|d| d.label())
-                    .unwrap_or_else(|| "Automatic".into());
+                let picked = &self.runs.devices;
+                let current = match picked.len() {
+                    0 => "Automatic".to_string(),
+                    1 => all.iter().find(|d| d.id == picked[0]).map_or(picked[0].clone(), |d| d.label()),
+                    n => format!("{n} devices"),
+                };
                 egui::ComboBox::from_id_salt("run-device")
                     .width(ui.available_width() - 30.0)
                     .selected_text(current)
+                    .height(320.0)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.runs.device, None, "Automatic");
+                        if ui.selectable_label(self.runs.devices.is_empty(), "Automatic").clicked() {
+                            self.runs.devices.clear();
+                        }
+                        ui.label(RichText::new("Tick several to run on all of them").small().color(p.text_faint));
                         for d in &all {
-                            ui.selectable_value(&mut self.runs.device, Some(d.id.clone()), d.label());
+                            let mut on = self.runs.devices.contains(&d.id);
+                            if ui.checkbox(&mut on, d.label()).changed() {
+                                if on {
+                                    self.runs.devices.push(d.id.clone());
+                                } else {
+                                    self.runs.devices.retain(|x| x != &d.id);
+                                }
+                            }
                         }
                     });
             } else {
@@ -7582,8 +7624,8 @@ impl ZenithApp {
                 }
                 "stop" => self.stop_run(i),
                 "restart" => {
-                    let c = self.runs.sessions[i].config.clone();
-                    self.start_run(c);
+                    let (c, d) = (self.runs.sessions[i].config.clone(), self.runs.sessions[i].device.clone());
+                    self.start_run_on(c, d);
                 }
                 _ => {
                     let tab = self.runs.sessions[i].tab;
@@ -7629,7 +7671,7 @@ impl ZenithApp {
         };
         // Flutter: run on the device picked in the Run panel.
         if cfg.adapter == "flutter" && !cfg.extra.contains_key("toolArgs") {
-            if let Some(d) = self.runs.device.clone() {
+            if let Some(d) = self.runs.devices.first().cloned() {
                 cfg.extra.insert("toolArgs".into(), toml::Value::Array(vec!["-d".into(), d.into()]));
             }
         }

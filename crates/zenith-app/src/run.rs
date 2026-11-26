@@ -376,7 +376,9 @@ pub fn unwrap_lines(lines: &[String], cols: usize) -> Vec<String> {
     for l in lines {
         let t = l.trim_end();
         match out.last_mut() {
-            Some(last) if join && !t.starts_with(char::is_whitespace) && !t.is_empty() => last.push_str(t),
+            Some(last) if join && !t.is_empty() && !t.starts_with(char::is_whitespace) && !starts_sentence(t) => {
+                last.push_str(t)
+            }
             _ => out.push(t.to_string()),
         }
         // Too narrow a pane breaks everything: don't guess there.
@@ -398,6 +400,12 @@ pub fn merge_urls(mut known: Vec<String>, found: Vec<String>) -> Vec<String> {
         }
     }
     known
+}
+
+/// "The Flutter DevTools…": a new message, not the rest of a cut line.
+fn starts_sentence(t: &str) -> bool {
+    let mut c = t.chars();
+    matches!((c.next(), c.next()), (Some(a), Some(b)) if a.is_uppercase() && b.is_lowercase())
 }
 
 /// The port of a local URL.
@@ -490,6 +498,9 @@ mod tests {
         let joined = unwrap_lines(&wrapped, 50);
         assert_eq!(joined, ["The DevTools debugger is available at: http://127.0.0.1:4233/x/", "  next"]);
         assert_eq!(unwrap_lines(&wrapped[..2], 20).len(), 2); // narrow: no guessing
+        let full =
+            ["A Dart VM Service is available at: http://127.0.0.1:1/x=/".to_string(), "The DevTools…".to_string()];
+        assert_eq!(unwrap_lines(&full, full[0].len()).len(), 2);
         let known = merge_urls(vec![], vec!["http://localhost:41705".into(), "http://127.0.0.1:4".into()]);
         let known = merge_urls(known, vec!["http://127.0.0.1:4233/x".into(), "http://localhost:4".into()]);
         assert_eq!(known, ["http://localhost:41705", "http://127.0.0.1:4233/x"]);
