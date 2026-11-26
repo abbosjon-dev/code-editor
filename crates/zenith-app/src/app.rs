@@ -277,6 +277,8 @@ pub struct ZenithApp {
     pending_references: Option<(u64, String)>,
     pending_rename: Option<u64>,
     pending_code_actions: Option<u64>,
+    /// An organize / add-imports request: apply its first action directly.
+    pending_source_action: Option<(u64, &'static str, &'static str)>,
     pending_symbols: Option<u64>,
     code_actions: Vec<zenith_lsp::CodeAction>,
     /// Diagnostics for every file the language servers reported on.
@@ -406,6 +408,7 @@ impl ZenithApp {
             pending_references: None,
             pending_rename: None,
             pending_code_actions: None,
+            pending_source_action: None,
             pending_symbols: None,
             code_actions: vec![],
             problems: Default::default(),
@@ -2205,6 +2208,24 @@ impl ZenithApp {
                     self.focus_editor = true;
                 }
             }
+            Cmd::OrganizeImports | Cmd::AddMissingImports => {
+                let root = self.active_root();
+                let Some(doc) = self.docs.get_mut(self.active) else { return };
+                if !doc.lsp_active {
+                    if cmd == Cmd::OrganizeImports {
+                        self.organize_imports_builtin();
+                    } else {
+                        self.toast("No language server for this file", NotifyLevel::Info);
+                    }
+                    return;
+                }
+                let (kind, what) = match cmd {
+                    Cmd::OrganizeImports => ("source.organizeImports", "organize imports"),
+                    _ => ("source.addMissingImports", "add missing imports"),
+                };
+                self.pending_source_action =
+                    self.lsp.request_source_action(doc, root.as_deref(), kind).map(|r| (r, kind, what));
+            }
             Cmd::CodeActions | Cmd::GotoSymbol | Cmd::TriggerParameterHints => {
                 let root = self.active_root();
                 let Some(doc) = self.docs.get_mut(self.active) else { return };
@@ -2789,6 +2810,8 @@ impl ZenithApp {
                 d.semantic_version = None;
             }
         }
+        let root = self.active_root();
+        self.lsp.send_completion_resolves(&mut self.docs, root.as_deref());
         for (i, (doc, root)) in self.docs.iter_mut().zip(roots).enumerate() {
             self.lsp.sync(doc, root.as_deref(), false);
             // Hints only for what's on screen.
@@ -2835,6 +2858,32 @@ impl ZenithApp {
                         self.problems.remove(&path);
                     } else {
                         self.problems.insert(path, diagnostics);
+                    }
+                }
+                LspOutcome::CodeActions { request, actions }
+                    if self.pending_source_action.is_some_and(|(r, ..)| r == request) =>
+                {
+                    let (_, kind, what) = self.pending_source_action.take().unwrap_or_default();
+                    // Only actions of the asked kind (some servers send quick fixes too);
+                    // the preferred / first one is the action.
+                    let fits: Vec<_> = actions.into_iter().filter(|a| a.kind.starts_with(kind)).collect();
+                    match fits.iter().find(|a| a.preferred).or(fits.first()).cloned() {
+                        Some(a) => {
+                            log::info!("{what}: {}", a.title);
+                            self.apply_edits_quiet(a.edits, false);
+                            if let Some(cmd) = &a.command {
+                                let root = self.active_root();
+                                if let Some(doc) = self.docs.get_mut(self.active) {
+                                    self.lsp.execute_command(doc, root.as_deref(), cmd);
+                                }
+                            }
+                            // Servers often only remove unused ones: sort as well.
+                            if what == "organize imports" {
+                                self.sort_imports_quietly();
+                            }
+                        }
+                        None if what == "organize imports" => self.organize_imports_builtin(),
+                        None => self.toast(format!("The language server can't {what} here"), NotifyLevel::Info),
                     }
                 }
                 LspOutcome::CodeActions { request, actions } => {
@@ -3465,6 +3514,7 @@ impl ZenithApp {
             (Modifiers::ALT, Key::Z, Cmd::ToggleWordWrap, false),
             (ca, Key::Z, Cmd::ToggleZenMode, true),
             (Modifiers::SHIFT | Modifiers::ALT, Key::F, Cmd::FormatDocument, false),
+            (Modifiers::SHIFT | Modifiers::ALT, Key::O, Cmd::OrganizeImports, false),
             (Modifiers::SHIFT, Key::F12, Cmd::FindReferences, false),
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
             (cs, Key::F5, Cmd::DebugRestart, true),
@@ -3646,6 +3696,10 @@ impl ZenithApp {
                 item(ui, Cmd::Find, "Find");
                 item(ui, Cmd::Replace, "Replace");
                 item(ui, Cmd::FindInFiles, "Find in Files");
+                ui.separator();
+                item(ui, Cmd::FormatDocument, "Format Document");
+                item(ui, Cmd::OrganizeImports, "Organize Imports");
+                item(ui, Cmd::AddMissingImports, "Add All Missing Imports");
                 ui.separator();
                 item(ui, Cmd::SelectLanguage, "Change Language Mode…");
             });
@@ -7505,6 +7559,27 @@ impl ZenithApp {
                 self.editor_pane(ctx, ui, false);
             }
         });
+    }
+
+    /// Sort the active file's import blocks without a language server.
+    fn organize_imports_builtin(&mut self) {
+        if !self.sort_imports_quietly() {
+            self.toast("Imports are already organized", NotifyLevel::Info);
+        }
+    }
+
+    /// Sort import blocks; false if they already were.
+    fn sort_imports_quietly(&mut self) -> bool {
+        let Some(doc) = self.docs.get_mut(self.active) else { return false };
+        let text = doc.buffer.text();
+        let Some(new) = crate::imports::organize(&text, doc.language()) else { return false };
+        // Replace only the part that changed (keeps the caret and undo small).
+        let (a, b): (Vec<char>, Vec<char>) = (text.chars().collect(), new.chars().collect());
+        let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+        let middle: String = b[pre..b.len() - suf].iter().collect();
+        doc.buffer.apply_edits(vec![(pre, a.len() - suf, middle)]);
+        true
     }
 
     /// Every workspace file as a palette item running `make(path)`.

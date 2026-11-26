@@ -133,6 +133,13 @@ pub struct CompletionItem {
     pub select: Option<(usize, usize)>,
     pub filter_text: String,
     pub sort_text: String,
+    /// Edits elsewhere in the file (e.g. an `import` for this name).
+    pub additional_edits: Vec<TextEdit>,
+    /// The server's `data`: the item can be resolved for more details
+    /// (servers often compute the import edits only then).
+    pub resolve_data: Option<Value>,
+    /// The item as the server sent it (sent back to resolve it).
+    pub raw: Value,
 }
 
 impl CompletionItem {
@@ -257,6 +264,11 @@ pub enum LspEvent {
         request: u64,
         items: Vec<CompletionItem>,
     },
+    /// The extra edits of a resolved completion item (auto-import).
+    CompletionResolved {
+        request: u64,
+        edits: Vec<TextEdit>,
+    },
     Hover {
         request: u64,
         text: String,
@@ -328,6 +340,7 @@ pub enum LspEvent {
 enum Pending {
     Initialize,
     Completion,
+    CompletionResolve,
     Hover,
     Definition,
     References,
@@ -482,7 +495,12 @@ impl LspClient {
                         "synchronization": { "didSave": true, "dynamicRegistration": false },
                         "publishDiagnostics": { "relatedInformation": false },
                         "completion": {
-                            "completionItem": { "snippetSupport": true, "documentationFormat": ["plaintext", "markdown"], "insertReplaceSupport": false },
+                            "completionItem": {
+                                "snippetSupport": true,
+                                "documentationFormat": ["plaintext", "markdown"],
+                                "insertReplaceSupport": false,
+                                "resolveSupport": { "properties": ["additionalTextEdits", "detail", "documentation"] }
+                            },
                             "contextSupport": true
                         },
                         "hover": { "contentFormat": ["plaintext", "markdown"] },
@@ -593,6 +611,22 @@ impl LspClient {
             None => json!({ "triggerKind": 1 }),
         };
         self.request("textDocument/completion", params, Pending::Completion)
+    }
+
+    /// Ask for the rest of a completion item (its import edits).
+    pub fn resolve_completion(&mut self, item: Value) -> u64 {
+        self.request("completionItem/resolve", item, Pending::CompletionResolve)
+    }
+
+    /// Code actions of the given kinds for the whole file (e.g.
+    /// `source.organizeImports`).
+    pub fn source_actions(&mut self, path: &Path, end: LspPos, kinds: &[&str]) -> u64 {
+        let params = json!({
+            "textDocument": { "uri": text::path_to_uri(path) },
+            "range": { "start": { "line": 0, "character": 0 }, "end": end },
+            "context": { "diagnostics": [], "only": kinds, "triggerKind": 1 }
+        });
+        self.request("textDocument/codeAction", params, Pending::CodeAction)
     }
 
     pub fn hover(&mut self, path: &Path, pos: LspPos) -> u64 {
@@ -786,6 +820,12 @@ fn handle_message(server: &str, msg: Value, stdin: &Arc<Mutex<Out>>, shared: &Ar
                     }
                     out.push(LspEvent::Ready { server: server.into() });
                 }
+                Some(Pending::CompletionResolve) => {
+                    out.push(LspEvent::CompletionResolved {
+                        request: id,
+                        edits: parse_text_edits(&result["additionalTextEdits"]),
+                    });
+                }
                 Some(Pending::Completion) => {
                     out.push(LspEvent::Completion { request: id, items: parse_completions(&result) });
                 }
@@ -880,6 +920,9 @@ pub(crate) fn parse_completions(result: &Value) -> Vec<CompletionItem> {
                 select,
                 filter_text: it["filterText"].as_str().unwrap_or(&label).to_string(),
                 sort_text: it["sortText"].as_str().unwrap_or(&label).to_string(),
+                additional_edits: parse_text_edits(&it["additionalTextEdits"]),
+                resolve_data: it.get("data").filter(|d| !d.is_null()).cloned(),
+                raw: it.clone(),
                 label,
             })
         })
@@ -1246,6 +1289,20 @@ mod tests {
         assert_eq!(items[0].insert_text, "push(value)");
         assert_eq!(items[0].kind_label(), "fn");
         assert_eq!(items[1].edit_range.unwrap().start.character, 2);
+        assert!(items[0].additional_edits.is_empty() && items[0].resolve_data.is_none());
+    }
+
+    #[test]
+    fn completion_import_edits_and_resolve_data() {
+        let imp = json!({ "range": { "start": {"line":0,"character":0}, "end": {"line":0,"character":0} }, "newText": "use std::collections::HashMap;\n" });
+        let v = json!([
+            { "label": "HashMap", "additionalTextEdits": [imp] },
+            { "label": "BTreeMap", "data": { "imports": [{ "full_import_path": "std::collections::BTreeMap" }] } }
+        ]);
+        let items = parse_completions(&v);
+        assert_eq!(items[0].additional_edits[0].new_text, "use std::collections::HashMap;\n");
+        assert!(items[1].resolve_data.is_some());
+        assert_eq!(items[1].raw["label"], "BTreeMap");
     }
 
     #[test]

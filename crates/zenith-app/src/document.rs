@@ -106,6 +106,11 @@ pub struct Document {
     // --- language server state ---
     pub diagnostics: Vec<DocDiagnostic>,
     pub completion: Option<Completion>,
+    /// An accepted completion item to resolve for its import edits, with
+    /// the line it was inserted on.
+    pub completion_resolve: Option<(serde_json::Value, usize)>,
+    /// The resolve request in flight (request id, insertion line).
+    pub resolve_request: Option<(u64, usize)>,
     pub hover: Option<Hover>,
     pub signature: Option<Signature>,
     /// Buffer version last sent to the language server.
@@ -244,6 +249,8 @@ impl Document {
             longest_full_cost: std::time::Duration::ZERO,
             diagnostics: vec![],
             completion: None,
+            completion_resolve: None,
+            resolve_request: None,
             hover: None,
             signature: None,
             lsp_version: None,
@@ -994,13 +1001,34 @@ impl Document {
         };
         let text = item.insert_text.clone();
         let select = item.select;
+        let extra = item.additional_edits.clone();
+        let resolve = (extra.is_empty() && item.resolve_data.is_some()).then(|| item.raw.clone());
+        let line = self.buffer.char_to_pos(start).line;
         self.buffer.seal_history();
         self.buffer.replace_range(start, end, &text);
         if let Some((a, b)) = select {
             self.buffer.sel = Selection::new(start + a, start + b);
         }
         self.buffer.seal_history();
+        // Imports that come with the item (above the insertion).
+        self.apply_import_edits(&extra, line);
+        self.completion_resolve = resolve.map(|r| (r, line));
         self.scroll_to_cursor = true;
+    }
+
+    /// Apply a completion's extra edits (e.g. `use std::collections::HashMap;`)
+    /// when they all lie above `line`, keeping the selection in place.
+    pub fn apply_import_edits(&mut self, edits: &[zenith_lsp::TextEdit], line: usize) -> bool {
+        if edits.is_empty() || edits.iter().any(|e| e.range.end.line as usize > line) {
+            return false;
+        }
+        let sel = self.buffer.sel;
+        let head = sel.head as isize;
+        self.apply_lsp_edits(edits);
+        let shift = self.buffer.sel.head as isize - head;
+        let mv = |i: usize| (i as isize + shift).max(0) as usize;
+        self.buffer.sel = Selection::new(mv(sel.anchor), mv(sel.head));
+        true
     }
 
     pub fn goto_line(&mut self, line: usize) {

@@ -18,6 +18,7 @@ mod git;
 mod git_log;
 mod highlight;
 mod history;
+mod imports;
 mod inline_ai;
 mod keymap;
 mod lsp;

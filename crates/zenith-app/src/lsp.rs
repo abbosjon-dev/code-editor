@@ -324,6 +324,24 @@ impl LspManager {
         Some(self.client_for(doc, root)?.code_actions(&path, range, diags))
     }
 
+    /// Resolve accepted completion items that may bring an import.
+    pub fn send_completion_resolves(&mut self, docs: &mut [Document], root: Option<&Path>) {
+        for doc in docs.iter_mut() {
+            let Some((item, line)) = doc.completion_resolve.take() else { continue };
+            if let Some(c) = self.client_for(doc, root) {
+                doc.resolve_request = Some((c.resolve_completion(item), line));
+            }
+        }
+    }
+
+    /// Ask for the file's source actions of `kind` (e.g. "source.organizeImports").
+    pub fn request_source_action(&mut self, doc: &mut Document, root: Option<&Path>, kind: &str) -> Option<u64> {
+        self.sync(doc, root, true);
+        let path = doc.path()?.to_path_buf();
+        let end = doc.to_lsp(doc.buffer.len_chars());
+        Some(self.client_for(doc, root)?.source_actions(&path, end, &[kind]))
+    }
+
     /// Ask every running server for workspace symbols matching `query`.
     pub fn request_workspace_symbols(&mut self, query: &str) -> Vec<u64> {
         self.clients.values_mut().map(|c| c.workspace_symbols(query)).collect()
@@ -405,6 +423,12 @@ impl LspManager {
                             doc.refilter_completion();
                             break;
                         }
+                    }
+                }
+                LspEvent::CompletionResolved { request, edits } => {
+                    if let Some(doc) = docs.iter_mut().find(|d| d.resolve_request.is_some_and(|(r, _)| r == request)) {
+                        let (_, line) = doc.resolve_request.take().unwrap_or_default();
+                        doc.apply_import_edits(&edits, line);
                     }
                 }
                 LspEvent::Hover { request, text } => {
