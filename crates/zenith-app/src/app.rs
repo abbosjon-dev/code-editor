@@ -460,6 +460,65 @@ impl ZenithApp {
         app
     }
 
+    /// Remember where the current project was left (files, tab, carets).
+    fn remember_project(&mut self) {
+        let Some(ws) = self.workspace.clone() else { return };
+        // Nothing open (e.g. mid-switch): keep what was remembered.
+        if self.docs.iter().all(|d| d.path().is_none()) {
+            return;
+        }
+        let files: Vec<PathBuf> = self.docs.iter().filter_map(|d| d.path().map(Path::to_path_buf)).collect();
+        let state = settings::ProjectState {
+            active: self
+                .docs
+                .get(self.active)
+                .and_then(|d| d.path())
+                .and_then(|a| files.iter().position(|f| f == a))
+                .unwrap_or(0),
+            cursors: self.docs.iter().filter_map(|d| Some((d.path()?.to_path_buf(), d.buffer.sel.head))).collect(),
+            open_files: files,
+        };
+        self.session.projects.retain(|(p, _)| p != &ws);
+        self.session.projects.insert(0, (ws, state));
+        self.session.projects.truncate(20);
+    }
+
+    /// Switch to another project, coming back to where it was left.
+    fn switch_project(&mut self, path: PathBuf) {
+        if self.docs.iter().any(|d| d.buffer.is_dirty()) {
+            self.toast("Save or close the unsaved files first", NotifyLevel::Warning);
+            return;
+        }
+        self.remember_project();
+        for d in std::mem::take(&mut self.docs) {
+            self.lsp.did_close(&d);
+        }
+        self.active = 0;
+        self.open_workspace(path.clone());
+        let state = self.session.projects.iter().find(|(p, _)| *p == path).map(|(_, s)| s.clone());
+        if let Some(st) = state {
+            for f in st.open_files.iter().filter(|f| f.exists()) {
+                self.open_file(f);
+            }
+            for (f, idx) in &st.cursors {
+                if let Some(d) = self.docs.iter_mut().find(|d| d.path() == Some(f.as_path())) {
+                    let idx = (*idx).min(d.buffer.len_chars());
+                    d.buffer.set_cursor(idx, false);
+                    d.scroll_to_cursor = true;
+                }
+            }
+            if let Some(a) = st.open_files.get(st.active) {
+                if let Some(i) = self.docs.iter().position(|d| d.path() == Some(a.as_path())) {
+                    self.active = i;
+                }
+            }
+        }
+        if self.docs.is_empty() {
+            self.new_file();
+        }
+        self.save_session();
+    }
+
     /// Reopen unsaved changes left by a session that didn't exit normally.
     fn restore_backups(&mut self) {
         let dir = crate::backup::dir(&settings::config_dir());
@@ -516,6 +575,10 @@ impl ZenithApp {
 
     fn open_workspace(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
+        // Leaving a project with files open: remember where it was.
+        if self.workspace.as_ref().is_some_and(|w| *w != path) && !self.docs.is_empty() {
+            self.remember_project();
+        }
         // A different folder ends the remote session (re-set by the caller when connecting).
         if self.remote.as_ref().is_some_and(|r| r.cache != path) {
             self.remote = None;
@@ -1037,6 +1100,7 @@ impl ZenithApp {
     }
 
     fn save_session(&mut self) {
+        self.remember_project();
         self.session.workspace = self.workspace.clone();
         self.session.open_files = self.docs.iter().filter_map(|d| d.path().map(Path::to_path_buf)).collect();
         self.session.cursors =
@@ -1715,6 +1779,38 @@ impl ZenithApp {
             }
             Cmd::OpenSettings => self.show_settings = true,
             Cmd::FocusEditor => self.focus_editor = true,
+            Cmd::SwitchProject => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let short = |p: &Path| {
+                    let s = p.display().to_string();
+                    match s.strip_prefix(&home) {
+                        Some(rest) if !home.is_empty() => format!("~{rest}"),
+                        _ => s,
+                    }
+                };
+                let mut items: Vec<Item> = self
+                    .session
+                    .recent_workspaces
+                    .iter()
+                    .filter(|p| Some(*p) != self.workspace.as_ref() && p.exists())
+                    .filter(|p| !p.starts_with(settings::config_dir().join("remote")))
+                    .map(|p| Item {
+                        label: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| short(p)),
+                        detail: short(p),
+                        action: PaletteAction::SwitchProject(p.clone()),
+                    })
+                    .collect();
+                items.extend(self.session.recent_remotes.iter().map(|r| Item {
+                    label: format!("SSH: {}", r.rsplit(['/', ':']).find(|s| !s.is_empty()).unwrap_or(r)),
+                    detail: r.clone(),
+                    action: PaletteAction::SwitchRemote(r.clone()),
+                }));
+                if items.is_empty() {
+                    self.toast("No other recent projects yet", NotifyLevel::Info);
+                } else {
+                    self.palette.show(Mode::Pick, items, "Switch to project");
+                }
+            }
             Cmd::FocusActivityBar => {
                 // Then Tab / Shift+Tab move between the views, Enter opens one.
                 if let Some(id) = ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new("activity-first"))) {
@@ -2064,6 +2160,15 @@ impl ZenithApp {
                 self.launch_agent(&id);
             }
             PaletteAction::OpenRecent(p) => self.open_workspace(p),
+            PaletteAction::SwitchProject(p) => self.switch_project(p),
+            PaletteAction::SwitchRemote(text) => {
+                if self.docs.iter().any(|d| d.buffer.is_dirty()) {
+                    self.toast("Save or close the unsaved files first", NotifyLevel::Warning);
+                } else {
+                    self.remember_project();
+                    self.connect_remote(&text);
+                }
+            }
             PaletteAction::OpenAt(path, line, character) => {
                 if self.open_file(&path) {
                     if let Some(doc) = self.active_doc() {
@@ -3121,6 +3226,8 @@ impl ZenithApp {
             (cmd, Key::Plus, Cmd::ZoomIn, true),
             (cmd, Key::Minus, Cmd::ZoomOut, true),
             (cmd, Key::Num0, Cmd::ZoomReset, true),
+            (cmd, Key::R, Cmd::SwitchProject, false),
+            (ca, Key::R, Cmd::SwitchProject, true),
             (cmd, Key::Num1, Cmd::FocusEditor, true),
             (Modifiers::ALT, Key::F1, Cmd::FocusActivityBar, true),
             (cmd, Key::Comma, Cmd::OpenSettings, true),
@@ -3191,6 +3298,10 @@ impl ZenithApp {
         ctx.input_mut(|i| {
             for (m, k, t, in_term) in table {
                 if term && !in_term {
+                    continue;
+                }
+                // Vim's Ctrl+R is redo (the switcher is also on Ctrl+Alt+R).
+                if self.settings.vim_mode && k == Key::R && m == Modifiers::COMMAND {
                     continue;
                 }
                 if i.consume_shortcut(&KeyboardShortcut::new(m, k)) {

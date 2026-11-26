@@ -261,6 +261,17 @@ pub struct Session {
     pub recent_remotes: Vec<String>,
     /// When updates were last checked (Unix seconds).
     pub last_update_check: u64,
+    /// Where each recent project was left (for the project switcher).
+    pub projects: Vec<(PathBuf, ProjectState)>,
+}
+
+/// A project's open files, active tab and carets, restored when switching back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectState {
+    pub open_files: Vec<PathBuf>,
+    pub active: usize,
+    pub cursors: Vec<(PathBuf, usize)>,
 }
 
 impl Session {

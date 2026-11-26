@@ -9,6 +9,10 @@ use crate::theme::Palette as Colors;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaletteAction {
+    /// Switch to a recent project (local folder).
+    SwitchProject(std::path::PathBuf),
+    /// Open a recent remote folder ("host:/path").
+    SwitchRemote(String),
     Command(Cmd),
     PluginCommand(String),
     OpenFile(String),
