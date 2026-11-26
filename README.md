@@ -18,6 +18,7 @@ macOS, Windows va Linux'da ishlaydi.
 | 🌳 **Tree-sitter** | Rust, Python, JavaScript/TypeScript (JSX/TSX), Go, C/C++, JSON, Bash, HTML, CSS uchun sintaksis daraxti asosida aniq ranglash va **sintaktik yig'ish** (folding) — har tahrirda inkremental qayta tahlil (20 ming qatorgacha bo'lgan faylda bir tugma ~5 ms). Boshqa tillar uchun TextMate grammatikalari (syntect). Sozlamalar → Editor → Tree-sitter. |
 | 🧠 **LSP (til serverlari)** | Avtomatik to'ldirish, xatolar va ogohlantirishlar (qizil to'lqinli chiziq), hover hujjatlari, ta'rifga o'tish (`F12` / `Ctrl+bosish`), havolalarni topish (`Shift+F12`), nomni hamma joyda o'zgartirish (`F2`), formatlash (`Shift+Alt+F`, ixtiyoriy saqlashda formatlash), parametr maslahatlari, tezkor tuzatishlar (`Ctrl+.` / 💡), **avtomatik import** (masalan `HashMa` yozib `HashMap`ni tanlasangiz, `use std::collections::HashMap;` o'zi qo'shiladi), **Organize Imports** (`Shift+Alt+O`: import'larni saralash va takrorlarni olib tashlash; til serverisiz ham Rust/Python/JS/TS/Go/Java uchun ishlaydi), *Add All Missing Imports*, fayldagi belgiga o'tish (`Ctrl+T`), butun loyihadagi belgilar (`Ctrl+Shift+T`), **inlay hints** — o'zgaruvchi turlari va parametr nomlari qator ichida. **Semantik ranglash** — til serveri belgining nima ekanini aytadi (parametr, maydon, tur, makros…) va rang shunga qarab tanlanadi. O'rnatilgan bo'lsa avtomatik ishga tushadi: **rust-analyzer**, **pyright**, **typescript-language-server**, **gopls**, **clangd** va boshqalar. |
 | ⎇ **Git** | Gutter'da o'zgarish belgilari (qo'shilgan / o'zgargan / o'chirilgan), Source Control paneli (`Ctrl+Shift+G`): stage/unstage, commit (`Ctrl+Enter`), push/pull, stash, merge konfliktlarini hal qilish, fayl daraxtida rangli holat. **✳ Commit with AI** — agent diff'ni ko'rib, commit'ni o'zi yozadi. |
+| ▶ **Run: loyihani ishga tushirish** | `Ctrl+F5` — loyiha turini o'zi aniqlaydi (Cargo, npm/pnpm/yarn/bun, **Flutter**, **Expo / React Native**, Django/Python, Go, Docker Compose) va alohida terminal tabida ishga tushiradi. Chiqarilgan `localhost` manzillari topiladi; **Web preview** sahifani kod yonida, editor ichida ko'rsatadi (iPhone/Pixel/iPad o'lchamlari bilan). Flutter: qurilma tanlash, **hot reload** (saqlaganda ham), debug. Expo: **Expo Go uchun QR kod**, web versiya preview'da. **Emulator/simulator**larni ishga tushirish va **telefon ekranini editor ichida** ko'rish va boshqarish (adb). [Batafsil ↓](#run-loyihani-ishga-tushirish) |
 | 🌐 **SSH orqali ishlash** | *File → Open Remote Folder (SSH)…* — uzoq serverdagi papkani ochish: fayllar mahalliy nusxada tez tahrirlanadi, saqlash serverga yuklanadi, terminal va AI agentlar serverning o'zida ishlaydi. |
 | 🪟 **Bir nechta oyna** | *File → New Window* (`Ctrl+Shift+N`) — yangi oyna (masalan, ikkinchi monitor uchun); *View: Move Editor into New Window* — joriy faylni yangi oynaga ko'chirish. Asosiy oynaning sessiyasi saqlanadi. |
 | 🗂 **Bir nechta papka** | Bir oynada bir nechta loyiha papkasi (multi-root): Explorer, tezkor ochish va fayllarda qidirish hammasini qamraydi; har bir papka o'z Git repo'si (Source Control'da repo tanlash, gutter/blame/branch) va o'z til serveriga ega; sessiyada saqlanadi. |
@@ -143,6 +144,56 @@ languages = ["python"]
 
 
 ![Inlay hints](docs/inlay-hints.png)
+
+## Run: loyihani ishga tushirish
+
+**Run and Debug** paneli (`Ctrl+Shift+D`) tepasidagi **RUN** bo'limi yoki **Run** menyusi.
+
+- **Avtomatik aniqlash.** Papka (va uning bir pog'ona ichidagi papkalar, masalan `mobile/`, `web/`) qarab chiqiladi:
+  `Cargo.toml` → `cargo run`, `package.json` skriptlari (`dev`, `start`, `serve`…; lock fayliga qarab npm / pnpm / yarn / bun),
+  `pubspec.yaml` → `flutter run`, Expo → `npx expo start`, `manage.py` / `main.py`, `go.mod`, `compose.yaml`.
+- **`.zenith/run.toml`** — o'z buyruqlaringiz (⚙ tugmasi shablonni ochadi):
+  ```toml
+  [[run]]
+  name = "API"
+  command = "uvicorn app:app --reload"
+  cwd = "backend"
+  url = "http://localhost:8000/docs"   # preview uchun (ixtiyoriy)
+  [run.env]
+  DEBUG = "1"
+  ```
+- **▶ Run** (`Ctrl+F5`) — har konfiguratsiya o'z terminal tabida ishlaydi (ranglar, interaktiv kiritish). Panelda: ■ Stop, ↻ Restart,
+  chiqishda topilgan URL'lar (bosing — brauzerda), status qatorida `▶ nomi  http://localhost:5173`.
+- **SSH papkada** buyruq serverda ishlaydi, `localhost` portlari esa avtomatik sizning kompyuteringizga forward qilinadi (`ssh -L`).
+
+### Web preview
+
+URL yonidagi **◧ Preview** (yoki *Run: Open Web Preview…*) — sahifa kod yonidagi panelda, tizimning WebView'ida ochiladi
+(macOS: WKWebView, Windows: WebView2). Manzil qatori, orqaga/oldinga/yangilash, **qurilma o'lchamlari** (iPhone 15, iPhone SE,
+Pixel 8, Galaxy S23, iPad, Laptop — sahifa aynan shu CSS kenglikni ko'radi), *Reload on save*. Linux'da ichki preview uchun
+`cargo build --release --features zenith-app/webview` (kerak: `libwebkit2gtk-4.1-dev`); usiz sahifa brauzerda ochiladi.
+Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod.
+
+### Flutter
+
+- **Qurilma** tanlash: telefonlar, emulatorlar, simulatorlar, desktop, Chrome va **Web server (preview in Zenith)** —
+  ilova kompilyatsiya bo'lgach to'g'ridan-to'g'ri editor ichidagi preview'da ochiladi.
+- **⟳ Hot reload / ↻ Hot restart** tugmalari, *Run: Hot Reload*, va `.dart` faylni **saqlaganda avtomatik hot reload**
+  (Sozlamalar → *Flutter: hot reload on save*).
+- **Debug** (`F5`): Flutter ilovalari debug konfiguratsiyasi sifatida avtomatik topiladi (`flutter debug_adapter`) —
+  breakpoint'lar, qadam-baqadam, o'zgaruvchilar; tanlangan qurilmada ishlaydi, hot reload debug paytida ham ishlaydi.
+
+### Expo / React Native
+
+- `npx expo start` ishga tushgach panelda **QR kod** chiqadi — telefonda **Expo Go** (Android) yoki Kamera (iOS) bilan skanerlang.
+- **Reload / Android / iOS / Web** tugmalari; **Web** — ilovaning web versiyasi editor ichidagi preview'da.
+
+### Emulatorlar, simulatorlar va qurilma ekrani
+
+- *Run → Start Emulator / Simulator…* — Android AVD'lar (`emulator`), iOS simulatorlar (`xcrun simctl`, macOS), Flutter emulatorlari.
+- *Run → Show Device Screen…* (yoki qurilma yonidagi **📱 Screen**) — **telefon/emulator ekrani editor ichida**: bosish = tap,
+  sudrash = swipe, g'ildirak = scroll, ◁ ○ ▢ ⏻ tugmalari, matn yozish. Ishlaydi har qanday Android qurilma bilan (USB orqali
+  ulangan haqiqiy telefon ham) — faqat `adb` kerak. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
 
 ## Testlar
 
@@ -350,6 +401,7 @@ matn obyektlari bilan (`ciw`, `da(`, `ci"`, `yi{`), `dd yy cc x X D C s S r ~ J 
 | Boshqa panelga o'tish | `Ctrl+Alt+\` | `⌃⌥\` |
 | Yon panel | `Ctrl+B` | `⌘B` |
 | Zen rejimi | `Ctrl+Alt+Z` (chiqish: `Esc Esc`) | `⌘⌥Z` |
+| Loyihani ishga tushirish (Run) | `Ctrl+F5` | `⌘F5` |
 | Import'larni tartiblash | `Shift+Alt+O` | `⇧⌥O` |
 | Masshtab | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | `⌘=` / `⌘-` / `⌘0` |
 

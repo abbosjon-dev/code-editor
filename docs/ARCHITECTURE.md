@@ -104,3 +104,8 @@ uchun O(n²) hisob).
 - [x] Sticky scroll (tree-sitter fold diapazonlari yoki chekinish asosida), Zen rejimi
 - [x] Ikki faylni / fayl va clipboard'ni yonma-yon solishtirish
 - [x] Avtomatik import (`additionalTextEdits`, `completionItem/resolve`), Organize Imports (LSP + o'rnatilgan saralash)
+- [x] Run: loyiha turini aniqlash, `run.toml`, terminal tabida ishga tushirish, URL topish, SSH port-forward
+- [x] Web preview (wry: WKWebView / WebView2 / WebKitGTK), qurilma o'lchamlari
+- [x] Flutter: qurilmalar, web-server preview, hot reload (saqlaganda), DAP debug
+- [x] Expo: Expo Go QR kodi, web preview
+- [x] Emulator/simulator ishga tushirish, qurilma ekrani (adb screencap + input; iOS — ko'rish)
