@@ -148,6 +148,10 @@ struct RunSession {
     auto_preview: bool,
     /// Expo app URLs (exp://…) for Expo Go.
     expo_urls: Vec<String>,
+    /// Errors / warnings in its output (shown in Problems).
+    problems: Vec<crate::run_problems::Problem>,
+    /// The output was read after the process ended.
+    final_scan: bool,
     /// The URL whose QR code is shown (to open it on a phone).
     qr: Option<String>,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
@@ -3655,20 +3659,36 @@ impl ZenithApp {
         self.show_sidebar = true;
     }
 
+    /// Language server problems plus those printed by Run sessions.
+    fn all_problems(&self) -> std::collections::BTreeMap<PathBuf, Vec<zenith_lsp::Diagnostic>> {
+        let mut all = self.problems.clone();
+        for r in &self.runs.sessions {
+            for pr in &r.problems {
+                let list = all.entry(pr.path.clone()).or_default();
+                // The language server may already report the same thing.
+                if !list.iter().any(|d| d.range.start.line == pr.line && d.severity == pr.severity) {
+                    list.push(pr.diagnostic(&format!("run: {}", r.config.name)));
+                }
+            }
+        }
+        all
+    }
+
     fn problems_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
         use zenith_lsp::Severity;
-        let count = |s: Severity| self.problems.values().flatten().filter(|d| d.severity == s).count();
+        let problems = self.all_problems();
+        let count = |s: Severity| problems.values().flatten().filter(|d| d.severity == s).count();
         let (e, w) = (count(Severity::Error), count(Severity::Warning));
         Self::section_header(ui, p, "PROBLEMS");
         ui.label(RichText::new(format!("{e} errors, {w} warnings")).small().color(p.text_dim));
         ui.add_space(6.0);
-        if self.problems.is_empty() {
+        if problems.is_empty() {
             ui.label(RichText::new("No problems have been detected.").color(p.text_dim));
             return;
         }
         let mut open: Option<(PathBuf, zenith_lsp::LspPos)> = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (path, diags) in &self.problems {
+            for (path, diags) in &problems {
                 let rel = self.rel_path(path);
                 let (dir, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
                 let (icon, color) = theme::file_icon(name);
@@ -3687,7 +3707,13 @@ impl ZenithApp {
                         _ => ("ℹ", p.accent),
                     };
                     let msg = d.message.lines().next().unwrap_or_default();
-                    let text = format!("{msg}  [{}:{}]", d.range.start.line + 1, d.range.start.character + 1);
+                    let from = d.source.as_deref().filter(|s| s.starts_with("run: ")).map(|s| format!("  ({s})"));
+                    let text = format!(
+                        "{msg}  [{}:{}]{}",
+                        d.range.start.line + 1,
+                        d.range.start.character + 1,
+                        from.unwrap_or_default()
+                    );
                     let r = ui.horizontal(|ui| {
                         ui.add_space(14.0);
                         ui.label(RichText::new(glyph).color(c));
@@ -7051,6 +7077,8 @@ impl ZenithApp {
             let tab = self.runs.sessions[i].tab;
             self.runs.sessions[i].urls.clear();
             self.runs.sessions[i].expo_urls.clear();
+            self.runs.sessions[i].problems.clear();
+            self.runs.sessions[i].final_scan = false;
             self.runs.sessions[i].forwards.clear();
             if let Some(pos) = self.bottom.tabs.iter().position(|t| t.id == tab) {
                 let waker = self.waker.clone();
@@ -7080,6 +7108,8 @@ impl ZenithApp {
             scanned: Instant::now(),
             auto_preview,
             expo_urls: vec![],
+            problems: vec![],
+            final_scan: false,
             qr: None,
             forwards: vec![],
         });
@@ -7157,6 +7187,7 @@ impl ZenithApp {
         let tabs: std::collections::HashSet<u64> = self.bottom.tabs.iter().map(|t| t.id).collect();
         self.runs.sessions.retain(|r| tabs.contains(&r.tab));
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        let ws = self.workspace.clone();
         for r in &mut self.runs.sessions {
             if r.scanned.elapsed() < Duration::from_millis(700) {
                 continue;
@@ -7164,9 +7195,17 @@ impl ZenithApp {
             r.scanned = Instant::now();
             let Some(t) = self.bottom.tabs.iter().find(|t| t.id == r.tab) else { continue };
             let Some(term) = &t.term else { continue };
-            if !term.is_alive() {
+            let alive = term.is_alive();
+            if alive {
+                // (Restarted from the terminal: read it again when it ends.)
+                r.final_scan = false;
+            } else {
                 r.forwards.clear();
-                continue;
+                // Read the output one last time (errors of a failed build).
+                if r.final_scan {
+                    continue;
+                }
+                r.final_scan = true;
             }
             let lines = crate::run::unwrap_lines(&term.logical_lines(), term.size().1 as usize);
             let start = lines.len().saturating_sub(400);
@@ -7175,6 +7214,11 @@ impl ZenithApp {
             let mut found = r.config.url.iter().cloned().collect::<Vec<_>>();
             found.extend(crate::run::find_urls(&lines[start..]));
             r.urls = crate::run::merge_urls(std::mem::take(&mut r.urls), found);
+            if let Some(ws) = &ws {
+                let cwd = if r.config.cwd.is_empty() { ws.clone() } else { ws.join(&r.config.cwd) };
+                let from = lines.len().saturating_sub(1500);
+                r.problems = crate::run_problems::parse(&lines[from..], &cwd);
+            }
             if r.config.kind == crate::run::Kind::Expo {
                 let expo = crate::run::find_expo_urls(&lines[start..]);
                 r.expo_urls = crate::run::merge_urls(std::mem::take(&mut r.expo_urls), expo);
@@ -7184,7 +7228,7 @@ impl ZenithApp {
                     *failed = true;
                 }
             }
-            if let Some(spec) = &remote {
+            if let Some(spec) = remote.as_ref().filter(|_| alive) {
                 for u in &r.urls {
                     let Some(port) = crate::run::port_of(u) else { continue };
                     let local_host = u.contains("localhost") || u.contains("127.0.0.1");
@@ -7419,6 +7463,16 @@ impl ZenithApp {
                             }
                         });
                     });
+                    if !r.problems.is_empty() {
+                        let errs = r.problems.iter().filter(|q| q.severity == zenith_lsp::Severity::Error).count();
+                        let warns = r.problems.len() - errs;
+                        let text = RichText::new(format!("⊗ {errs}  ⚠ {warns}  — show in Problems"))
+                            .small()
+                            .color(if errs > 0 { p.error } else { p.warning });
+                        if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() {
+                            act = Some((i, "problems"));
+                        }
+                    }
                     if alive && !r.config.kind.keys().is_empty() {
                         ui.horizontal_wrapped(|ui| {
                             for (label, k, tip) in r.config.kind.keys() {
@@ -7522,6 +7576,10 @@ impl ZenithApp {
         if let Some((i, a)) = act {
             match a {
                 "show" => self.show_run_output(i),
+                "problems" => {
+                    self.sidebar = SidebarView::Problems;
+                    self.show_sidebar = true;
+                }
                 "stop" => self.stop_run(i),
                 "restart" => {
                     let c = self.runs.sessions[i].config.clone();

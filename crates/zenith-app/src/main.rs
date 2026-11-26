@@ -34,6 +34,7 @@ mod qr;
 mod remote;
 mod review;
 mod run;
+mod run_problems;
 mod sample_plugin;
 mod settings;
 mod settings_ui;
