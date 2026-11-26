@@ -56,7 +56,7 @@ papka; standart: cargo registry manbalari). 29 853 fayl, ~780 MB, 4 yadro, disk 
 | Fayl ichida qidirish (Ctrl+F) | 1 240 ms | **63 ms** |
 | Saqlash | 185 ms | 173 ms |
 
-Qidiruv natijalari 100 000 ta bilan cheklanadi ("100000+"), 100 ms dan uzun kadrlar `RUST_LOG=warn` da logga yoziladi.
+8 MB dan katta fayllar fonda yuklanadi (tabda "Loading…"; eng uzun qator ham o'sha yerda o'lchanadi) — ochishda UI kadri 100 ms dan oshmaydi. Qidiruv natijalari 100 000 ta bilan cheklanadi ("100000+"), 100 ms dan uzun kadrlar `RUST_LOG=warn` da logga yoziladi.
 
 Nima o'zgardi: fayllar parallel o'qiladi (`ignore` parallel walker); har fayl avval butunligicha bayt-regex bilan
 tekshiriladi (mos kelmasa — qatorlarga bo'linmaydi va UTF-8 ga o'girilmaydi); qator raqami faqat topilgan joygacha

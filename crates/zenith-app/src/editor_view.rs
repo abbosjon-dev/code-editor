@@ -186,6 +186,19 @@ pub fn editor_ui(
     pane: usize,
 ) -> Vec<EditorAction> {
     let mut actions = vec![];
+    if doc.loading.is_some() {
+        // A big file on its way: nothing to edit yet.
+        let size = doc.path().and_then(|f| std::fs::metadata(f).ok()).map_or(0, |m| m.len());
+        ui.centered_and_justified(|ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!("Loading {} ({} MB)…", doc.title(), size >> 20)).color(p.text_dim),
+                );
+            });
+        });
+        return actions;
+    }
     doc.sync();
 
     if doc.find.open {

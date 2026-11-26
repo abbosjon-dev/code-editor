@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -90,6 +91,11 @@ pub struct Document {
     /// Explicit line to center on (go-to-line, search result).
     pub reveal_line: Option<usize>,
     pub disk_mtime: Option<SystemTime>,
+    /// A big file still loading in the background (the buffer is empty
+    /// until then and must not be saved).
+    pub loading: Option<Receiver<std::io::Result<(Buffer, usize)>>>,
+    /// Line to show once loading finished.
+    pub goto_after_load: Option<usize>,
     longest_line: (u64, usize),
     longest_dirty: Option<(usize, usize)>,
     longest_full_at: Option<std::time::Instant>,
@@ -161,7 +167,7 @@ pub struct Document {
 
 /// Length in chars of the longest line (without its line break): one pass
 /// over the bytes, counting chars as the bytes that don't continue one.
-fn longest_line_scan(rope: &zenith_core::Rope) -> usize {
+pub fn longest_line_scan(rope: &zenith_core::Rope) -> usize {
     let (mut best, mut cur) = (0usize, 0usize);
     for chunk in rope.chunks() {
         for &b in chunk.as_bytes() {
@@ -187,7 +193,22 @@ impl Document {
     }
 
     pub fn open(id: u64, path: &Path, theme: Arc<Theme>, tab_size: usize) -> std::io::Result<Self> {
-        let mut buffer = Buffer::load(path)?;
+        Ok(Self::from_loaded(id, path, Buffer::load(path)?, theme, tab_size))
+    }
+
+    /// A tab for a big file still loading on another thread (`rx`).
+    /// `rx` brings the buffer and its longest line (measured there too).
+    pub fn loading(id: u64, path: &Path, theme: Arc<Theme>, rx: Receiver<std::io::Result<(Buffer, usize)>>) -> Self {
+        let mut buffer = Buffer::from_str("");
+        buffer.set_path(path.to_path_buf());
+        let syn = highlight::syntax_set().find_syntax_plain_text();
+        let mut doc = Self::from_buffer(id, buffer, HighlightCache::new(syn, theme), String::new());
+        doc.loading = Some(rx);
+        doc
+    }
+
+    /// A document for a buffer loaded from `path`.
+    pub fn from_loaded(id: u64, path: &Path, mut buffer: Buffer, theme: Arc<Theme>, tab_size: usize) -> Self {
         buffer.tab_size = tab_size;
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         let first = buffer.line_text(0);
@@ -199,7 +220,7 @@ impl Document {
         }
         let mut doc = Self::from_buffer(id, buffer, hl, String::new());
         doc.disk_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        Ok(doc)
+        doc
     }
 
     fn from_buffer(id: u64, buffer: Buffer, highlight: HighlightCache, untitled_name: String) -> Self {
@@ -212,6 +233,8 @@ impl Document {
             scroll_to_cursor: false,
             reveal_line: None,
             disk_mtime: None,
+            loading: None,
+            goto_after_load: None,
             longest_line: (u64::MAX, 0),
             longest_dirty: None,
             longest_full_at: None,
@@ -692,6 +715,12 @@ impl Document {
         }
     }
 
+    /// The longest line's length, already measured (e.g. while loading).
+    pub fn set_longest_line(&mut self, n: usize) {
+        self.longest_line = (self.buffer.version(), n);
+        self.longest_full_at = Some(std::time::Instant::now());
+    }
+
     pub fn longest_line_chars(&mut self) -> usize {
         let v = self.buffer.version();
         if self.longest_line.0 == v {
@@ -972,6 +1001,10 @@ impl Document {
     }
 
     pub fn goto_line(&mut self, line: usize) {
+        if self.loading.is_some() {
+            self.goto_after_load = Some(line);
+            return;
+        }
         let line = line.min(self.buffer.len_lines().saturating_sub(1));
         let idx = self.buffer.pos_to_char(zenith_core::Position::new(line, 0));
         self.buffer.clear_extra();

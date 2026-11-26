@@ -703,17 +703,35 @@ impl ZenithApp {
             self.active = i;
             return true;
         }
-        if let Ok(bytes) = std::fs::read(&path) {
-            if bytes.iter().take(8000).any(|b| *b == 0) {
-                self.toast(
-                    format!("{} is a binary file and can't be opened as text", path.display()),
-                    NotifyLevel::Warning,
-                );
-                return false;
-            }
+        // Binary check on the first bytes only.
+        let mut head = [0u8; 8000];
+        let n = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+        if head[..n].contains(&0) {
+            self.toast(
+                format!("{} is a binary file and can't be opened as text", path.display()),
+                NotifyLevel::Warning,
+            );
+            return false;
         }
         let id = self.id();
-        match Document::open(id, &path, self.syntax_theme.clone(), self.settings.tab_size) {
+        // Big files load on a thread; the tab shows "Loading…" meanwhile.
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let opened = if size > LOAD_IN_BACKGROUND {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (p2, waker) = (path.clone(), self.waker.clone());
+            std::thread::spawn(move || {
+                let r = zenith_core::Buffer::load(&p2).map(|b| {
+                    let n = crate::document::longest_line_scan(b.rope());
+                    (b, n)
+                });
+                let _ = tx.send(r);
+                waker();
+            });
+            Ok(Document::loading(id, &path, self.syntax_theme.clone(), rx))
+        } else {
+            Document::open(id, &path, self.syntax_theme.clone(), self.settings.tab_size)
+        };
+        match opened {
             Ok(mut doc) => {
                 if !self.settings.insert_spaces {
                     doc.buffer.use_spaces = false;
@@ -748,6 +766,42 @@ impl ZenithApp {
         }
     }
 
+    /// Finish documents whose file loaded in the background.
+    fn poll_loading(&mut self) {
+        for i in 0..self.docs.len() {
+            let Some(rx) = &self.docs[i].loading else { continue };
+            let Ok(r) = rx.try_recv() else { continue };
+            let Some(path) = self.docs[i].path().map(Path::to_path_buf) else { continue };
+            match r {
+                Ok((buffer, longest)) => {
+                    let (id, goto) = (self.docs[i].id, self.docs[i].goto_after_load);
+                    let mut doc =
+                        Document::from_loaded(id, &path, buffer, self.syntax_theme.clone(), self.settings.tab_size);
+                    doc.set_longest_line(longest);
+                    if !self.settings.insert_spaces {
+                        doc.buffer.use_spaces = false;
+                    }
+                    doc.breakpoints = std::mem::take(&mut self.docs[i].breakpoints);
+                    doc.breakpoints_gen += 1;
+                    if let Some(g) = self.git_for(&path) {
+                        doc.set_git_base(g.head_text(&path));
+                        doc.blame_rx = g.blame_async(&path);
+                    }
+                    if let Some(l) = goto {
+                        doc.goto_line(l);
+                    }
+                    self.docs[i] = doc;
+                }
+                Err(e) => {
+                    self.docs[i].loading = None;
+                    self.toast(format!("Can't open {}: {e}", path.display()), NotifyLevel::Error);
+                    self.close_doc(i, true);
+                    return;
+                }
+            }
+        }
+    }
+
     fn new_file(&mut self) {
         self.untitled += 1;
         let id = self.id();
@@ -761,6 +815,10 @@ impl ZenithApp {
 
     fn save_doc(&mut self, idx: usize, save_as: bool) -> bool {
         let Some(doc) = self.docs.get_mut(idx) else { return false };
+        if doc.loading.is_some() {
+            // Its buffer is still empty: saving would wipe the file.
+            return false;
+        }
         let result = if doc.path().is_none() || save_as {
             let mut dlg = rfd::FileDialog::new().set_file_name(doc.title());
             if let Some(ws) = &self.workspace {
@@ -6769,6 +6827,7 @@ impl ZenithApp {
         if std::env::var_os("ZENITH_TEST_CRASH").is_some() && ctx.cumulative_pass_nr() > 5 {
             panic!("ZENITH_TEST_CRASH was set");
         }
+        self.poll_loading();
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
             self.style_dirty = false;
@@ -6957,6 +7016,9 @@ impl ZenithApp {
         }
     }
 }
+
+/// Files bigger than this load on a background thread.
+const LOAD_IN_BACKGROUND: u64 = 8 << 20;
 
 /// Two modifier sets name the same chord (Ctrl and Cmd are one on Linux/Windows).
 fn same_chord(a: Modifiers, b: Modifiers) -> bool {
