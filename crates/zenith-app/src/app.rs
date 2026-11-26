@@ -135,6 +135,35 @@ enum Dialog {
     },
 }
 
+/// A started run configuration (its output is a bottom terminal tab).
+struct RunSession {
+    config: crate::run::RunConfig,
+    tab: u64,
+    /// Local URLs it printed (dev servers).
+    urls: Vec<String>,
+    scanned: Instant,
+    /// `ssh -L` port forwards for runs on an SSH host (port, process,
+    /// failed: the port is taken on this computer or ssh refused).
+    forwards: Vec<(u16, std::process::Child, bool)>,
+}
+
+impl Drop for RunSession {
+    fn drop(&mut self) {
+        for (_, c, _) in &mut self.forwards {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunState {
+    /// Configurations for the folder, and a run.toml error.
+    configs: Option<(Vec<crate::run::RunConfig>, Option<String>)>,
+    selected: usize,
+    sessions: Vec<RunSession>,
+}
+
 #[derive(Default)]
 struct TermPanel {
     tabs: Vec<TermTab>,
@@ -258,6 +287,7 @@ pub struct ZenithApp {
     last_esc: f64,
     show_ai: bool,
     bottom: TermPanel,
+    runs: RunState,
     ai: TermPanel,
     focus_terminal: Option<u64>,
     terminal_focused: bool,
@@ -389,6 +419,7 @@ impl ZenithApp {
             show_terminal: false,
             show_ai: false,
             bottom: TermPanel::default(),
+            runs: RunState::default(),
             ai: TermPanel::default(),
             focus_terminal: None,
             terminal_focused: false,
@@ -1286,7 +1317,13 @@ impl ZenithApp {
         self.session.show_ai = self.show_ai;
         self.session.split = self.split;
         self.session.extra_roots = self.extra_trees.iter().map(|t| t.root.clone()).collect();
-        self.session.terminals = self.bottom.tabs.iter().filter(|t| t.is_alive()).map(|t| t.spec.cwd.clone()).collect();
+        self.session.terminals = self
+            .bottom
+            .tabs
+            .iter()
+            .filter(|t| t.is_alive() && matches!(t.kind, TermKind::Shell))
+            .map(|t| t.spec.cwd.clone())
+            .collect();
         self.session.agents = self
             .ai
             .tabs
@@ -1294,7 +1331,7 @@ impl ZenithApp {
             .filter(|t| t.is_alive())
             .filter_map(|t| match &t.kind {
                 TermKind::Agent { id, .. } => Some(id.clone()),
-                TermKind::Shell => None,
+                TermKind::Shell | TermKind::Run { .. } => None,
             })
             .collect();
         self.session.save();
@@ -1792,6 +1829,69 @@ impl ZenithApp {
                     let line = doc.buffer.cursor_pos().line;
                     doc.toggle_breakpoint(line);
                 }
+            }
+            Cmd::RunProject => {
+                let (configs, err) = self.run_configurations();
+                if let Some(e) = err {
+                    self.toast(e, NotifyLevel::Error);
+                }
+                match configs.get(self.runs.selected.min(configs.len().saturating_sub(1))) {
+                    Some(c) => self.start_run(c.clone()),
+                    None => {
+                        self.toast("Nothing to run was detected — add one in .zenith/run.toml", NotifyLevel::Info);
+                        self.sidebar = SidebarView::Debug;
+                        self.show_sidebar = true;
+                    }
+                }
+            }
+            Cmd::ShowRunOutput => {
+                if let Some(i) = self.current_run() {
+                    self.show_run_output(i);
+                }
+            }
+            Cmd::StopRun => match self.current_run() {
+                Some(i) => self.stop_run(i),
+                None => self.toast("Nothing is running", NotifyLevel::Info),
+            },
+            Cmd::RestartRun => match self.runs.sessions.last().map(|r| r.config.clone()) {
+                Some(c) => self.start_run(c),
+                None => self.run(ctx, Cmd::RunProject),
+            },
+            Cmd::HotReload => match self.current_run() {
+                Some(i) => match self.runs.sessions[i].config.kind.keys().first() {
+                    Some((_, k, _)) => self.run_send(i, k),
+                    None => {
+                        let c = self.runs.sessions[i].config.clone();
+                        self.start_run(c);
+                    }
+                },
+                None => self.toast("Nothing is running", NotifyLevel::Info),
+            },
+            Cmd::SelectRunConfig => {
+                let (configs, _) = self.run_configurations();
+                let items = configs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| Item {
+                        label: format!("{} {}", c.kind.icon(), c.name),
+                        detail: c.command.clone(),
+                        action: PaletteAction::RunConfig(i),
+                    })
+                    .collect();
+                self.palette.show(Mode::Pick, items, "Run…");
+            }
+            Cmd::OpenRunConfig => {
+                let Some(ws) = self.workspace.clone() else {
+                    self.toast("Open a folder first", NotifyLevel::Info);
+                    return;
+                };
+                let p = crate::run::config_path(&ws);
+                if !p.exists() {
+                    let _ = std::fs::create_dir_all(p.parent().unwrap_or(&ws));
+                    let _ = std::fs::write(&p, crate::run::TEMPLATE);
+                }
+                self.runs.configs = None;
+                self.open_file(&p);
             }
             Cmd::OpenLaunchConfig => {
                 let Some(ws) = self.workspace.clone() else {
@@ -2391,6 +2491,13 @@ impl ZenithApp {
             PaletteAction::OpenFile(rel) => {
                 if let Some(ws) = self.workspace.clone() {
                     self.open_file(&ws.join(rel));
+                }
+            }
+            PaletteAction::RunConfig(i) => {
+                let (configs, _) = self.run_configurations();
+                if let Some(c) = configs.get(i).cloned() {
+                    self.runs.selected = i;
+                    self.start_run(c);
                 }
             }
             PaletteAction::CompareWith(rel) => {
@@ -3519,6 +3626,7 @@ impl ZenithApp {
             (Modifiers::NONE, Key::F2, Cmd::RenameSymbol, false),
             (cs, Key::F5, Cmd::DebugRestart, true),
             (Modifiers::SHIFT, Key::F5, Cmd::DebugStop, true),
+            (cmd, Key::F5, Cmd::RunProject, true),
             (Modifiers::NONE, Key::F5, Cmd::DebugStart, true),
             (Modifiers::NONE, Key::F6, Cmd::DebugPause, true),
             (Modifiers::NONE, Key::F9, Cmd::ToggleBreakpoint, false),
@@ -3729,6 +3837,19 @@ impl ZenithApp {
                 item(ui, Cmd::GotoLine, "Go to Line…");
                 item(ui, Cmd::NextTab, "Next Editor");
                 item(ui, Cmd::PrevTab, "Previous Editor");
+            });
+            ui.menu_button("Run", |ui| {
+                ui.set_min_width(260.0);
+                item(ui, Cmd::RunProject, "Run");
+                item(ui, Cmd::SelectRunConfig, "Run Configuration…");
+                item(ui, Cmd::RestartRun, "Restart");
+                item(ui, Cmd::HotReload, "Hot Reload");
+                item(ui, Cmd::StopRun, "Stop");
+                item(ui, Cmd::ShowRunOutput, "Show Output");
+                ui.separator();
+                item(ui, Cmd::DebugStart, "Start Debugging");
+                item(ui, Cmd::OpenRunConfig, "Open run.toml");
+                item(ui, Cmd::OpenLaunchConfig, "Open launch.toml");
             });
             ui.menu_button("Terminal", |ui| {
                 ui.set_min_width(240.0);
@@ -5336,6 +5457,14 @@ impl ZenithApp {
                     cmd = Some(Cmd::GitSwitchBranch);
                 }
             }
+            if let Some(i) = self.current_run() {
+                let r = &self.runs.sessions[i];
+                let url = r.urls.first().map(|u| format!("  {u}")).unwrap_or_default();
+                let text = RichText::new(format!("▶ {}{url}", r.config.name)).size(12.0).color(p.success);
+                if ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_text("Running — show output").clicked() {
+                    cmd = Some(Cmd::ShowRunOutput);
+                }
+            }
             if self.settings.vim_mode {
                 if let Some(doc) = self.docs.get(self.active) {
                     let v = &doc.vim;
@@ -6736,6 +6865,310 @@ impl ZenithApp {
     // Debugging
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Run
+    // ------------------------------------------------------------------
+
+    fn run_configurations(&mut self) -> (Vec<crate::run::RunConfig>, Option<String>) {
+        if self.runs.configs.is_none() {
+            let loaded = match &self.workspace {
+                Some(ws) => crate::run::load(ws),
+                None => (vec![], None),
+            };
+            self.runs.configs = Some(loaded);
+        }
+        self.runs.configs.clone().unwrap_or_default()
+    }
+
+    /// Start a configuration in its own terminal tab (restarting it if it
+    /// is already running).
+    fn start_run(&mut self, cfg: crate::run::RunConfig) {
+        let Some(ws) = self.workspace.clone() else {
+            self.toast("Open a folder first", NotifyLevel::Info);
+            return;
+        };
+        // Unsaved edits would not be in the build.
+        for i in 0..self.docs.len() {
+            if self.docs[i].buffer.is_dirty() && self.docs[i].path().is_some() {
+                self.save_doc(i, false);
+            }
+        }
+        if let Some(i) = self.runs.sessions.iter().position(|r| r.config == cfg) {
+            let tab = self.runs.sessions[i].tab;
+            self.runs.sessions[i].urls.clear();
+            self.runs.sessions[i].forwards.clear();
+            if let Some(pos) = self.bottom.tabs.iter().position(|t| t.id == tab) {
+                let waker = self.waker.clone();
+                let t = &mut self.bottom.tabs[pos];
+                if let Some(term) = &mut t.term {
+                    term.kill();
+                }
+                t.restart(waker);
+                self.bottom.active = pos;
+                self.show_terminal = true;
+                return;
+            }
+            self.runs.sessions.remove(i);
+        }
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        let spec = crate::run::spec(&cfg, &ws, remote.as_ref(), "");
+        let id = self.id();
+        let kind = TermKind::Run { name: cfg.name.clone(), icon: cfg.kind.icon().to_string() };
+        let tab = TermTab::spawn(id, kind, spec, self.waker.clone());
+        self.bottom.tabs.push(tab);
+        self.bottom.active = self.bottom.tabs.len() - 1;
+        self.show_terminal = true;
+        self.runs.sessions.push(RunSession {
+            config: cfg,
+            tab: id,
+            urls: vec![],
+            scanned: Instant::now(),
+            forwards: vec![],
+        });
+    }
+
+    fn run_session_alive(&self, i: usize) -> bool {
+        let tab = self.runs.sessions[i].tab;
+        self.bottom.tabs.iter().any(|t| t.id == tab && t.is_alive())
+    }
+
+    fn stop_run(&mut self, i: usize) {
+        let tab = self.runs.sessions[i].tab;
+        if let Some(t) = self.bottom.tabs.iter_mut().find(|t| t.id == tab) {
+            if let Some(term) = &mut t.term {
+                term.kill();
+            }
+        }
+        self.runs.sessions[i].forwards.clear();
+    }
+
+    /// Send keys (e.g. `r` for a Flutter hot reload) to a running session.
+    fn run_send(&mut self, i: usize, keys: &str) {
+        let tab = self.runs.sessions[i].tab;
+        if let Some(t) = self.bottom.tabs.iter_mut().find(|t| t.id == tab) {
+            t.write(keys.as_bytes());
+        }
+    }
+
+    fn show_run_output(&mut self, i: usize) {
+        let tab = self.runs.sessions[i].tab;
+        if let Some(pos) = self.bottom.tabs.iter().position(|t| t.id == tab) {
+            self.bottom.active = pos;
+            self.show_terminal = true;
+        }
+    }
+
+    /// The most recently started session that is still running.
+    fn current_run(&self) -> Option<usize> {
+        (0..self.runs.sessions.len()).rev().find(|&i| self.run_session_alive(i))
+    }
+
+    /// Forget closed tabs; look for URLs in the output; forward their ports
+    /// from the SSH host.
+    fn poll_runs(&mut self) {
+        let tabs: std::collections::HashSet<u64> = self.bottom.tabs.iter().map(|t| t.id).collect();
+        self.runs.sessions.retain(|r| tabs.contains(&r.tab));
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        for r in &mut self.runs.sessions {
+            if r.scanned.elapsed() < Duration::from_millis(700) {
+                continue;
+            }
+            r.scanned = Instant::now();
+            let Some(t) = self.bottom.tabs.iter().find(|t| t.id == r.tab) else { continue };
+            let Some(term) = &t.term else { continue };
+            if !term.is_alive() {
+                r.forwards.clear();
+                continue;
+            }
+            let (lines, _) = term.history();
+            let start = lines.len().saturating_sub(400);
+            let mut urls = r.config.url.iter().cloned().collect::<Vec<_>>();
+            for u in crate::run::find_urls(&lines[start..]) {
+                if !urls.contains(&u) {
+                    urls.push(u);
+                }
+            }
+            r.urls = urls;
+            for (_, c, failed) in &mut r.forwards {
+                if !*failed && c.try_wait().ok().flatten().is_some() {
+                    *failed = true;
+                }
+            }
+            if let Some(spec) = &remote {
+                for u in &r.urls {
+                    let Some(port) = crate::run::port_of(u) else { continue };
+                    let local_host = u.contains("localhost") || u.contains("127.0.0.1");
+                    if !local_host || r.forwards.iter().any(|(p, ..)| *p == port) {
+                        continue;
+                    }
+                    let args = crate::remote::forward_args(spec, port);
+                    match std::process::Command::new("ssh")
+                        .args(&args)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(c) => r.forwards.push((port, c, false)),
+                        Err(e) => log::warn!("port forward {port}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Run section at the top of Run and Debug.
+    fn run_section_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let (configs, err) = self.run_configurations();
+        let mut cmd: Option<Cmd> = None;
+        let mut start: Option<crate::run::RunConfig> = None;
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, "RUN");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("⚙").on_hover_text("Open .zenith/run.toml").clicked() {
+                    cmd = Some(Cmd::OpenRunConfig);
+                }
+                if ui.small_button("⟳").on_hover_text("Detect again").clicked() {
+                    self.runs.configs = None;
+                }
+            });
+        });
+        if let Some(e) = &err {
+            ui.label(RichText::new(e).color(p.error).small());
+        }
+        if configs.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Nothing to run was detected (Cargo, npm, Flutter, Expo, Python, Go, Compose). \
+                     Add a command in .zenith/run.toml.",
+                )
+                .color(p.text_dim)
+                .small(),
+            );
+        } else {
+            let sel = self.runs.selected.min(configs.len() - 1);
+            let mut new_sel = sel;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("▶ Run").color(Color32::WHITE)).fill(p.success))
+                    .on_hover_text("Ctrl+F5")
+                    .clicked()
+                {
+                    start = Some(configs[sel].clone());
+                }
+                egui::ComboBox::from_id_salt("run-config")
+                    .width(ui.available_width() - 4.0)
+                    .selected_text(format!("{} {}", configs[sel].kind.icon(), configs[sel].name))
+                    .show_ui(ui, |ui| {
+                        for (i, c) in configs.iter().enumerate() {
+                            ui.selectable_value(&mut new_sel, i, format!("{} {}", c.kind.icon(), c.name))
+                                .on_hover_text(&c.command);
+                        }
+                    });
+            });
+            self.runs.selected = new_sel;
+        }
+        // Running and finished sessions.
+        let mut act: Option<(usize, &str)> = None;
+        let mut keys: Option<(usize, &'static str)> = None;
+        for i in 0..self.runs.sessions.len() {
+            let alive = self.run_session_alive(i);
+            let r = &self.runs.sessions[i];
+            ui.add_space(4.0);
+            egui::Frame::new().fill(p.bg_elevated).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 4)).show(
+                ui,
+                |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (dot, color) = if alive { ("●", p.success) } else { ("○", p.text_faint) };
+                        ui.label(RichText::new(dot).color(color));
+                        let name =
+                            ui.add(egui::Label::new(RichText::new(&r.config.name).color(p.text)).sense(Sense::click()));
+                        if name.on_hover_text("Show output").clicked() {
+                            act = Some((i, "show"));
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("✕").on_hover_text("Close").clicked() {
+                                act = Some((i, "close"));
+                            }
+                            if alive {
+                                if ui.small_button("■").on_hover_text("Stop").clicked() {
+                                    act = Some((i, "stop"));
+                                }
+                                if ui.small_button("↻").on_hover_text("Restart").clicked() {
+                                    act = Some((i, "restart"));
+                                }
+                            } else if ui.small_button("▶").on_hover_text("Run again").clicked() {
+                                act = Some((i, "restart"));
+                            }
+                        });
+                    });
+                    if alive && !r.config.kind.keys().is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, k, tip) in r.config.kind.keys() {
+                                if ui.small_button(*label).on_hover_text(*tip).clicked() {
+                                    keys = Some((i, k));
+                                }
+                            }
+                        });
+                    }
+                    for u in &r.urls {
+                        ui.horizontal(|ui| {
+                            let fwd = r.forwards.iter().find(|(p, ..)| Some(*p) == crate::run::port_of(u)).map(|f| f.2);
+                            let label = RichText::new(format!("🌐 {u}")).color(p.accent).small();
+                            if ui
+                                .add(egui::Label::new(label).sense(Sense::click()))
+                                .on_hover_text("Open in browser")
+                                .clicked()
+                            {
+                                open_url(u);
+                            }
+                            match fwd {
+                                Some(false) => {
+                                    ui.label(RichText::new("⇄ forwarded").small().color(p.text_faint))
+                                        .on_hover_text("This port on the SSH host is forwarded to your computer");
+                                }
+                                Some(true) => {
+                                    ui.label(RichText::new("⚠ not forwarded").small().color(p.warning)).on_hover_text(
+                                        "The port is already in use on this computer (or ssh refused the forward)",
+                                    );
+                                }
+                                None => {}
+                            }
+                        });
+                    }
+                },
+            );
+        }
+        if let Some((i, k)) = keys {
+            self.run_send(i, k);
+        }
+        if let Some((i, a)) = act {
+            match a {
+                "show" => self.show_run_output(i),
+                "stop" => self.stop_run(i),
+                "restart" => {
+                    let c = self.runs.sessions[i].config.clone();
+                    self.start_run(c);
+                }
+                _ => {
+                    let tab = self.runs.sessions[i].tab;
+                    self.runs.sessions.remove(i);
+                    self.bottom.tabs.retain(|t| t.id != tab);
+                    self.bottom.active = self.bottom.active.min(self.bottom.tabs.len().saturating_sub(1));
+                }
+            }
+        }
+        if let Some(c) = start {
+            self.start_run(c);
+        }
+        if let Some(c) = cmd {
+            self.run(&ui.ctx().clone(), c);
+        }
+        ui.add_space(6.0);
+        ui.separator();
+    }
+
     fn debug_configurations(&mut self) -> (Vec<zenith_dap::LaunchConfig>, Option<String>) {
         if self.debug_configs.is_none() {
             let active = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
@@ -6855,10 +7288,11 @@ impl ZenithApp {
 
     fn debug_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
         use crate::debug::State;
+        self.run_section_ui(ui, p);
         let (configs, err) = self.debug_configurations();
         let mut cmd: Option<Cmd> = None;
         ui.horizontal(|ui| {
-            Self::section_header(ui, p, "RUN AND DEBUG");
+            Self::section_header(ui, p, "DEBUG");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("⚙").on_hover_text("Open .zenith/launch.toml").clicked() {
                     cmd = Some(Cmd::OpenLaunchConfig);
@@ -7337,6 +7771,7 @@ impl ZenithApp {
         }
         self.poll_loading();
         self.refresh_outline();
+        self.poll_runs();
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
             self.style_dirty = false;

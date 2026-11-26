@@ -29,6 +29,7 @@ mod outline;
 mod palette;
 mod remote;
 mod review;
+mod run;
 mod sample_plugin;
 mod settings;
 mod settings_ui;

@@ -13,7 +13,16 @@ use crate::theme::{Palette, MONO_BOLD};
 #[derive(Clone, Debug, PartialEq)]
 pub enum TermKind {
     Shell,
-    Agent { id: String, name: String, icon: String },
+    Agent {
+        id: String,
+        name: String,
+        icon: String,
+    },
+    /// A run configuration (Run and Debug › Run).
+    Run {
+        name: String,
+        icon: String,
+    },
 }
 
 pub struct TermTab {
@@ -100,7 +109,7 @@ impl TermTab {
 
     pub fn title(&self) -> String {
         match &self.kind {
-            TermKind::Agent { name, icon, .. } => format!("{icon} {name}"),
+            TermKind::Agent { name, icon, .. } | TermKind::Run { name, icon } => format!("{icon} {name}"),
             TermKind::Shell => {
                 let t = self.term.as_ref().map(|t| t.title.clone()).unwrap_or_default();
                 let short = t.rsplit(['/', '\\']).next().unwrap_or("").trim().to_string();

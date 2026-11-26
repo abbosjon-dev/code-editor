@@ -20,6 +20,8 @@ pub enum PaletteAction {
     OpenFile(String),
     /// Compare the active file with this one (same path form as `OpenFile`).
     CompareWith(String),
+    /// Start run configuration `i`.
+    RunConfig(usize),
     GotoLine(usize),
     SetTheme(String),
     SetSyntaxTheme(String),

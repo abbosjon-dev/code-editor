@@ -50,7 +50,7 @@ impl RemoteSpec {
     }
 
     /// The folder as a shell word (`~/x` stays expandable).
-    fn qpath(&self) -> String {
+    pub fn qpath(&self) -> String {
         match self.path.strip_prefix("~/") {
             Some(rest) => format!("\"$HOME\"/{}", sh_quote(rest)),
             None if self.path == "~" => "\"$HOME\"".into(),
@@ -433,6 +433,22 @@ pub fn probe(spec: &RemoteSpec, cache: &Path, programs: &[String]) -> Result<Hos
 }
 
 /// `ssh` arguments for an interactive shell in the folder.
+/// `ssh` arguments that forward `port` on this computer to the same port
+/// on the host (no shared connection: the forward lives as long as the
+/// process).
+pub fn forward_args(spec: &RemoteSpec, port: u16) -> Vec<String> {
+    let mut a: Vec<String> = ["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ControlPath=none"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    a.extend(["-L".into(), format!("{port}:localhost:{port}")]);
+    if let Some(p) = spec.port {
+        a.extend(["-p".into(), p.to_string()]);
+    }
+    a.push(spec.host.clone());
+    a
+}
+
 pub fn shell_args(spec: &RemoteSpec) -> Vec<String> {
     let mut a = ssh_args(spec, true);
     a.push(format!("cd {} && exec \"${{SHELL:-sh}}\" -l", spec.qpath()));
