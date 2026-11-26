@@ -273,6 +273,44 @@ impl Terminal {
         self.scroll_offset
     }
 
+    /// Every line, oldest scrollback first, then the screen; and how many
+    /// lines of scrollback there are (line `i` is at the top of the view at
+    /// scroll offset `scrollback - i`).
+    pub fn history(&self) -> (Vec<String>, usize) {
+        let mut p = self.lock();
+        let cur = p.screen().scrollback();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let max = p.screen().scrollback();
+        let (rows, cols) = p.screen().size();
+        let rows = rows as usize;
+        let mut lines = vec![String::new(); max + rows];
+        let mut off = max;
+        loop {
+            p.screen_mut().set_scrollback(off);
+            for (r, t) in p.screen().rows(0, cols).enumerate() {
+                if let Some(l) = lines.get_mut(max - off + r) {
+                    *l = t;
+                }
+            }
+            if off == 0 {
+                break;
+            }
+            off = off.saturating_sub(rows);
+        }
+        p.screen_mut().set_scrollback(cur);
+        (lines, max)
+    }
+
+    /// Scroll so that history line `line` (see [`history`](Self::history))
+    /// is shown, a few lines from the top.
+    pub fn reveal(&mut self, line: usize, scrollback: usize) {
+        let (rows, _) = self.size();
+        let top = line.saturating_sub(rows as usize / 3);
+        let off = scrollback.saturating_sub(top);
+        self.scroll_offset = 0;
+        self.scroll(off as isize);
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }

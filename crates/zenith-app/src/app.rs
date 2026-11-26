@@ -5434,7 +5434,7 @@ impl ZenithApp {
                     Some(TermEvent::OpenLink(link)) => open_link = Some((link, tab.spec.cwd.clone())),
                     None => {}
                 }
-                focused |= ui.memory(|m| m.has_focus(ui.make_persistent_id(("zenith-term", tab.id))));
+                focused |= ui.memory(|m| m.has_focus(egui::Id::new(("zenith-term", tab.id))));
                 if want_focus {
                     self.focus_terminal = None;
                 }

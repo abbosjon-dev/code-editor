@@ -26,11 +26,62 @@ pub struct TermTab {
     scroll_accum: f32,
     /// Set when started with resume arguments: (start time, args to drop if it exits right away).
     pub resumed: Option<(std::time::Instant, Vec<String>)>,
+    /// Ctrl+F: search in the output and scrollback.
+    find: Option<TermFind>,
+}
+
+/// The terminal's search bar.
+#[derive(Default)]
+struct TermFind {
+    query: String,
+    /// Searched for this query (redone when it changes).
+    searched: Option<String>,
+    /// Matches: (history line, first column, length in chars).
+    matches: Vec<(usize, usize, usize)>,
+    current: usize,
+    /// Scrollback lines when searched (history line numbering).
+    scrollback: usize,
+    focus: bool,
+}
+
+/// Case-insensitive matches of `q` in `lines`: (line, column, length), in chars.
+fn find_in_lines(lines: &[String], q: &str) -> Vec<(usize, usize, usize)> {
+    let q: Vec<char> = q.to_lowercase().chars().collect();
+    if q.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        let hay: Vec<char> = l.chars().flat_map(char::to_lowercase).collect();
+        if hay.len() != l.chars().count() {
+            continue; // lowercasing changed the length: skip rather than misplace
+        }
+        let mut c = 0;
+        while c + q.len() <= hay.len() {
+            if hay[c..c + q.len()] == q[..] {
+                out.push((i, c, q.len()));
+                c += q.len();
+            } else {
+                c += 1;
+            }
+        }
+    }
+    out
 }
 
 impl TermTab {
     pub fn spawn(id: u64, kind: TermKind, spec: CommandSpec, waker: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let mut t = Self { id, term: None, kind, spec, error: None, selection: None, scroll_accum: 0.0, resumed: None };
+        let mut t = Self {
+            id,
+            term: None,
+            kind,
+            spec,
+            error: None,
+            selection: None,
+            scroll_accum: 0.0,
+            resumed: None,
+            find: None,
+        };
         t.restart(waker);
         t
     }
@@ -101,7 +152,7 @@ pub fn terminal_ui(
     focus_request: bool,
 ) -> Option<TermEvent> {
     let rect = ui.available_rect_before_wrap();
-    let id = ui.make_persistent_id(("zenith-term", tab.id));
+    let id = egui::Id::new(("zenith-term", tab.id));
     let resp = ui.interact(rect, id, Sense::click_and_drag()).on_hover_cursor(CursorIcon::Text);
     ui.allocate_rect(rect, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -236,6 +287,11 @@ pub fn terminal_ui(
                         event = Some(TermEvent::Restart);
                         continue;
                     }
+                    // Ctrl+F: search the output (as in VS Code; the shell doesn't get it).
+                    if modifiers.command && !modifiers.shift && !modifiers.alt && key == Key::F {
+                        tab.find = Some(TermFind { focus: true, ..Default::default() });
+                        continue;
+                    }
                     // Ctrl+Shift+C / Cmd+C copy is handled via Event::Copy.
                     if modifiers.ctrl && modifiers.shift && key == Key::C {
                         if let Some(text) = selected_text(term, tab.selection) {
@@ -360,6 +416,93 @@ pub fn terminal_ui(
     let alive = term.is_alive();
     drop(parser);
 
+    // --- search bar and its matches ---
+    let mut refocus = false;
+    if let Some(f) = &mut tab.find {
+        let mut close = false;
+        let mut step: isize = 0;
+        let bar = egui::Area::new(id.with("find"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.right_top() + egui::vec2(-330.0, 6.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).fill(p.bg_elevated).inner_margin(6).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut f.query).hint_text("Find in terminal").desired_width(170.0),
+                        );
+                        if f.focus {
+                            r.request_focus();
+                            f.focus = false;
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            step = if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
+                            r.request_focus();
+                        }
+                        if r.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                            close = true;
+                        }
+                        let n = f.matches.len();
+                        ui.label(count_label(n, f.current, &f.query).color(if n == 0 && !f.query.is_empty() {
+                            p.error
+                        } else {
+                            p.text_dim
+                        }));
+                        if ui.small_button("↑").on_hover_text("Previous (Shift+Enter)").clicked() {
+                            step = -1;
+                        }
+                        if ui.small_button("↓").on_hover_text("Next (Enter)").clicked() {
+                            step = 1;
+                        }
+                        if ui.small_button("✕").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        let _ = bar;
+        // Search again when the query changed (newest match first).
+        if f.searched.as_deref() != Some(f.query.as_str()) {
+            let (lines, sb) = term.history();
+            f.matches = find_in_lines(&lines, &f.query);
+            f.scrollback = sb;
+            f.searched = Some(f.query.clone());
+            f.current = f.matches.len().saturating_sub(1);
+            if let Some(&(l, _, _)) = f.matches.get(f.current) {
+                term.reveal(l, sb);
+            }
+        }
+        if step != 0 && !f.matches.is_empty() {
+            let n = f.matches.len() as isize;
+            f.current = ((f.current as isize + step).rem_euclid(n)) as usize;
+            term.reveal(f.matches[f.current].0, f.scrollback);
+        }
+        // Highlight the matches on screen.
+        let top = f.scrollback.saturating_sub(term.scroll_offset());
+        for (k, &(l, c, len)) in f.matches.iter().enumerate() {
+            if l < top || l >= top + rows as usize {
+                continue;
+            }
+            let r = Rect::from_min_size(
+                egui::pos2(inner.min.x + c as f32 * char_w, inner.min.y + (l - top) as f32 * line_h),
+                egui::vec2(len as f32 * char_w, line_h),
+            );
+            if k == f.current {
+                painter.rect_filled(r, 2.0, p.find_match);
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5_f32, p.warning), StrokeKind::Outside);
+            } else {
+                painter.rect_filled(r, 2.0, p.find_match.gamma_multiply(0.5));
+            }
+        }
+        if close {
+            refocus = true;
+        }
+    }
+    if refocus {
+        tab.find = None;
+        term.scroll_to_bottom();
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+
     if offset > 0 {
         painter.text(
             rect.right_top() + egui::vec2(-12.0, 8.0),
@@ -462,4 +605,28 @@ fn key_bytes(key: Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec<u8>> 
         Key::F12 => csi("24~"),
         _ => return None,
     })
+}
+
+/// The "3 of 12" label of the search bar.
+fn count_label(n: usize, current: usize, query: &str) -> egui::RichText {
+    let t = if query.is_empty() {
+        String::new()
+    } else if n == 0 {
+        "No results".into()
+    } else {
+        format!("{} of {n}", current + 1)
+    };
+    egui::RichText::new(t).small()
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    #[test]
+    fn finds_case_insensitively() {
+        let lines = vec!["error: boom".to_string(), "ok".into(), "Error again, ERROR".into()];
+        assert_eq!(find_in_lines(&lines, "error"), [(0, 0, 5), (2, 0, 5), (2, 13, 5)]);
+        assert!(find_in_lines(&lines, "").is_empty());
+    }
 }
