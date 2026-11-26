@@ -154,6 +154,8 @@ struct RunSession {
     final_scan: bool,
     /// Flutter device it runs on.
     device: Option<String>,
+    /// When it was (re)started: build outputs newer than this are its own.
+    started: std::time::SystemTime,
     /// The URL whose QR code is shown (to open it on a phone).
     qr: Option<String>,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
@@ -7122,6 +7124,7 @@ impl ZenithApp {
                 t.restart(waker);
                 self.runs.sessions[i].auto_preview = auto_preview;
                 self.runs.sessions[i].device = device;
+                self.runs.sessions[i].started = std::time::SystemTime::now();
                 self.bottom.active = pos;
                 self.show_terminal = true;
                 return;
@@ -7144,6 +7147,7 @@ impl ZenithApp {
             problems: vec![],
             final_scan: false,
             device: device.clone(),
+            started: std::time::SystemTime::now(),
             qr: None,
             forwards: vec![],
         });
@@ -7393,6 +7397,30 @@ impl ZenithApp {
         }
     }
 
+    /// `adb install -r` an APK (path relative to `cwd` in the workspace) on
+    /// the picked Android device, or the first one connected.
+    fn install_apk(&mut self, cwd: String, apk: PathBuf) {
+        let found = self.runs.found.clone().unwrap_or_default();
+        let android: Vec<&crate::devices::Device> = found.devices.iter().filter(|d| d.platform == "android").collect();
+        let Some(dev) = android.iter().find(|d| self.runs.devices.contains(&d.id)).or(android.first()) else {
+            self.toast("No Android device or emulator is connected (adb devices)", NotifyLevel::Warning);
+            return;
+        };
+        let name = apk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let path = apk.to_string_lossy().replace('\\', "/");
+        let c = crate::run::RunConfig {
+            name: format!("Install {name} → {}", dev.name),
+            command: format!(
+                "adb -s {} install -r {}",
+                crate::remote::sh_quote(&dev.id),
+                crate::remote::sh_quote(&path)
+            ),
+            cwd,
+            ..Default::default()
+        };
+        self.start_run_on(c, None);
+    }
+
     fn show_device_screen(&mut self, ctx: &egui::Context, target: crate::mirror::Target, name: String) {
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
         self.mirror = Some(crate::mirror::Mirror::start(target, name, remote, ctx.clone()));
@@ -7418,6 +7446,8 @@ impl ZenithApp {
         let (configs, err) = self.run_configurations();
         let mut cmd: Option<Cmd> = None;
         let mut start: Option<crate::run::RunConfig> = None;
+        // (label, command, per device)
+        let mut build: Option<(String, String, bool)> = None;
         ui.horizontal(|ui| {
             Self::section_header(ui, p, "RUN");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -7464,6 +7494,46 @@ impl ZenithApp {
             });
             self.runs.selected = new_sel;
             let kind = configs[new_sel].kind;
+            if let Some(ws) = self.workspace.clone() {
+                let cfg = &configs[new_sel];
+                let tasks = crate::run::build_tasks(cfg, &ws);
+                let dir = if cfg.cwd.is_empty() { ws.clone() } else { ws.join(&cfg.cwd) };
+                if !tasks.is_empty() || kind == crate::run::Kind::Flutter {
+                    ui.horizontal(|ui| {
+                        ui.menu_button(RichText::new("🔨 Build").small(), |ui| {
+                            ui.set_min_width(260.0);
+                            for (label, command) in &tasks {
+                                if ui.button(label).on_hover_text(command).clicked() {
+                                    build = Some((label.clone(), command.clone(), false));
+                                    ui.close_menu();
+                                }
+                            }
+                            if kind == crate::run::Kind::Flutter {
+                                ui.separator();
+                                if ui
+                                    .button("Install on the picked device(s)")
+                                    .on_hover_text("flutter install -d … (builds first if needed)")
+                                    .clicked()
+                                {
+                                    build = Some(("Install".into(), "flutter install".into(), true));
+                                    ui.close_menu();
+                                }
+                            }
+                            if crate::run::missing_android_signing(kind, &dir) {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new("⚠ Android release builds are signed with the debug key")
+                                        .small()
+                                        .color(p.warning),
+                                );
+                                if ui.small_button("How to set up android/key.properties ↗").clicked() {
+                                    open_url("https://docs.flutter.dev/deployment/android#sign-the-app");
+                                }
+                            }
+                        });
+                    });
+                }
+            }
             if matches!(kind, crate::run::Kind::Flutter | crate::run::Kind::Expo) {
                 self.devices_ui(ui, p, kind == crate::run::Kind::Flutter);
             }
@@ -7471,6 +7541,7 @@ impl ZenithApp {
         // Running and finished sessions.
         let mut preview_url: Option<String> = None;
         let mut qr_toggle: Option<(usize, Option<String>)> = None;
+        let mut install_apk: Option<(String, PathBuf)> = None;
         let mut act: Option<(usize, &str)> = None;
         let mut keys: Option<(usize, &'static str)> = None;
         for i in 0..self.runs.sessions.len() {
@@ -7505,6 +7576,48 @@ impl ZenithApp {
                             }
                         });
                     });
+                    if r.config.build && !alive {
+                        let dir = self.workspace.as_ref().map(|w| {
+                            if r.config.cwd.is_empty() {
+                                w.clone()
+                            } else {
+                                w.join(&r.config.cwd)
+                            }
+                        });
+                        let made: Vec<PathBuf> = dir
+                            .as_ref()
+                            .map(|d| crate::run::artifacts(r.config.kind, d))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|a| std::fs::metadata(a).and_then(|m| m.modified()).is_ok_and(|t| t >= r.started))
+                            .collect();
+                        for a in made {
+                            ui.horizontal(|ui| {
+                                // A web build is its folder, not its index.html.
+                                let marker = a.file_name().is_some_and(|n| n == "index.html" || n == "BUILD_ID");
+                                let shown = if marker { a.parent().unwrap_or(&a) } else { a.as_path() };
+                                let rel = dir.as_ref().and_then(|d| shown.strip_prefix(d).ok()).unwrap_or(shown);
+                                let mut name = rel.to_string_lossy().replace('\\', "/");
+                                if shown.is_dir() {
+                                    name.push('/');
+                                }
+                                let size = std::fs::metadata(shown).ok().filter(|m| m.is_file() && m.len() > 100_000);
+                                let size =
+                                    size.map(|m| format!("  {:.1} MB", m.len() as f64 / 1e6)).unwrap_or_default();
+                                ui.label(RichText::new(format!("📦 {name}{size}")).small().color(p.success));
+                                if self.remote.is_none() && ui.small_button("Reveal").clicked() {
+                                    open_in_os(a.parent().unwrap_or(&a));
+                                }
+                                if a.extension().is_some_and(|e| e == "apk")
+                                    && ui.small_button("Install on device").on_hover_text("adb install -r").clicked()
+                                {
+                                    let rel =
+                                        dir.as_ref().and_then(|d| a.strip_prefix(d).ok()).unwrap_or(&a).to_path_buf();
+                                    install_apk = Some((r.config.cwd.clone(), rel));
+                                }
+                            });
+                        }
+                    }
                     if !r.problems.is_empty() {
                         let errs = r.problems.iter().filter(|q| q.severity == zenith_lsp::Severity::Error).count();
                         let warns = r.problems.len() - errs;
@@ -7597,6 +7710,9 @@ impl ZenithApp {
                 },
             );
         }
+        if let Some((cwd, apk)) = install_apk {
+            self.install_apk(cwd, apk);
+        }
         if let Some((i, q)) = qr_toggle {
             self.runs.sessions[i].qr = q;
         }
@@ -7637,6 +7753,23 @@ impl ZenithApp {
         }
         if let Some(c) = start {
             self.start_run(c);
+        }
+        if let Some((label, command, per_device)) = build {
+            let sel = &configs[self.runs.selected.min(configs.len() - 1)];
+            let c = crate::run::RunConfig {
+                name: if per_device { label.clone() } else { format!("Build: {label}") },
+                command,
+                cwd: sel.cwd.clone(),
+                env: sel.env.clone(),
+                kind: sel.kind,
+                build: true,
+                ..Default::default()
+            };
+            if per_device {
+                self.start_run(c);
+            } else {
+                self.start_run_on(c, None);
+            }
         }
         if let Some(c) = cmd {
             self.run(&ui.ctx().clone(), c);

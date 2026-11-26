@@ -83,6 +83,8 @@ pub struct RunConfig {
     pub url: Option<String>,
     /// From run.toml (not detected).
     pub from_file: bool,
+    /// A build (its card lists what it produced).
+    pub build: bool,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +148,7 @@ pub fn load(root: &Path) -> (Vec<RunConfig>, Option<String>) {
                     env: e.env.into_iter().collect(),
                     url: e.url,
                     from_file: true,
+                    build: false,
                 }));
             }
             Err(e) => err = Some(format!(".zenith/run.toml: {e}")),
@@ -281,6 +284,97 @@ fn detect_in(dir: &Path, rel: &str) -> Vec<RunConfig> {
         out.push(mk(at("Docker Compose: up"), "docker compose up", Kind::Compose));
     }
     out
+}
+
+/// Build commands for a configuration's project (label, command line).
+pub fn build_tasks(cfg: &RunConfig, root: &Path) -> Vec<(String, String)> {
+    let dir = if cfg.cwd.is_empty() { root.to_path_buf() } else { root.join(&cfg.cwd) };
+    let t = |l: &str, c: &str| (l.to_string(), c.to_string());
+    let mut out = vec![];
+    match cfg.kind {
+        Kind::Flutter => {
+            out.push(t("Android APK (release)", "flutter build apk --release"));
+            out.push(t("Android App Bundle (Play Store)", "flutter build appbundle --release"));
+            if cfg!(target_os = "macos") {
+                out.push(t("iOS IPA (App Store)", "flutter build ipa --release"));
+                out.push(t("macOS app", "flutter build macos --release"));
+            }
+            out.push(t("Web", "flutter build web --release"));
+            if cfg!(target_os = "linux") {
+                out.push(t("Linux app", "flutter build linux --release"));
+            }
+            if cfg!(windows) {
+                out.push(t("Windows app", "flutter build windows --release"));
+            }
+        }
+        Kind::Expo => {
+            out.push(t("EAS cloud build: Android", "npx --yes eas-cli build --platform android"));
+            out.push(t("EAS cloud build: iOS", "npx --yes eas-cli build --platform ios"));
+            out.push(t("Build and run on Android (local)", "npx expo run:android"));
+            if cfg!(target_os = "macos") {
+                out.push(t("Build and run on iOS (local)", "npx expo run:ios"));
+            }
+            out.push(t("Export web", "npx expo export --platform web"));
+        }
+        Kind::Cargo => out.push(t("Release build", "cargo build --release")),
+        Kind::Go => out.push(t("Build", "go build ./...")),
+        Kind::Compose => out.push(t("Build images", "docker compose build")),
+        Kind::Node => {
+            let pkg: serde_json::Value = std::fs::read_to_string(dir.join("package.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if pkg["scripts"].get("build").is_some() {
+                let pm = cfg
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .filter(|p| ["pnpm", "yarn", "bun"].contains(p))
+                    .unwrap_or("npm");
+                out.push(t("Production build", &format!("{pm} run build")));
+            }
+        }
+        Kind::Python | Kind::Custom => {}
+    }
+    out
+}
+
+/// Files a build of this kind produces (relative to its folder), newest
+/// builds first: APKs, bundles, IPAs, web output, release binaries.
+pub fn artifacts(kind: Kind, dir: &Path) -> Vec<PathBuf> {
+    let rel: &[&str] = match kind {
+        Kind::Flutter => &[
+            "build/app/outputs/flutter-apk/app-release.apk",
+            "build/app/outputs/flutter-apk/app-debug.apk",
+            "build/app/outputs/bundle/release/app-release.aab",
+            "build/web/index.html",
+            "build/linux/x64/release/bundle",
+            "build/macos/Build/Products/Release",
+            "build/windows/x64/runner/Release",
+        ],
+        Kind::Expo => &[
+            "dist/index.html",
+            "android/app/build/outputs/apk/debug/app-debug.apk",
+            "android/app/build/outputs/apk/release/app-release.apk",
+        ],
+        Kind::Node => &["dist/index.html", "build/index.html", ".next/BUILD_ID", "out/index.html"],
+        Kind::Cargo => &["target/release"],
+        _ => &[],
+    };
+    let mut out: Vec<PathBuf> = rel.iter().map(|r| dir.join(r)).filter(|p| p.exists()).collect();
+    // IPAs carry the app's name: look in their folder.
+    if kind == Kind::Flutter {
+        if let Ok(rd) = std::fs::read_dir(dir.join("build/ios/ipa")) {
+            out.extend(rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "ipa")));
+        }
+    }
+    out
+}
+
+/// A Flutter app's Android release signing isn't set up (release builds
+/// then use the debug key, which stores reject).
+pub fn missing_android_signing(kind: Kind, dir: &Path) -> bool {
+    kind == Kind::Flutter && dir.join("android").is_dir() && !dir.join("android/key.properties").exists()
 }
 
 /// What to spawn in the terminal: the command line in a login shell (so
@@ -444,6 +538,12 @@ mod tests {
             ]
         );
         assert_eq!(cfgs[1].kind, Kind::Flutter);
+        let b = build_tasks(&cfgs[1], &root);
+        assert!(b.iter().any(|(_, c)| c == "flutter build apk --release"));
+        assert_eq!(build_tasks(&cfgs[2], &root), [("Production build".to_string(), "pnpm run build".to_string())]);
+        std::fs::create_dir_all(root.join("app/build/app/outputs/flutter-apk")).unwrap();
+        std::fs::write(root.join("app/build/app/outputs/flutter-apk/app-release.apk"), "").unwrap();
+        assert_eq!(artifacts(Kind::Flutter, &root.join("app")).len(), 1);
         // run.toml comes first; `detect = false` hides the rest.
         std::fs::create_dir_all(root.join(".zenith")).unwrap();
         std::fs::write(
