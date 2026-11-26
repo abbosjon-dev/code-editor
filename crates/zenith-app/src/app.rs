@@ -279,6 +279,7 @@ pub struct ZenithApp {
     md_cache: egui_commonmark::CommonMarkCache,
     show_settings: bool,
     settings_section: crate::settings_ui::Section,
+    settings_search: String,
     /// Split editor: two panes side by side.
     split: bool,
     /// Doc index shown in the pane that does NOT have focus.
@@ -392,6 +393,7 @@ impl ZenithApp {
             md_cache: Default::default(),
             show_settings: false,
             settings_section: Default::default(),
+            settings_search: String::new(),
             split: false,
             other: 0,
             focus_right: false,
@@ -5993,6 +5995,7 @@ impl ZenithApp {
             &self.agents,
             &p,
             &self.ws_overrides,
+            &mut self.settings_search,
         );
         let mut c = c;
         if c.style {
