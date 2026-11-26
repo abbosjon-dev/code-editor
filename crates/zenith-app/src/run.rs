@@ -286,7 +286,12 @@ fn detect_in(dir: &Path, rel: &str) -> Vec<RunConfig> {
 /// What to spawn in the terminal: the command line in a login shell (so
 /// PATH has flutter, node…), locally or on the SSH host.
 pub fn spec(cfg: &RunConfig, root: &Path, remote: Option<&RemoteSpec>, extra_args: &str) -> CommandSpec {
-    let line = if extra_args.is_empty() { cfg.command.clone() } else { format!("{} {extra_args}", cfg.command) };
+    let mut line = if extra_args.is_empty() { cfg.command.clone() } else { format!("{} {extra_args}", cfg.command) };
+    // Flutter wraps its messages (and URLs) at the terminal width itself;
+    // without that the terminal wraps them and they can be found whole.
+    if let Some(rest) = line.strip_prefix("flutter ").filter(|r| !r.contains("-wrap")) {
+        line = format!("flutter --no-wrap {rest}");
+    }
     let mut spec = match remote {
         Some(r) => {
             let env: String = cfg.env.iter().map(|(k, v)| format!("{k}={} ", crate::remote::sh_quote(v))).collect();
@@ -339,6 +344,39 @@ pub fn find_urls(lines: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Join lines that a program broke itself at the terminal width (Flutter
+/// wraps its messages): a full-width line followed by one that doesn't start
+/// with a space continues it.
+pub fn unwrap_lines(lines: &[String], cols: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut join = false;
+    for l in lines {
+        let t = l.trim_end();
+        match out.last_mut() {
+            Some(last) if join && !t.starts_with(char::is_whitespace) && !t.is_empty() => last.push_str(t),
+            _ => out.push(t.to_string()),
+        }
+        // Too narrow a pane breaks everything: don't guess there.
+        join = cols >= 30 && t.chars().count() >= cols.saturating_sub(1);
+    }
+    out
+}
+
+/// Add newly found URLs to the known ones: a cut-off copy of a known URL
+/// is ignored, a longer one replaces its prefix.
+pub fn merge_urls(mut known: Vec<String>, found: Vec<String>) -> Vec<String> {
+    for u in found {
+        if known.iter().any(|k| k.starts_with(&u)) {
+            continue;
+        }
+        match known.iter_mut().find(|k| u.starts_with(k.as_str())) {
+            Some(k) => *k = u,
+            None => known.push(u),
+        }
+    }
+    known
 }
 
 /// The port of a local URL.
@@ -417,6 +455,18 @@ mod tests {
         ];
         assert_eq!(find_urls(&out), ["http://localhost:5173/", "http://192.168.1.5:5173/", "http://localhost:8000"]);
         assert_eq!(port_of("http://localhost:5173/"), Some(5173));
+        let wrapped = [
+            "The DevTools debugger is available at: http://127".to_string(),
+            ".0.0.1:4233/x/".to_string(),
+            "  next".to_string(),
+        ];
+        let joined = unwrap_lines(&wrapped, 50);
+        assert_eq!(joined, ["The DevTools debugger is available at: http://127.0.0.1:4233/x/", "  next"]);
+        assert_eq!(unwrap_lines(&wrapped[..2], 20).len(), 2); // narrow: no guessing
+        let known = merge_urls(vec![], vec!["http://localhost:41705".into(), "http://127.0.0.1:4".into()]);
+        let known = merge_urls(known, vec!["http://127.0.0.1:4233/x".into(), "http://localhost:4".into()]);
+        assert_eq!(known, ["http://localhost:41705", "http://127.0.0.1:4233/x"]);
+        assert_eq!(find_urls(&joined), ["http://127.0.0.1:4233/x/"]);
         assert_eq!(port_of("http://localhost/x"), Some(80));
     }
 }

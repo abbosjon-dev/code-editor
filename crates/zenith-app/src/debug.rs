@@ -291,6 +291,16 @@ impl Debugger {
         self.build_rx = None;
     }
 
+    /// Flutter / Dart: apply code changes to the running app (`hotReload`)
+    /// or restart it (`hotRestart`); false when not debugging one.
+    pub fn hot_reload(&mut self, restart: bool) -> bool {
+        let flutter = self.session.as_ref().is_some_and(|s| matches!(s.config.adapter.as_str(), "flutter" | "dart"));
+        if flutter {
+            self.request(if restart { "hotRestart" } else { "hotReload" }, json!({}), Req::Other);
+        }
+        flutter
+    }
+
     pub fn continue_(&mut self) {
         if let Some(t) = self.stopped_thread() {
             self.request("continue", json!({ "threadId": t }), Req::Other);
@@ -794,6 +804,31 @@ pub fn configurations(root: Option<&Path>, active_file: Option<&Path>) -> (Vec<L
             program: root.and_then(|r| f.strip_prefix(r).ok()).unwrap_or(f).to_string_lossy().into_owned(),
             ..Default::default()
         });
+    }
+    // Flutter apps (also one folder down, e.g. `mobile/`).
+    if let Some(root) = root {
+        let dirs = std::iter::once(String::new()).chain(
+            std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| !n.starts_with('.')),
+        );
+        for d in dirs {
+            let pubspec = std::fs::read_to_string(root.join(&d).join("pubspec.yaml")).unwrap_or_default();
+            if pubspec.contains("flutter:") && root.join(&d).join("lib/main.dart").exists() {
+                let at = |p: &str| if d.is_empty() { p.to_string() } else { format!("{d}/{p}") };
+                out.push(LaunchConfig {
+                    name: if d.is_empty() { "Flutter".into() } else { format!("Flutter: {d}") },
+                    adapter: "flutter".into(),
+                    program: at("lib/main.dart"),
+                    cwd: d.clone(),
+                    ..Default::default()
+                });
+            }
+        }
     }
     if let Some(root) = root.filter(|r| r.join("Cargo.toml").exists()) {
         let native = if zenith_dap::adapter("gdb").and_then(|a| a.resolve()).is_some() { "gdb" } else { "lldb" };

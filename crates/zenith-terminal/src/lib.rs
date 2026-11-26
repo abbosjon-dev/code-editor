@@ -301,6 +301,12 @@ impl Terminal {
         (lines, max)
     }
 
+    /// The output as logical lines: rows the terminal wrapped because they
+    /// were too long are joined again (for finding URLs in narrow panes).
+    pub fn logical_lines(&self) -> Vec<String> {
+        logical_lines(&mut self.lock())
+    }
+
     /// Scroll so that history line `line` (see [`history`](Self::history))
     /// is shown, a few lines from the top.
     pub fn reveal(&mut self, line: usize, scrollback: usize) {
@@ -401,6 +407,41 @@ pub enum Link {
 }
 
 /// Find the link under char column `col` of a terminal row.
+/// See [`Terminal::logical_lines`].
+pub fn logical_lines(p: &mut Parser) -> Vec<String> {
+    let cur = p.screen().scrollback();
+    p.screen_mut().set_scrollback(usize::MAX);
+    let max = p.screen().scrollback();
+    let (rows, cols) = p.screen().size();
+    let mut out: Vec<String> = vec![];
+    let mut joining = false;
+    // Oldest first: one screen at a time from the top of the scrollback.
+    let mut off = max;
+    let mut seen = 0usize;
+    loop {
+        p.screen_mut().set_scrollback(off);
+        let first_new = (max - off).max(seen) - (max - off);
+        for (r, t) in p.screen().rows(0, cols).enumerate().skip(first_new) {
+            let wrapped = p.screen().row_wrapped(r as u16);
+            if joining {
+                if let Some(last) = out.last_mut() {
+                    last.push_str(&t);
+                }
+            } else {
+                out.push(t);
+            }
+            joining = wrapped;
+        }
+        seen = max - off + rows as usize;
+        if off == 0 {
+            break;
+        }
+        off = off.saturating_sub(rows as usize);
+    }
+    p.screen_mut().set_scrollback(cur);
+    out
+}
+
 pub fn link_at(row: &str, col: usize) -> Option<Link> {
     let chars: Vec<char> = row.chars().collect();
     if col >= chars.len() || chars[col].is_whitespace() {
@@ -450,6 +491,19 @@ pub fn link_at(row: &str, col: usize) -> Option<Link> {
 #[cfg(test)]
 mod link_tests {
     use super::*;
+
+    #[test]
+    fn joins_wrapped_rows() {
+        let mut p = vt100::Parser::new_with_callbacks(4, 20, 100, Callbacks::default());
+        for i in 0..6 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        p.process(b"served at http://localhost:35617/ ok\r\nnext\r\n");
+        let lines = logical_lines(&mut p);
+        assert!(lines.iter().any(|l| l.trim_end() == "served at http://localhost:35617/ ok"), "{lines:?}");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("line ")).count(), 6);
+        assert!(lines.iter().any(|l| l.trim_end() == "next"));
+    }
 
     #[test]
     fn finds_links() {

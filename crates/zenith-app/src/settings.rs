@@ -22,6 +22,8 @@ pub struct Settings {
     pub show_minimap: bool,
     /// Keep the headers of the scopes being read at the top of the editor.
     pub sticky_scroll: bool,
+    /// Hot reload running Flutter apps when a .dart file is saved.
+    pub flutter_hot_reload_on_save: bool,
     /// Soft-wrap long lines to the window width.
     pub word_wrap: bool,
     /// Show problem messages at the end of their line.
@@ -81,6 +83,7 @@ impl Default for Settings {
             show_indent_guides: true,
             show_minimap: true,
             sticky_scroll: true,
+            flutter_hot_reload_on_save: true,
             word_wrap: false,
             inline_diagnostics: true,
             inline_blame: true,

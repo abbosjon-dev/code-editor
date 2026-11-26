@@ -238,6 +238,18 @@ pub const ADAPTERS: &[Adapter] = &[
         install_hint: "Install LLDB (it ships lldb-dap; on macOS: xcrun lldb-dap)",
     },
     Adapter {
+        id: "flutter",
+        name: "Flutter",
+        commands: &[("flutter", &["debug_adapter"])],
+        install_hint: "Install the Flutter SDK (flutter.dev) and put flutter on PATH",
+    },
+    Adapter {
+        id: "dart",
+        name: "Dart",
+        commands: &[("dart", &["debug_adapter"])],
+        install_hint: "Install the Dart SDK (dart.dev) and put dart on PATH",
+    },
+    Adapter {
         id: "debugpy",
         name: "Python (debugpy)",
         commands: &[("python3", &["-m", "debugpy.adapter"]), ("python", &["-m", "debugpy.adapter"])],
@@ -315,6 +327,11 @@ pub fn launch_arguments(cfg: &LaunchConfig, root: &Path) -> Value {
         "debugpy" => json!({
             "type": "python", "request": "launch", "program": program, "args": cfg.args, "cwd": cwd,
             "console": "internalConsole", "justMyCode": true, "stopOnEntry": cfg.stop_on_entry,
+        }),
+        // Flutter / Dart: `toolArgs` go to `flutter run` (e.g. ["-d", "emulator-5554"]).
+        "flutter" | "dart" => json!({
+            "program": if cfg.program.is_empty() { resolve_path(root, "lib/main.dart") } else { program },
+            "args": cfg.args, "cwd": cwd,
         }),
         _ => json!({ "program": program, "args": cfg.args, "cwd": cwd, "stopOnEntry": cfg.stop_on_entry }),
     };

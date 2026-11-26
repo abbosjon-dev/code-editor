@@ -9,6 +9,7 @@ mod compare;
 mod conflicts;
 mod crash;
 mod debug;
+mod devices;
 mod diff_view;
 mod document;
 mod editor_view;

@@ -144,6 +144,8 @@ struct RunSession {
     /// Local URLs it printed (dev servers).
     urls: Vec<String>,
     scanned: Instant,
+    /// Open the first URL in the preview when it appears (Flutter web-server).
+    auto_preview: bool,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
     /// failed: the port is taken on this computer or ssh refused).
     forwards: Vec<(u16, std::process::Child, bool)>,
@@ -164,6 +166,13 @@ struct RunState {
     configs: Option<(Vec<crate::run::RunConfig>, Option<String>)>,
     selected: usize,
     sessions: Vec<RunSession>,
+    /// Devices / emulators found, and a scan in progress.
+    found: Option<crate::devices::Found>,
+    scanning: Option<std::sync::mpsc::Receiver<crate::devices::Found>>,
+    /// Device to run Flutter apps on (id); `None` = Flutter's choice.
+    device: Option<String>,
+    /// Look for devices again then (an emulator is booting).
+    rescan_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1081,6 +1090,21 @@ impl ZenithApp {
                 if let Some(pv) = self.preview.as_mut().filter(|p| p.reload_on_save) {
                     pv.reload();
                 }
+                // Flutter: hot reload running apps when Dart code is saved.
+                // (In a debug session the adapter does it; else the Run tabs.)
+                if self.settings.flutter_hot_reload_on_save
+                    && path.as_ref().is_some_and(|p| p.extension().is_some_and(|e| e == "dart"))
+                    && !self.debugger.hot_reload(false)
+                {
+                    let running: Vec<usize> = (0..self.runs.sessions.len())
+                        .filter(|&i| {
+                            self.runs.sessions[i].config.kind == crate::run::Kind::Flutter && self.run_session_alive(i)
+                        })
+                        .collect();
+                    for i in running {
+                        self.run_send(i, "r");
+                    }
+                }
                 if let Some(p) = &path {
                     if let Some(parent) = p.parent() {
                         for t in self.tree.iter_mut().chain(self.extra_trees.iter_mut()) {
@@ -1878,6 +1902,7 @@ impl ZenithApp {
                 Some(c) => self.start_run(c),
                 None => self.run(ctx, Cmd::RunProject),
             },
+            Cmd::HotReload if self.debugger.hot_reload(false) => {}
             Cmd::HotReload => match self.current_run() {
                 Some(i) => match self.runs.sessions[i].config.kind.keys().first() {
                     Some((_, k, _)) => self.run_send(i, k),
@@ -6924,6 +6949,12 @@ impl ZenithApp {
                 self.save_doc(i, false);
             }
         }
+        // Flutter: the device picked in the Run panel.
+        let device = self.runs.device.clone().filter(|_| cfg.kind == crate::run::Kind::Flutter);
+        let extra = device.as_ref().map(|d| format!("-d {}", crate::remote::sh_quote(d))).unwrap_or_default();
+        let auto_preview = device.as_deref() == Some("web-server");
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        let spec = crate::run::spec(&cfg, &ws, remote.as_ref(), &extra);
         if let Some(i) = self.runs.sessions.iter().position(|r| r.config == cfg) {
             let tab = self.runs.sessions[i].tab;
             self.runs.sessions[i].urls.clear();
@@ -6934,15 +6965,15 @@ impl ZenithApp {
                 if let Some(term) = &mut t.term {
                     term.kill();
                 }
+                t.spec = spec;
                 t.restart(waker);
+                self.runs.sessions[i].auto_preview = auto_preview;
                 self.bottom.active = pos;
                 self.show_terminal = true;
                 return;
             }
             self.runs.sessions.remove(i);
         }
-        let remote = self.remote.as_ref().map(|r| r.spec.clone());
-        let spec = crate::run::spec(&cfg, &ws, remote.as_ref(), "");
         let id = self.id();
         let kind = TermKind::Run { name: cfg.name.clone(), icon: cfg.kind.icon().to_string() };
         let tab = TermTab::spawn(id, kind, spec, self.waker.clone());
@@ -6954,6 +6985,7 @@ impl ZenithApp {
             tab: id,
             urls: vec![],
             scanned: Instant::now(),
+            auto_preview,
             forwards: vec![],
         });
     }
@@ -6997,6 +7029,33 @@ impl ZenithApp {
     /// Forget closed tabs; look for URLs in the output; forward their ports
     /// from the SSH host.
     fn poll_runs(&mut self) {
+        if self.runs.rescan_at.is_some_and(|t| Instant::now() >= t) && self.runs.scanning.is_none() {
+            self.runs.rescan_at = None;
+            let flutter = self.runs.found.as_ref().is_some_and(|f| f.tools.contains(&"flutter"));
+            self.scan_devices(flutter);
+        }
+        if let Some(found) = self.runs.scanning.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.runs.scanning = None;
+            // Keep the chosen device if it is still there.
+            if self.runs.device.as_ref().is_some_and(|d| d != "web-server" && !found.devices.iter().any(|x| &x.id == d))
+            {
+                self.runs.device = None;
+            }
+            self.runs.found = Some(found);
+        }
+        let ready: Vec<String> = self
+            .runs
+            .sessions
+            .iter_mut()
+            .filter(|r| r.auto_preview && !r.urls.is_empty())
+            .map(|r| {
+                r.auto_preview = false;
+                r.urls[0].clone()
+            })
+            .collect();
+        for u in ready {
+            self.open_preview(&u);
+        }
         let tabs: std::collections::HashSet<u64> = self.bottom.tabs.iter().map(|t| t.id).collect();
         self.runs.sessions.retain(|r| tabs.contains(&r.tab));
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
@@ -7011,15 +7070,13 @@ impl ZenithApp {
                 r.forwards.clear();
                 continue;
             }
-            let (lines, _) = term.history();
+            let lines = crate::run::unwrap_lines(&term.logical_lines(), term.size().1 as usize);
             let start = lines.len().saturating_sub(400);
-            let mut urls = r.config.url.iter().cloned().collect::<Vec<_>>();
-            for u in crate::run::find_urls(&lines[start..]) {
-                if !urls.contains(&u) {
-                    urls.push(u);
-                }
-            }
-            r.urls = urls;
+            // Found URLs stay: a narrower pane cuts old output short (the
+            // terminal doesn't reflow), which would lose or truncate them.
+            let mut found = r.config.url.iter().cloned().collect::<Vec<_>>();
+            found.extend(crate::run::find_urls(&lines[start..]));
+            r.urls = crate::run::merge_urls(std::mem::take(&mut r.urls), found);
             for (_, c, failed) in &mut r.forwards {
                 if !*failed && c.try_wait().ok().flatten().is_some() {
                     *failed = true;
@@ -7058,6 +7115,88 @@ impl ZenithApp {
             Some(p) => p.load(url),
             None => self.preview = Some(crate::preview::Preview::new(url)),
         }
+    }
+
+    fn scan_devices(&mut self, flutter: bool) {
+        let Some(ws) = self.workspace.clone() else { return };
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.runs.scanning = Some(crate::devices::scan(remote, ws, flutter));
+    }
+
+    /// Device picker (Flutter) and emulators / simulators to start.
+    fn devices_ui(&mut self, ui: &mut egui::Ui, p: &Palette, flutter: bool) {
+        if self.runs.found.is_none() && self.runs.scanning.is_none() {
+            self.scan_devices(flutter);
+        }
+        let found = self.runs.found.clone().unwrap_or_default();
+        let mut launch: Option<crate::devices::Emulator> = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Device").small().color(p.text_dim));
+            if flutter {
+                let mut all = found.devices.clone();
+                all.push(crate::devices::web_server());
+                let current = self
+                    .runs
+                    .device
+                    .as_ref()
+                    .and_then(|id| all.iter().find(|d| &d.id == id))
+                    .map(|d| d.label())
+                    .unwrap_or_else(|| "Automatic".into());
+                egui::ComboBox::from_id_salt("run-device")
+                    .width(ui.available_width() - 30.0)
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.runs.device, None, "Automatic");
+                        for d in &all {
+                            ui.selectable_value(&mut self.runs.device, Some(d.id.clone()), d.label());
+                        }
+                    });
+            } else {
+                let n = found.devices.len();
+                ui.label(RichText::new(format!("{n} connected")).small().color(p.text_faint));
+            }
+            if self.runs.scanning.is_some() {
+                ui.spinner();
+            } else if ui.small_button("⟳").on_hover_text("Look for devices again").clicked() {
+                self.scan_devices(flutter);
+            }
+        });
+        if !found.emulators.is_empty() {
+            ui.menu_button(RichText::new("▶ Start an emulator / simulator…").small(), |ui| {
+                for e in &found.emulators {
+                    let icon = if e.platform == "ios" { "◆" } else { "▲" };
+                    let state = if e.booted { "  (running)" } else { "" };
+                    if ui.button(format!("{icon} {}{state}", e.name)).clicked() {
+                        launch = Some(e.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+        } else if self.runs.scanning.is_none() && !found.tools.iter().any(|t| *t == "emulator" || *t == "simctl") {
+            ui.label(
+                RichText::new("No emulators found (Android SDK emulator / Xcode simulators).")
+                    .small()
+                    .color(p.text_faint),
+            );
+        }
+        if let Some(e) = launch {
+            self.launch_emulator(&e, &found.tools);
+        }
+    }
+
+    /// Start an emulator / simulator in the background, then look for
+    /// devices again once it has had time to boot.
+    fn launch_emulator(&mut self, e: &crate::devices::Emulator, tools: &[&'static str]) {
+        let Some(ws) = self.workspace.clone() else { return };
+        let line = crate::devices::launch_command(e, tools);
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.toast(format!("Starting {}…", e.name), NotifyLevel::Info);
+        std::thread::spawn(move || {
+            if let Err(err) = crate::devices::capture(remote.as_ref(), &ws, &line) {
+                log::warn!("{line}: {err}");
+            }
+        });
+        self.runs.rescan_at = Some(Instant::now() + Duration::from_secs(12));
     }
 
     /// The Run section at the top of Run and Debug.
@@ -7110,6 +7249,10 @@ impl ZenithApp {
                     });
             });
             self.runs.selected = new_sel;
+            let kind = configs[new_sel].kind;
+            if matches!(kind, crate::run::Kind::Flutter | crate::run::Kind::Expo) {
+                self.devices_ui(ui, p, kind == crate::run::Kind::Flutter);
+            }
         }
         // Running and finished sessions.
         let mut preview_url: Option<String> = None;
@@ -7159,7 +7302,12 @@ impl ZenithApp {
                     for u in &r.urls {
                         ui.horizontal(|ui| {
                             let fwd = r.forwards.iter().find(|(p, ..)| Some(*p) == crate::run::port_of(u)).map(|f| f.2);
-                            let label = RichText::new(format!("🌐 {u}")).color(p.accent).small();
+                            let shown = if u.chars().count() > 44 {
+                                format!("{}…", u.chars().take(43).collect::<String>())
+                            } else {
+                                u.clone()
+                            };
+                            let label = RichText::new(format!("🌐 {shown}")).color(p.accent).small();
                             if ui
                                 .add(egui::Label::new(label).sense(Sense::click()))
                                 .on_hover_text("Open in browser")
@@ -7242,12 +7390,18 @@ impl ZenithApp {
         if let Some(e) = err {
             self.toast(e, NotifyLevel::Error);
         }
-        let Some(cfg) = configs.get(self.debugger.selected.min(configs.len().saturating_sub(1))).cloned() else {
+        let Some(mut cfg) = configs.get(self.debugger.selected.min(configs.len().saturating_sub(1))).cloned() else {
             self.toast("No debug configuration found: add one to .zenith/launch.toml", NotifyLevel::Warning);
             self.sidebar = SidebarView::Debug;
             self.show_sidebar = true;
             return;
         };
+        // Flutter: run on the device picked in the Run panel.
+        if cfg.adapter == "flutter" && !cfg.extra.contains_key("toolArgs") {
+            if let Some(d) = self.runs.device.clone() {
+                cfg.extra.insert("toolArgs".into(), toml::Value::Array(vec!["-d".into(), d.into()]));
+            }
+        }
         // Unsaved changes would not match what runs.
         let dirty: Vec<usize> = (0..self.docs.len()).filter(|&i| self.docs[i].buffer.is_dirty()).collect();
         for i in dirty {

@@ -265,6 +265,12 @@ fn editor(ui: &mut egui::Ui, s: &mut Settings, c: &mut Changes) {
     c.any |= checkbox(ui, &mut s.auto_save, "Auto save", "Save modified files every few seconds");
     c.any |= checkbox(ui, &mut s.format_trim_trailing_whitespace, "Trim trailing whitespace", "On save");
     c.any |= checkbox(ui, &mut s.format_on_save, "Format on save", "Uses the language server");
+    c.any |= checkbox(
+        ui,
+        &mut s.flutter_hot_reload_on_save,
+        "Flutter: hot reload on save",
+        "Apply saved Dart changes to running Flutter apps",
+    );
     if checkbox(
         ui,
         &mut s.tree_sitter,
