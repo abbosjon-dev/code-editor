@@ -210,6 +210,10 @@ orasida yurish, "Open file" — tahrirga qaytish). Gutter'dagi rangli o'zgarish 
 
 ![Git diff](docs/git-diff.png)
 
+**Git tarixi:** *Git: Show History* — commitlar grafi (branch/merge chiziqlari, branch va tag nomlari), filtr; commitni
+bossangiz — xabari va o'zgargan fayllar, faylni bossangiz — yonma-yon diff; `Ctrl+bosish` bilan ikkinchi commitni
+tanlasangiz — ikkalasi orasidagi farq. *Git: Show File History* — faqat joriy fayl tarixi (nomi o'zgarganda ham).
+
 **Merge konfliktlari:** `git merge` / `rebase` / `cherry-pick` to'qnashuvga uchrasa, faylda `<<<<<<<` … `>>>>>>>` bloklari
 rangli ko'rinadi (joriy — yashil, kelayotgan — binafsha) va har birida **Accept Current / Accept Incoming / Accept Both**
 tugmalari chiqadi; yuqoridagi panelda konfliktlar soni, **Next ↓** va hammasini birdan qabul qilish. Source Control'da

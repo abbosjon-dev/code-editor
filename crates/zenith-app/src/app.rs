@@ -282,6 +282,8 @@ pub struct ZenithApp {
     settings_section: crate::settings_ui::Section,
     settings_search: String,
     outline: crate::outline::Outline,
+    /// The Git History window, with the repository root it belongs to.
+    history: Option<(crate::history::History, PathBuf)>,
     /// The outline row last scrolled to (follows the caret).
     outline_follow: Option<usize>,
     /// Split editor: two panes side by side.
@@ -399,6 +401,7 @@ impl ZenithApp {
             settings_section: Default::default(),
             settings_search: String::new(),
             outline: Default::default(),
+            history: None,
             outline_follow: None,
             split: false,
             other: 0,
@@ -2165,6 +2168,28 @@ impl ZenithApp {
             },
             Cmd::SyncPush => self.start_sync(crate::sync_ui::SyncOp::Push),
             Cmd::SyncPull => self.start_sync(crate::sync_ui::SyncOp::Pull),
+            Cmd::GitHistory | Cmd::GitFileHistory => {
+                let file = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
+                let path = if cmd == Cmd::GitFileHistory { file.clone() } else { None };
+                let at = path.clone().or(file).or_else(|| self.workspace.clone());
+                let Some(g) = at.as_deref().and_then(|p| self.git_for(p)).or(self.git.as_ref()) else {
+                    self.toast("Not a Git repository", NotifyLevel::Info);
+                    return;
+                };
+                let root = g.root.clone();
+                let rel = match &path {
+                    Some(p) => match p.strip_prefix(&root) {
+                        Ok(r) => Some(r.to_string_lossy().replace('\\', "/")),
+                        Err(_) => return,
+                    },
+                    None => None,
+                };
+                let title = rel
+                    .clone()
+                    .unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                let h = crate::history::History::new(g.runner(), rel, title, self.waker.clone());
+                self.history = Some((h, root));
+            }
             Cmd::ShowOutline => {
                 self.sidebar = SidebarView::Outline;
                 self.show_sidebar = true;
@@ -7235,6 +7260,18 @@ impl ZenithApp {
         self.changes_window(ctx);
         self.settings_window(ctx);
         self.inline_edit_window(ctx);
+        if let Some((h, root)) = &mut self.history {
+            let mut open = true;
+            let fs = self.settings.editor_font_size;
+            let action = h.ui(ctx, &self.colors.clone(), fs, &mut open);
+            let root = root.clone();
+            if !open {
+                self.history = None;
+            }
+            if let Some(crate::history::Action::OpenFile(rel)) = action {
+                self.open_file(&root.join(rel));
+            }
+        }
         self.toasts_ui(ctx);
 
         // Agents may edit files on disk; poll for external changes now and then.

@@ -130,13 +130,13 @@ fn hunk_at(hunks: &[crate::review::Hunk], line: usize) -> Option<&crate::review:
 
 /// Where git commands run: here, or in the folder on an SSH host.
 #[derive(Clone)]
-struct Runner {
+pub struct Runner {
     root: PathBuf,
     remote: Option<crate::remote::RemoteSpec>,
 }
 
 impl Runner {
-    fn git(&self, args: &[&str]) -> Result<String, String> {
+    pub fn git(&self, args: &[&str]) -> Result<String, String> {
         match &self.remote {
             None => git(&self.root, args),
             Some(spec) => crate::remote::git(spec, args),
@@ -460,6 +460,12 @@ impl Git {
         g.apply_state(remote_state(cache, state));
         g.refresh();
         Some(g)
+    }
+
+    /// Runs git for this repository (here or on its SSH host); cheap to
+    /// clone into a background thread.
+    pub fn runner(&self) -> Runner {
+        self.run.clone()
     }
 
     pub fn is_remote(&self) -> bool {
