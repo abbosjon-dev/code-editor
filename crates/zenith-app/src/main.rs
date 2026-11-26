@@ -21,6 +21,7 @@ mod lsp;
 mod marketplace;
 mod mcp_ui;
 mod mention;
+mod outline;
 mod palette;
 mod remote;
 mod review;

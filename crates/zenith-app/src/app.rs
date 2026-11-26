@@ -38,6 +38,7 @@ enum SidebarView {
     Plugins,
     Debug,
     Tests,
+    Outline,
     /// A plugin's panel (index into `PluginHost::panels()`).
     PluginPanel(usize),
 }
@@ -280,6 +281,9 @@ pub struct ZenithApp {
     show_settings: bool,
     settings_section: crate::settings_ui::Section,
     settings_search: String,
+    outline: crate::outline::Outline,
+    /// The outline row last scrolled to (follows the caret).
+    outline_follow: Option<usize>,
     /// Split editor: two panes side by side.
     split: bool,
     /// Doc index shown in the pane that does NOT have focus.
@@ -394,6 +398,8 @@ impl ZenithApp {
             show_settings: false,
             settings_section: Default::default(),
             settings_search: String::new(),
+            outline: Default::default(),
+            outline_follow: None,
             split: false,
             other: 0,
             focus_right: false,
@@ -458,6 +464,96 @@ impl ZenithApp {
         }
         app.restore_backups();
         app
+    }
+
+    /// Keep the outline in step with the active document.
+    fn refresh_outline(&mut self) {
+        let root = self.active_root();
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        let (id, v) = (doc.id, doc.buffer.version());
+        if !self.outline.stale(id, v) || doc.loading.is_some() {
+            return;
+        }
+        if self.outline.doc_id != id {
+            self.outline.symbols.clear();
+        }
+        self.outline.doc_id = id;
+        self.outline.version = v;
+        self.outline.requested_at = Some(Instant::now());
+        self.outline.pending = if doc.lsp_active { self.lsp.request_symbols(doc, root.as_deref()) } else { None };
+        if self.outline.pending.is_none() {
+            // No language server: a quick scan of the text.
+            self.outline.symbols = crate::outline::scan(&doc.buffer.text(), doc.language());
+            self.outline.from_lsp = false;
+        }
+    }
+
+    fn outline_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        Self::section_header(ui, p, "OUTLINE");
+        self.refresh_outline();
+        let Some(doc) = self.docs.get(self.active) else {
+            ui.label(RichText::new("No file is open.").color(p.text_dim));
+            return;
+        };
+        let caret = doc.buffer.cursor_pos().line;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.outline.filter)
+                    .hint_text("Filter symbols")
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        let source = if self.outline.from_lsp { "language server" } else { "quick scan" };
+        ui.label(
+            RichText::new(format!("{} symbols · {source}", self.outline.symbols.len())).small().color(p.text_faint),
+        );
+        let q = self.outline.filter.trim().to_lowercase();
+        let cur = crate::outline::current(&self.outline.symbols, caret);
+        let mut goto = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if self.outline.symbols.is_empty() {
+                ui.label(RichText::new("No symbols in this file.").color(p.text_dim));
+            }
+            for (i, s) in self.outline.symbols.iter().enumerate() {
+                if !q.is_empty() && !s.name.to_lowercase().contains(&q) {
+                    continue;
+                }
+                let depth = if q.is_empty() { s.depth } else { 0 };
+                ui.horizontal(|ui| {
+                    ui.add_space(depth as f32 * 14.0);
+                    let glyph = crate::outline::kind_glyph(s.kind);
+                    let color = match glyph {
+                        "ƒ" => p.accent,
+                        "C" | "I" | "E" => p.warning,
+                        "K" => p.success,
+                        _ => p.text_dim,
+                    };
+                    ui.label(RichText::new(glyph).monospace().color(color));
+                    let here = cur == Some(i);
+                    let r = ui.add(egui::SelectableLabel::new(here, &s.name));
+                    let r = r.on_hover_text(format!("{} · line {}", s.kind_label(), s.line + 1));
+                    if here && self.outline_follow != Some(i) {
+                        r.scroll_to_me(Some(Align::Center));
+                    }
+                    if r.clicked() {
+                        goto = Some((s.line as usize, s.character as usize));
+                    }
+                    if !s.detail.is_empty() {
+                        ui.label(RichText::new(&s.detail).small().color(p.text_faint));
+                    }
+                });
+            }
+        });
+        self.outline_follow = cur;
+        if let Some((line, col)) = goto {
+            if let Some(doc) = self.docs.get_mut(self.active) {
+                let idx = doc.buffer.pos_to_char(zenith_core::Position::new(line, col));
+                doc.buffer.clear_extra();
+                doc.buffer.set_cursor(idx, false);
+                doc.reveal_line = Some(line);
+                self.focus_editor = true;
+            }
+        }
     }
 
     /// Remember where the current project was left (files, tab, carets).
@@ -1125,6 +1221,7 @@ impl ZenithApp {
             SidebarView::Plugins => "plugins".into(),
             SidebarView::Debug => "debug".into(),
             SidebarView::Tests => "tests".into(),
+            SidebarView::Outline => "outline".into(),
             SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
                 Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
                 None => "explorer".into(),
@@ -1199,6 +1296,7 @@ impl ZenithApp {
             "plugins" => SidebarView::Plugins,
             "debug" => SidebarView::Debug,
             "tests" => SidebarView::Tests,
+            "outline" => SidebarView::Outline,
             other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
                 Some((plugin, panel)) => self
                     .plugins
@@ -2067,6 +2165,10 @@ impl ZenithApp {
             },
             Cmd::SyncPush => self.start_sync(crate::sync_ui::SyncOp::Push),
             Cmd::SyncPull => self.start_sync(crate::sync_ui::SyncOp::Pull),
+            Cmd::ShowOutline => {
+                self.sidebar = SidebarView::Outline;
+                self.show_sidebar = true;
+            }
             Cmd::ShowTests => {
                 self.sidebar = SidebarView::Tests;
                 self.show_sidebar = true;
@@ -2610,6 +2712,11 @@ impl ZenithApp {
                             self.palette.set_items(items);
                         }
                     }
+                }
+                LspOutcome::Symbols { request, symbols } if self.outline.pending == Some(request) => {
+                    self.outline.pending = None;
+                    self.outline.symbols = symbols;
+                    self.outline.from_lsp = true;
                 }
                 LspOutcome::Symbols { request, symbols } => {
                     if self.pending_symbols == Some(request) {
@@ -3492,6 +3599,7 @@ impl ZenithApp {
                 (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
                 (SidebarView::Debug, "▷", "Run and Debug (Ctrl+Shift+D)"),
                 (SidebarView::Tests, "✓", "Testing"),
+                (SidebarView::Outline, "≡", "Outline"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
             ]
@@ -3649,6 +3757,7 @@ impl ZenithApp {
             SidebarView::Agents => self.agents_ui(ctx, ui, &p),
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
             SidebarView::Debug => self.debug_ui(ui, &p),
+            SidebarView::Outline => self.outline_ui(ui, &p),
             SidebarView::Tests => {
                 let root = self.workspace.clone();
                 let waker = self.waker.clone();
