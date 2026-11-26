@@ -126,6 +126,31 @@ pub fn current(symbols: &[Symbol], line: usize) -> Option<usize> {
     symbols.iter().enumerate().filter(|(_, s)| s.line as usize <= line).map(|(i, _)| i).next_back()
 }
 
+/// The caret's symbol and its ancestors, outermost first (indices).
+pub fn symbol_path(symbols: &[Symbol], line: usize) -> Vec<usize> {
+    let Some(mut i) = current(symbols, line) else { return vec![] };
+    let mut path = vec![i];
+    let mut depth = symbols[i].depth;
+    while depth > 0 && i > 0 {
+        i -= 1;
+        if symbols[i].depth < depth {
+            path.push(i);
+            depth = symbols[i].depth;
+        }
+    }
+    path.reverse();
+    path
+}
+
+/// Symbols at the same level under the same parent as `idx` (indices).
+pub fn siblings(symbols: &[Symbol], idx: usize) -> Vec<usize> {
+    let depth = symbols[idx].depth;
+    // The parent's range: back to a shallower symbol, forward until one.
+    let start = (0..idx).rev().find(|&i| symbols[i].depth < depth).map_or(0, |i| i + 1);
+    let end = (idx + 1..symbols.len()).find(|&i| symbols[i].depth < depth).unwrap_or(symbols.len());
+    (start..end).filter(|&i| symbols[i].depth == depth).collect()
+}
+
 #[derive(Default)]
 pub struct Outline {
     pub doc_id: u64,
@@ -162,6 +187,9 @@ mod tests {
         assert_eq!(s[0].kind, STRUCT);
         assert_eq!(s[1].kind, CLASS);
         assert_eq!(current(&s, 7), Some(2)); // inside `new`
+        assert_eq!(symbol_path(&s, 7), [1, 2]); // impl A › new
+        assert_eq!(siblings(&s, 2), [2, 3]); // new, go
+        assert_eq!(siblings(&s, 1), [0, 1, 4, 5]);
         let py = "class Shop:\n    def add(self, x):\n        pass\n\nasync def main():\n    pass\n";
         let s = scan(py, "Python");
         let names: Vec<(&str, usize)> = s.iter().map(|s| (s.name.as_str(), s.depth)).collect();

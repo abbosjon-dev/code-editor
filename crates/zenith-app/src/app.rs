@@ -284,6 +284,8 @@ pub struct ZenithApp {
     outline: crate::outline::Outline,
     /// The Git History window, with the repository root it belongs to.
     history: Option<(crate::history::History, PathBuf)>,
+    /// A symbol picked in the breadcrumb (line, column), applied next frame.
+    crumb_jump: Option<(usize, usize)>,
     /// The outline row last scrolled to (follows the caret).
     outline_follow: Option<usize>,
     /// Split editor: two panes side by side.
@@ -403,6 +405,7 @@ impl ZenithApp {
             outline: Default::default(),
             history: None,
             outline_follow: None,
+            crumb_jump: None,
             split: false,
             other: 0,
             focus_right: false,
@@ -4651,11 +4654,45 @@ impl ZenithApp {
         });
         // Breadcrumbs.
         let is_md = self.docs.get(shown).is_some_and(|d| d.language().starts_with("Markdown"));
+        if let Some((line, col)) = self.crumb_jump.take() {
+            if let Some(doc) = self.docs.get_mut(shown) {
+                let idx = doc.buffer.pos_to_char(zenith_core::Position::new(line, col));
+                doc.buffer.clear_extra();
+                doc.buffer.set_cursor(idx, false);
+                doc.reveal_line = Some(line);
+                self.focus_editor = true;
+            }
+        }
         if let Some(path) = self.docs.get(shown).and_then(|d| d.path()).map(|p| self.rel_path(p)) {
+            let mut jump = None;
             ui.horizontal(|ui| {
                 ui.add_space(14.0);
                 let crumbs = path.split('/').collect::<Vec<_>>().join("  ›  ");
                 ui.label(RichText::new(crumbs).size(12.0).color(p.text_dim));
+                // Then the symbols around the caret; each opens its siblings.
+                let doc = &self.docs[shown];
+                if self.outline.doc_id == doc.id && !self.outline.symbols.is_empty() {
+                    let syms = &self.outline.symbols;
+                    for i in crate::outline::symbol_path(syms, doc.buffer.cursor_pos().line) {
+                        ui.label(RichText::new("›").size(12.0).color(p.text_faint));
+                        let s = &syms[i];
+                        let glyph = crate::outline::kind_glyph(s.kind);
+                        let title = RichText::new(format!("{glyph} {}", s.name)).size(12.0).color(p.text_dim);
+                        ui.menu_button(title, |ui| {
+                            ui.set_min_width(220.0);
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                for j in crate::outline::siblings(syms, i) {
+                                    let t = &syms[j];
+                                    let label = format!("{} {}", crate::outline::kind_glyph(t.kind), t.name);
+                                    if ui.add(egui::SelectableLabel::new(j == i, label)).clicked() {
+                                        jump = Some((t.line as usize, t.character as usize));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
                 if is_md {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(10.0);
@@ -4675,6 +4712,9 @@ impl ZenithApp {
                     });
                 }
             });
+            if jump.is_some() {
+                self.crumb_jump = jump;
+            }
         }
         let review = self.settings.review_external_changes;
         let mut conflict = false;
@@ -7147,6 +7187,7 @@ impl ZenithApp {
             panic!("ZENITH_TEST_CRASH was set");
         }
         self.poll_loading();
+        self.refresh_outline();
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
             self.style_dirty = false;
