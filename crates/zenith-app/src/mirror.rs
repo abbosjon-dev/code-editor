@@ -90,10 +90,72 @@ fn run_bytes(remote: Option<&RemoteSpec>, program: &str, args: &[String]) -> Res
     Ok(out.stdout)
 }
 
+/// One screenshot of the device.
+fn capture(target: &Target, remote: Option<&RemoteSpec>, raw_ok: &AtomicBool) -> Result<egui::ColorImage, String> {
+    match target {
+        Target::Android { serial } => {
+            if raw_ok.load(Ordering::Relaxed) {
+                let data = run_bytes(remote, "adb", &["-s", serial, "exec-out", "screencap"].map(String::from))?;
+                match parse_raw(&data) {
+                    Some(img) => return Ok(img),
+                    None => raw_ok.store(false, Ordering::Relaxed),
+                }
+            }
+            let png = run_bytes(remote, "adb", &["-s", serial, "exec-out", "screencap", "-p"].map(String::from))?;
+            decode_png(&png)
+        }
+        Target::Ios { udid } => {
+            let png = run_bytes(
+                remote,
+                "xcrun",
+                &["simctl", "io", udid, "screenshot", "--type=png", "/dev/stdout"].map(String::from),
+            )?;
+            decode_png(&png)
+        }
+    }
+}
+
+fn decode_png(png: &[u8]) -> Result<egui::ColorImage, String> {
+    let img = image::load_from_memory(png).map_err(|e| format!("screenshot: {e}"))?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
+}
+
+/// `screencap` without `-p`: width, height, pixel format (u32 LE) and, on
+/// newer Androids, a color space — then the pixels.
+pub fn parse_raw(data: &[u8]) -> Option<egui::ColorImage> {
+    let u = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(data.get(i..i + 4)?.try_into().ok()?)) };
+    let (w, h, format) = (u(0)? as usize, u(4)? as usize, u(8)?);
+    if w == 0 || h == 0 || w > 10_000 || h > 10_000 {
+        return None;
+    }
+    let px = w * h * 4;
+    let header = [16, 12].into_iter().find(|hd| data.len() == hd + px)?;
+    let pixels = &data[header..];
+    let rgba: Vec<u8> = match format {
+        // RGBA_8888, RGBX_8888 (alpha unused)
+        1 | 2 => pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        // BGRA_8888
+        5 => pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]).collect(),
+        _ => return None,
+    };
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
+
+/// `scrcpy` (a fast, full-frame-rate mirror with audio) for this device,
+/// when it is installed here.
+pub fn scrcpy_available() -> bool {
+    which::which("scrcpy").is_ok()
+}
+
 pub struct Mirror {
     pub target: Target,
     pub name: String,
-    frames: Receiver<Result<egui::ColorImage, String>>,
+    frames: Receiver<(Instant, Result<egui::ColorImage, String>)>,
+    /// When the frame on screen was taken.
+    last_taken: Option<Instant>,
+    /// The device is attached to the SSH host (scrcpy would need it here).
+    remote: bool,
     input: Sender<Input>,
     stop: Arc<AtomicBool>,
     texture: Option<egui::TextureHandle>,
@@ -114,40 +176,33 @@ impl Drop for Mirror {
 
 impl Mirror {
     pub fn start(target: Target, name: String, remote: Option<RemoteSpec>, ctx: egui::Context) -> Self {
-        // One frame in flight: a slow UI never queues stale screenshots.
-        let (ftx, frx) = sync_channel(1);
+        let is_remote = remote.is_some();
+        // Two captures in flight (a device answers one while the other
+        // travels); frames carry when they were taken so an older one that
+        // arrives late is dropped.
+        let (ftx, frx) = sync_channel::<(Instant, Result<egui::ColorImage, String>)>(2);
         let (itx, irx) = channel::<Input>();
         let stop = Arc::new(AtomicBool::new(false));
-        {
-            let (target, remote, stop) = (target.clone(), remote.clone(), stop.clone());
+        // Raw screenshots skip PNG compression on the phone (much faster);
+        // devices that don't support them fall back to PNG for good.
+        let raw_ok = Arc::new(AtomicBool::new(matches!(target, Target::Android { .. })));
+        for n in 0..2u64 {
+            let (target, remote, stop, ftx, ctx, raw_ok) =
+                (target.clone(), remote.clone(), stop.clone(), ftx.clone(), ctx.clone(), raw_ok.clone());
             std::thread::spawn(move || {
+                // Stagger the second worker by half a frame.
+                std::thread::sleep(Duration::from_millis(n * 60));
                 while !stop.load(Ordering::Relaxed) {
                     let started = Instant::now();
-                    let shot = match &target {
-                        Target::Android { serial } => run_bytes(
-                            remote.as_ref(),
-                            "adb",
-                            &["-s", serial, "exec-out", "screencap", "-p"].map(String::from),
-                        ),
-                        Target::Ios { udid } => run_bytes(
-                            remote.as_ref(),
-                            "xcrun",
-                            &["simctl", "io", udid, "screenshot", "--type=png", "/dev/stdout"].map(String::from),
-                        ),
-                    };
-                    let frame = shot.and_then(|png| {
-                        let img = image::load_from_memory(&png).map_err(|e| format!("screenshot: {e}"))?.to_rgba8();
-                        let size = [img.width() as usize, img.height() as usize];
-                        Ok(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
-                    });
+                    let frame = capture(&target, remote.as_ref(), &raw_ok);
                     let failed = frame.is_err();
-                    if ftx.send(frame).is_err() {
+                    if ftx.send((started, frame)).is_err() {
                         break;
                     }
                     ctx.request_repaint();
-                    // As fast as the device answers, but not faster than ~10 fps;
-                    // back off while it fails (unplugged, still booting).
-                    let min = if failed { Duration::from_secs(2) } else { Duration::from_millis(100) };
+                    // Up to ~15 fps per worker; back off while it fails
+                    // (unplugged, still booting).
+                    let min = if failed { Duration::from_secs(2) } else { Duration::from_millis(66) };
                     if let Some(rest) = min.checked_sub(started.elapsed()) {
                         std::thread::sleep(rest);
                     }
@@ -176,6 +231,8 @@ impl Mirror {
             size: [0, 0],
             error: None,
             text: String::new(),
+            last_taken: None,
+            remote: is_remote,
             times: vec![],
             drag_from: None,
         }
@@ -192,7 +249,11 @@ impl Mirror {
     /// Toolbar and the screen; returns true when closed.
     pub fn ui(&mut self, ui: &mut egui::Ui, p: &Palette) -> bool {
         let mut close = false;
-        while let Ok(f) = self.frames.try_recv() {
+        while let Ok((taken, f)) = self.frames.try_recv() {
+            if self.last_taken.is_some_and(|t| taken < t) {
+                continue;
+            }
+            self.last_taken = Some(taken);
             match f {
                 Ok(img) => {
                     self.size = img.size;
@@ -216,6 +277,15 @@ impl Mirror {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("✕").on_hover_text("Close").clicked() {
                     close = true;
+                }
+                if let (Target::Android { serial }, true, false) = (&self.target, scrcpy_available(), self.remote) {
+                    if ui
+                        .small_button("↗ scrcpy")
+                        .on_hover_text("Open in scrcpy: full frame rate, with sound")
+                        .clicked()
+                    {
+                        let _ = std::process::Command::new("scrcpy").args(["-s", serial]).spawn();
+                    }
                 }
             });
         });
@@ -316,6 +386,28 @@ impl Mirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_screencap() {
+        let mut data = vec![];
+        for v in [2u32, 1, 1, 0] {
+            data.extend(v.to_le_bytes()); // 2×1, RGBA, color space
+        }
+        data.extend([255, 0, 0, 7, 0, 0, 255, 9]);
+        let img = parse_raw(&data).unwrap();
+        assert_eq!(img.size, [2, 1]);
+        assert_eq!(img.pixels[0], egui::Color32::from_rgb(255, 0, 0));
+        assert_eq!(img.pixels[1], egui::Color32::from_rgb(0, 0, 255));
+        // Old 12-byte header, BGRA.
+        let mut old = vec![];
+        for v in [1u32, 1, 5] {
+            old.extend(v.to_le_bytes());
+        }
+        old.extend([255, 0, 0, 255]);
+        assert_eq!(parse_raw(&old).unwrap().pixels[0], egui::Color32::from_rgb(0, 0, 255));
+        // PNG data isn't raw.
+        assert!(parse_raw(b"\x89PNG\r\n\x1a\nxxxxxxxxxxxx").is_none());
+    }
 
     #[test]
     fn adb_input_commands() {
