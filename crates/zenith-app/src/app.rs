@@ -7725,7 +7725,26 @@ impl ZenithApp {
                             }
                         });
                     }
-                    for u in &r.urls {
+                    // Flutter DevTools: buttons instead of its long URL.
+                    if let Some(dt) = r.urls.iter().find(|u| crate::run::is_devtools(u)) {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("🛠 DevTools").on_hover_text("Flutter DevTools in the preview").clicked()
+                            {
+                                preview_url = Some(dt.clone());
+                            }
+                            if ui
+                                .small_button("Widget inspector")
+                                .on_hover_text("The widget tree of the running app")
+                                .clicked()
+                            {
+                                preview_url = Some(crate::run::devtools_page(dt, "inspector"));
+                            }
+                            if ui.small_button("Performance").clicked() {
+                                preview_url = Some(crate::run::devtools_page(dt, "performance"));
+                            }
+                        });
+                    }
+                    for u in r.urls.iter().filter(|u| !crate::run::is_devtools(u) && !crate::run::is_vm_service(u)) {
                         ui.horizontal(|ui| {
                             let fwd = r.forwards.iter().find(|(p, ..)| Some(*p) == crate::run::port_of(u)).map(|f| f.2);
                             let shown = if u.chars().count() > 44 {

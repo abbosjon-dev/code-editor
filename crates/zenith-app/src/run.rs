@@ -592,8 +592,11 @@ pub fn unwrap_lines(lines: &[String], cols: usize) -> Vec<String> {
             }
             _ => out.push(t.to_string()),
         }
-        // Too narrow a pane breaks everything: don't guess there.
-        join = cols >= 30 && t.chars().count() >= cols.saturating_sub(1);
+        let full = cols > 0 && t.chars().count() >= cols.saturating_sub(1);
+        // In a narrow pane only a URL cut at the edge is joined (prose
+        // would be glued wrongly there).
+        let in_url = out.last().and_then(|l| l.split_whitespace().last()).is_some_and(|w| w.contains("://"));
+        join = full && (cols >= 30 || in_url);
     }
     out
 }
@@ -615,8 +618,33 @@ pub fn merge_urls(mut known: Vec<String>, found: Vec<String>) -> Vec<String> {
 
 /// "The Flutter DevTools…": a new message, not the rest of a cut line.
 fn starts_sentence(t: &str) -> bool {
+    // A capital and then a lowercase word ("The", "Next") — not "Th8kJ" of a token.
     let mut c = t.chars();
-    matches!((c.next(), c.next()), (Some(a), Some(b)) if a.is_uppercase() && b.is_lowercase())
+    matches!((c.next(), c.next(), c.next()), (Some(a), Some(b), Some(d)) if a.is_uppercase() && b.is_lowercase() && d.is_lowercase())
+}
+
+/// Flutter DevTools (`…/devtools/?uri=ws://…`).
+pub fn is_devtools(u: &str) -> bool {
+    u.contains("/devtools/") && u.contains("uri=")
+}
+
+/// The Dart VM service of a debug app (`http://127.0.0.1:41234/AbCd=/`):
+/// for tools, not a page to look at.
+pub fn is_vm_service(u: &str) -> bool {
+    let path = u.split("://").nth(1).and_then(|r| r.split_once('/')).map_or("", |(_, p)| p);
+    path.ends_with("=/") && !path.trim_end_matches("=/").contains('/')
+}
+
+/// A DevTools screen (`inspector`, `performance`, `network`…) of a
+/// DevTools URL.
+pub fn devtools_page(u: &str, page: &str) -> String {
+    match u.split_once("/devtools/") {
+        Some((base, rest)) => {
+            let query = rest.split_once('?').map_or("", |(_, q)| q);
+            format!("{base}/devtools/{page}?{query}")
+        }
+        None => u.to_string(),
+    }
 }
 
 /// The port of a local URL.
@@ -741,6 +769,13 @@ mod tests {
         ];
         assert_eq!(find_urls(&out), ["http://localhost:5173/", "http://192.168.1.5:5173/", "http://localhost:8000"]);
         assert_eq!(port_of("http://localhost:5173/"), Some(5173));
+        let dt = "http://127.0.0.1:9100/AbC=/devtools/?uri=ws://127.0.0.1:9100/AbC=/ws";
+        assert!(is_devtools(dt) && !is_vm_service(dt));
+        assert!(is_vm_service("http://127.0.0.1:41234/AbCd_x=/") && !is_vm_service("http://localhost:5173/"));
+        assert_eq!(
+            devtools_page(dt, "inspector"),
+            "http://127.0.0.1:9100/AbC=/devtools/inspector?uri=ws://127.0.0.1:9100/AbC=/ws"
+        );
         let expo = [
             "› Metro waiting on exp://192.168.1.20:8081".to_string(),
             "› Web is waiting on http://localhost:8081".to_string(),
@@ -754,7 +789,24 @@ mod tests {
         ];
         let joined = unwrap_lines(&wrapped, 50);
         assert_eq!(joined, ["The DevTools debugger is available at: http://127.0.0.1:4233/x/", "  next"]);
-        assert_eq!(unwrap_lines(&wrapped[..2], 20).len(), 2); // narrow: no guessing
+        // Narrow: a URL cut at the edge is joined, prose isn't.
+        assert_eq!(unwrap_lines(&wrapped[..2], 20).len(), 1);
+        let prose = ["some words that fill".to_string(), "more words".to_string()];
+        assert_eq!(unwrap_lines(&prose, 20).len(), 2);
+        let narrow: Vec<String> = [
+            "available at:",
+            "http://127.0.0.1:4",
+            "1861/EThBkJyfvUs=/",
+            "devtools/?uri=ws:/",
+            "/127.0.0.1:41861/E",
+            "Th8kJyfvUs=/ws",
+            "Next thing",
+        ]
+        .map(String::from)
+        .to_vec();
+        let j = unwrap_lines(&narrow, 18);
+        assert_eq!(j[1], "http://127.0.0.1:41861/EThBkJyfvUs=/devtools/?uri=ws://127.0.0.1:41861/ETh8kJyfvUs=/ws");
+        assert_eq!(j.len(), 3);
         let full =
             ["A Dart VM Service is available at: http://127.0.0.1:1/x=/".to_string(), "The DevTools…".to_string()];
         assert_eq!(unwrap_lines(&full, full[0].len()).len(), 2);
