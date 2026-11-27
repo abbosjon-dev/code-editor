@@ -156,6 +156,8 @@ struct RunSession {
     device: Option<String>,
     /// When it was (re)started: build outputs newer than this are its own.
     started: std::time::SystemTime,
+    /// The compound it was started by.
+    group: Option<String>,
     /// The URL whose QR code is shown (to open it on a phone).
     qr: Option<String>,
     /// `ssh -L` port forwards for runs on an SSH host (port, process,
@@ -188,6 +190,10 @@ struct RunState {
     rescan_at: Option<Instant>,
     /// A command waiting for a scan to finish (then shown again).
     pending_pick: Option<Cmd>,
+    /// The compound being started (its sessions are grouped).
+    group: Option<String>,
+    /// `.env` file to run with (by name, where a project has it).
+    env_choice: Option<String>,
 }
 
 #[derive(Default)]
@@ -1971,7 +1977,15 @@ impl ZenithApp {
                 }
             }
             Cmd::StopRun => match self.current_run() {
-                Some(i) => self.stop_run(i),
+                Some(i) => {
+                    // A compound stops together.
+                    let g = self.runs.sessions[i].group.clone();
+                    for j in 0..self.runs.sessions.len() {
+                        if j == i || (g.is_some() && self.runs.sessions[j].group == g) {
+                            self.stop_run(j);
+                        }
+                    }
+                }
                 None => self.toast("Nothing is running", NotifyLevel::Info),
             },
             Cmd::RestartRun => match self.runs.sessions.last().map(|r| (r.config.clone(), r.device.clone())) {
@@ -2007,7 +2021,7 @@ impl ZenithApp {
                     .iter()
                     .enumerate()
                     .map(|(i, c)| Item {
-                        label: format!("{} {}", c.kind.icon(), c.name),
+                        label: format!("{} {}", c.icon(), c.name),
                         detail: c.command.clone(),
                         action: PaletteAction::RunConfig(i),
                     })
@@ -7084,6 +7098,26 @@ impl ZenithApp {
                 self.save_doc(i, false);
             }
         }
+        // A compound: each of its configurations, as one group.
+        if !cfg.compound.is_empty() {
+            let (all, _) = self.run_configurations();
+            for name in &cfg.compound {
+                if let Some(member) = all.iter().find(|c| &c.name == name && c.compound.is_empty()).cloned() {
+                    self.runs.group = Some(cfg.name.clone());
+                    self.start_run(member);
+                }
+            }
+            self.runs.group = None;
+            return;
+        }
+        // The env file picked in the Run panel, where the project has it.
+        let mut cfg = cfg;
+        if let (None, Some(choice), Some(ws)) = (&cfg.env_file, &self.runs.env_choice, &self.workspace) {
+            let dir = if cfg.cwd.is_empty() { ws.clone() } else { ws.join(&cfg.cwd) };
+            if dir.join(choice).is_file() {
+                cfg.env_file = Some(choice.clone());
+            }
+        }
         // Flutter on several devices: a session each (hot reload reaches all).
         let picked = if cfg.kind == crate::run::Kind::Flutter { self.runs.devices.clone() } else { vec![] };
         if picked.len() > 1 {
@@ -7107,7 +7141,14 @@ impl ZenithApp {
         let auto_preview = device.as_deref() == Some("web-server");
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
         let spec = crate::run::spec(&cfg, &ws, remote.as_ref(), &extra);
-        if let Some(i) = self.runs.sessions.iter().position(|r| r.config == cfg) {
+        // The same configuration (its env file may have changed): restart it.
+        if let Some(i) = self
+            .runs
+            .sessions
+            .iter()
+            .position(|r| (&r.config.name, &r.config.command, &r.config.cwd) == (&cfg.name, &cfg.command, &cfg.cwd))
+        {
+            self.runs.sessions[i].config = cfg.clone();
             let tab = self.runs.sessions[i].tab;
             self.runs.sessions[i].urls.clear();
             self.runs.sessions[i].expo_urls.clear();
@@ -7148,6 +7189,7 @@ impl ZenithApp {
             final_scan: false,
             device: device.clone(),
             started: std::time::SystemTime::now(),
+            group: self.runs.group.clone(),
             qr: None,
             forwards: vec![],
         });
@@ -7484,10 +7526,10 @@ impl ZenithApp {
                 }
                 egui::ComboBox::from_id_salt("run-config")
                     .width(ui.available_width() - 4.0)
-                    .selected_text(format!("{} {}", configs[sel].kind.icon(), configs[sel].name))
+                    .selected_text(format!("{} {}", configs[sel].icon(), configs[sel].name))
                     .show_ui(ui, |ui| {
                         for (i, c) in configs.iter().enumerate() {
-                            ui.selectable_value(&mut new_sel, i, format!("{} {}", c.kind.icon(), c.name))
+                            ui.selectable_value(&mut new_sel, i, format!("{} {}", c.icon(), c.name))
                                 .on_hover_text(&c.command);
                         }
                     });
@@ -7534,6 +7576,35 @@ impl ZenithApp {
                     });
                 }
             }
+            // Variables: the project's .env files.
+            if let Some(ws) = self.workspace.clone() {
+                let cfg = &configs[new_sel];
+                let mut dirs = vec![if cfg.cwd.is_empty() { ws.clone() } else { ws.join(&cfg.cwd) }];
+                for m in &cfg.compound {
+                    if let Some(c) = configs.iter().find(|c| &c.name == m) {
+                        dirs.push(if c.cwd.is_empty() { ws.clone() } else { ws.join(&c.cwd) });
+                    }
+                }
+                let mut files: Vec<String> = dirs.iter().flat_map(|d| crate::run::env_files(d)).collect();
+                files.sort();
+                files.dedup();
+                if !files.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Env").small().color(p.text_dim));
+                        let current = self.runs.env_choice.clone().unwrap_or_else(|| "none".into());
+                        egui::ComboBox::from_id_salt("run-env")
+                            .width(ui.available_width() - 4.0)
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.runs.env_choice, None, "none")
+                                    .on_hover_text("Run without loading an env file");
+                                for f in &files {
+                                    ui.selectable_value(&mut self.runs.env_choice, Some(f.clone()), f);
+                                }
+                            });
+                    });
+                }
+            }
             if matches!(kind, crate::run::Kind::Flutter | crate::run::Kind::Expo) {
                 self.devices_ui(ui, p, kind == crate::run::Kind::Flutter);
             }
@@ -7547,6 +7618,20 @@ impl ZenithApp {
         for i in 0..self.runs.sessions.len() {
             let alive = self.run_session_alive(i);
             let r = &self.runs.sessions[i];
+            // A compound's sessions under one header with Stop all / Restart all.
+            if let Some(g) = r.group.as_ref().filter(|g| i == 0 || self.runs.sessions[i - 1].group.as_ref() != Some(*g))
+            {
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("▣ {g}")).strong().color(p.text));
+                ui.horizontal(|ui| {
+                    if ui.small_button("↻ Restart all").clicked() {
+                        act = Some((i, "restart-group"));
+                    }
+                    if ui.small_button("■ Stop all").clicked() {
+                        act = Some((i, "stop-group"));
+                    }
+                });
+            }
             ui.add_space(4.0);
             egui::Frame::new().fill(p.bg_elevated).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 4)).show(
                 ui,
@@ -7576,6 +7661,9 @@ impl ZenithApp {
                             }
                         });
                     });
+                    if let Some(f) = &r.config.env_file {
+                        ui.label(RichText::new(format!("env: {f}")).small().color(p.text_faint));
+                    }
                     if r.config.build && !alive {
                         let dir = self.workspace.as_ref().map(|w| {
                             if r.config.cwd.is_empty() {
@@ -7734,6 +7822,21 @@ impl ZenithApp {
         if let Some((i, a)) = act {
             match a {
                 "show" => self.show_run_output(i),
+                "stop-group" | "restart-group" => {
+                    let g = self.runs.sessions[i].group.clone();
+                    let members: Vec<usize> =
+                        (0..self.runs.sessions.len()).filter(|&j| self.runs.sessions[j].group == g).collect();
+                    for &j in &members {
+                        if a == "stop-group" {
+                            self.stop_run(j);
+                        } else {
+                            let (c, d) = (self.runs.sessions[j].config.clone(), self.runs.sessions[j].device.clone());
+                            self.runs.group = g.clone();
+                            self.start_run_on(c, d);
+                        }
+                    }
+                    self.runs.group = None;
+                }
                 "problems" => {
                     self.sidebar = SidebarView::Problems;
                     self.show_sidebar = true;

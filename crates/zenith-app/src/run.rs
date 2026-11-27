@@ -85,12 +85,28 @@ pub struct RunConfig {
     pub from_file: bool,
     /// A build (its card lists what it produced).
     pub build: bool,
+    /// A compound: the names of the configurations it starts together.
+    pub compound: Vec<String>,
+    /// Variables file (`.env.staging`…) relative to `cwd`.
+    pub env_file: Option<String>,
+}
+
+impl RunConfig {
+    pub fn icon(&self) -> &'static str {
+        if self.compound.is_empty() {
+            self.kind.icon()
+        } else {
+            "▣"
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct FileConfig {
     #[serde(default)]
     run: Vec<FileEntry>,
+    #[serde(default)]
+    compound: Vec<CompoundEntry>,
     /// Also list the detected configurations (default true).
     #[serde(default = "yes")]
     detect: bool,
@@ -111,6 +127,13 @@ struct FileEntry {
     #[serde(default)]
     kind: String,
     url: Option<String>,
+    env_file: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompoundEntry {
+    name: String,
+    runs: Vec<String>,
 }
 
 pub fn config_path(root: &Path) -> PathBuf {
@@ -127,8 +150,14 @@ pub const TEMPLATE: &str = r#"# Run configurations for Zenith (Run and Debug pan
 # cwd = "frontend"              # relative to the folder
 # kind = "node"                 # cargo | node | flutter | expo | python | go | compose
 # url = "http://localhost:5173" # page to preview (default: first URL printed)
+# env_file = ".env.development"  # variables to load (also picked in the Run panel)
 # [run.env]
 # PORT = "5173"
+
+# Several configurations started (and stopped) together:
+# [[compound]]
+# name = "Full stack"
+# runs = ["API", "Web: dev server"]
 "#;
 
 /// Configurations for the folder: run.toml's first, then detected ones.
@@ -136,6 +165,7 @@ pub fn load(root: &Path) -> (Vec<RunConfig>, Option<String>) {
     let mut out = vec![];
     let mut err = None;
     let mut detect_too = true;
+    let mut compounds: Vec<CompoundEntry> = vec![];
     if let Ok(text) = std::fs::read_to_string(config_path(root)) {
         match toml::from_str::<FileConfig>(&text) {
             Ok(f) => {
@@ -147,9 +177,11 @@ pub fn load(root: &Path) -> (Vec<RunConfig>, Option<String>) {
                     cwd: e.cwd,
                     env: e.env.into_iter().collect(),
                     url: e.url,
+                    env_file: e.env_file,
                     from_file: true,
-                    build: false,
+                    ..Default::default()
                 }));
+                compounds = f.compound;
             }
             Err(e) => err = Some(format!(".zenith/run.toml: {e}")),
         }
@@ -161,7 +193,69 @@ pub fn load(root: &Path) -> (Vec<RunConfig>, Option<String>) {
             }
         }
     }
-    (out, err)
+    // Compounds first: they are what a full-stack project runs most.
+    let mut compound_cfgs = vec![];
+    for c in compounds {
+        if let Some(missing) = c.runs.iter().find(|n| !out.iter().any(|o| &o.name == *n)) {
+            err.get_or_insert(format!(
+                ".zenith/run.toml: compound \"{}\": no configuration named \"{missing}\"",
+                c.name
+            ));
+            continue;
+        }
+        compound_cfgs.push(RunConfig {
+            command: c.runs.join(" + "),
+            name: c.name,
+            compound: c.runs,
+            from_file: true,
+            ..Default::default()
+        });
+    }
+    compound_cfgs.extend(out);
+    (compound_cfgs, err)
+}
+
+/// Variables of a `.env` file: `KEY=value`, `export KEY=value`, quoted
+/// values, `#` comments.
+pub fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                return None;
+            }
+            let l = l.strip_prefix("export ").unwrap_or(l);
+            let (k, v) = l.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let v = v.trim();
+            let v = if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            {
+                v[1..v.len() - 1].to_string()
+            } else {
+                // An unquoted value ends at a comment.
+                v.split(" #").next().unwrap_or(v).trim().to_string()
+            };
+            Some((k.to_string(), v))
+        })
+        .collect()
+}
+
+/// `.env` files in a folder (`.env`, `.env.staging`, `.env.production`…).
+pub fn env_files(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| (n == ".env" || n.starts_with(".env.")) && !n.ends_with(".example") && !n.ends_with(".sample"))
+        .collect();
+    v.sort();
+    v
 }
 
 fn guess_kind(command: &str) -> Kind {
@@ -380,6 +474,29 @@ pub fn missing_android_signing(kind: Kind, dir: &Path) -> bool {
 /// What to spawn in the terminal: the command line in a login shell (so
 /// PATH has flutter, node…), locally or on the SSH host.
 pub fn spec(cfg: &RunConfig, root: &Path, remote: Option<&RemoteSpec>, extra_args: &str) -> CommandSpec {
+    // Variables from the env file, overridden by the configuration's own.
+    let dir = if cfg.cwd.is_empty() { root.to_path_buf() } else { root.join(&cfg.cwd) };
+    let mut env: Vec<(String, String)> = cfg
+        .env_file
+        .as_ref()
+        .and_then(|f| std::fs::read_to_string(dir.join(f)).ok())
+        .map(|t| parse_env_file(&t))
+        .unwrap_or_default();
+    for (k, v) in &cfg.env {
+        env.retain(|(x, _)| x != k);
+        env.push((k.clone(), v.clone()));
+    }
+    // Flutter reads them as compile-time constants (String.fromEnvironment).
+    let extra_args = match (&cfg.env_file, cfg.kind) {
+        (Some(f), Kind::Flutter)
+            if cfg.command.trim_start().starts_with("flutter run") || cfg.command.contains("flutter build") =>
+        {
+            format!("{extra_args} --dart-define-from-file={}", crate::remote::sh_quote(f)).trim().to_string()
+        }
+        _ => extra_args.to_string(),
+    };
+    let extra_args = extra_args.as_str();
+    let cfg = &RunConfig { env, ..cfg.clone() };
     let mut line = if extra_args.is_empty() { cfg.command.clone() } else { format!("{} {extra_args}", cfg.command) };
     // Flutter wraps its messages (and URLs) at the terminal width itself;
     // without that the terminal wraps them and they can be found whole.
@@ -554,6 +671,46 @@ mod tests {
         let (cfgs, _) = load(&root);
         assert_eq!(cfgs.len(), 1);
         assert_eq!((cfgs[0].kind, cfgs[0].env.clone()), (Kind::Expo, vec![("A".into(), "1".into())]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compounds_and_env_files() {
+        let root = std::env::temp_dir().join(format!("zenith-run-cmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".zenith")).unwrap();
+        std::fs::write(
+            config_path(&root),
+            "detect = false\n[[run]]\nname = \"API\"\ncommand = \"python3 api.py\"\nenv_file = \".env.staging\"\n[run.env]\nB = \"own\"\n\
+             [[run]]\nname = \"Web\"\ncommand = \"npm run dev\"\n\
+             [[compound]]\nname = \"All\"\nruns = [\"API\", \"Web\"]\n[[compound]]\nname = \"Bad\"\nruns = [\"Nope\"]\n",
+        )
+        .unwrap();
+        let (cfgs, err) = load(&root);
+        assert_eq!(cfgs.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["All", "API", "Web"]);
+        assert_eq!(cfgs[0].compound, ["API", "Web"]);
+        assert!(err.unwrap().contains("Nope"));
+        std::fs::write(root.join(".env.staging"), "# staging\nexport A=1\nB=\"from file\"\nC='x y' \nD=plain # note\n")
+            .unwrap();
+        std::fs::write(root.join(".env.example"), "A=").unwrap();
+        assert_eq!(env_files(&root), [".env.staging"]);
+        let s = spec(&cfgs[1], &root, None, "");
+        let get = |k: &str| s.env.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+        assert_eq!(get("A").as_deref(), Some("1"));
+        assert_eq!(get("B").as_deref(), Some("own")); // the configuration wins
+        assert_eq!(get("C").as_deref(), Some("x y"));
+        assert_eq!(get("D").as_deref(), Some("plain"));
+        let fl = RunConfig {
+            kind: Kind::Flutter,
+            command: "flutter run".into(),
+            env_file: Some(".env.staging".into()),
+            ..Default::default()
+        };
+        assert!(spec(&fl, &root, None, "-d chrome")
+            .args
+            .last()
+            .unwrap()
+            .ends_with("flutter --no-wrap run -d chrome --dart-define-from-file=.env.staging"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
