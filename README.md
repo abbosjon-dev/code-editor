@@ -164,6 +164,16 @@ languages = ["python"]
   ```
 - **▶ Run** (`Ctrl+F5`) — har konfiguratsiya o'z terminal tabida ishlaydi (ranglar, interaktiv kiritish). Panelda: ■ Stop, ↻ Restart,
   chiqishda topilgan URL'lar (bosing — brauzerda), status qatorida `▶ nomi  http://localhost:5173`.
+- **Compound** — bir nechta konfiguratsiyani birga ishga tushirish (masalan backend + frontend):
+  ```toml
+  [[compound]]
+  name = "Full stack"
+  runs = ["API", "Web: dev server"]
+  ```
+  Ular bitta guruh ostida chiqadi: **↻ Restart all / ■ Stop all**, *Run: Stop* butun guruhni to'xtatadi.
+- **Env fayllar** — Run panelidagi **Env** ro'yxati loyihadagi `.env`, `.env.staging`, `.env.production`… fayllarini
+  ko'rsatadi; tanlangani jarayonga yuklanadi (konfiguratsiyadagi `env_file = ".env.staging"` ham). Flutter'ga qo'shimcha
+  `--dart-define-from-file` beriladi — qiymatlar `String.fromEnvironment` orqali o'qiladi.
 - **SSH papkada** buyruq serverda ishlaydi, `localhost` portlari esa avtomatik sizning kompyuteringizga forward qilinadi (`ssh -L`).
 - **Xatolar → Problems.** Run chiqishidagi kompilyatsiya va runtime xatolari (rustc/cargo, gcc/clang, Go, Dart/Flutter,
   TypeScript, Python traceback) Problems panelida chiqadi va bosganda kerakli qatorga o'tadi; keyingi muvaffaqiyatli
@@ -187,6 +197,7 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
   ilova kompilyatsiya bo'lgach to'g'ridan-to'g'ri editor ichidagi preview'da ochiladi.
 - **⟳ Hot reload / ↻ Hot restart** tugmalari, *Run: Hot Reload*, va `.dart` faylni **saqlaganda avtomatik hot reload**
   (Sozlamalar → *Flutter: hot reload on save*).
+- **🛠 DevTools** — Flutter DevTools, Widget inspector va Performance tugmalari ularni editor ichidagi preview'da ochadi.
 - **Bir nechta qurilmada birdaniga**: Device ro'yxatida bir nechtasini belgilang — har biri o'z sessiyasida ishlaydi,
   hot reload (tugma, buyruq yoki saqlash) hammasiga boradi.
 - **Debug** (`F5`): Flutter ilovalari debug konfiguratsiyasi sifatida avtomatik topiladi (`flutter debug_adapter`) —
@@ -203,7 +214,10 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
 - *Run → Show Device Screen…* (yoki qurilma yonidagi **📱 Screen**) — **telefon/emulator ekrani editor ichida**: bosish = tap,
   sudrash = swipe, g'ildirak = scroll, ◁ ○ ▢ ⏻ tugmalari, matn yozish. Ishlaydi har qanday Android qurilma bilan (USB orqali
   ulangan haqiqiy telefon ham) — faqat `adb` kerak. Ekran "raw" rejimda olinadi (PNG siqishsiz, ikki parallel oqim) —
-  tez qurilmada ~25 fps; `scrcpy` o'rnatilgan bo'lsa, **↗ scrcpy** tugmasi to'liq tezlik va ovoz bilan ochadi. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
+  tez qurilmada ~25 fps; `scrcpy` o'rnatilgan bo'lsa, **↗ scrcpy** tugmasi to'liq tezlik va ovoz bilan ochadi.
+- **📜 Logs** (qurilma yonida yoki *Run → Show Device Logs…*) — Android `adb logcat` (faqat xatolar / ogohlantirishlar /
+  hammasi, yoki faqat shu ilova — paket nomi loyihadan olinadi), iOS simulator `log stream`. Dart exception'lari
+  (`package:app/x.dart:42`) Problems paneliga tushadi va bosganda kodning o'sha qatoriga olib boradi. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
 
 ## Testlar
 

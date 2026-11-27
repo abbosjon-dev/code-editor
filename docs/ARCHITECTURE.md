@@ -111,3 +111,5 @@ uchun O(n²) hisob).
 - [x] Emulator/simulator ishga tushirish, qurilma ekrani (adb screencap + input; iOS — ko'rish)
 - [x] Run chiqishidagi xatolar Problems panelida; Build menyusi (APK/AAB/IPA/web, EAS) va APK o'rnatish
 - [x] Bir nechta qurilmada birdaniga ishga tushirish; tezroq qurilma ekrani (raw screencap, scrcpy)
+- [x] Compound run'lar, `.env` fayllar (Flutter `--dart-define-from-file`), Flutter DevTools preview'da
+- [x] Qurilma loglari (logcat, simulator), Dart exception'lari Problems'da
