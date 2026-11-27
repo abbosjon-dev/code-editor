@@ -39,6 +39,7 @@ enum SidebarView {
     Debug,
     Tests,
     Outline,
+    Docker,
     /// A plugin's panel (index into `PluginHost::panels()`).
     PluginPanel(usize),
 }
@@ -326,6 +327,9 @@ pub struct ZenithApp {
     runs: RunState,
     /// The web preview panel.
     preview: Option<crate::preview::Preview>,
+    docker: crate::docker::Docker,
+    /// Docker actions in flight (verb, container).
+    docker_actions: Vec<(String, String, crate::docker::ActionResult)>,
     /// A phone / emulator / simulator screen.
     mirror: Option<crate::mirror::Mirror>,
     ai: TermPanel,
@@ -461,6 +465,8 @@ impl ZenithApp {
             bottom: TermPanel::default(),
             runs: RunState::default(),
             preview: None,
+            docker: Default::default(),
+            docker_actions: vec![],
             mirror: None,
             ai: TermPanel::default(),
             focus_terminal: None,
@@ -1380,6 +1386,7 @@ impl ZenithApp {
             SidebarView::Debug => "debug".into(),
             SidebarView::Tests => "tests".into(),
             SidebarView::Outline => "outline".into(),
+            SidebarView::Docker => "docker".into(),
             SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
                 Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
                 None => "explorer".into(),
@@ -1460,6 +1467,7 @@ impl ZenithApp {
             "plugins" => SidebarView::Plugins,
             "debug" => SidebarView::Debug,
             "tests" => SidebarView::Tests,
+            "docker" => SidebarView::Docker,
             "outline" => SidebarView::Outline,
             other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
                 Some((plugin, panel)) => self
@@ -4182,6 +4190,7 @@ impl ZenithApp {
                 (SidebarView::Problems, "⚠", "Problems (Ctrl+Shift+M)"),
                 (SidebarView::Debug, "▷", "Run and Debug (Ctrl+Shift+D)"),
                 (SidebarView::Tests, "✓", "Testing"),
+                (SidebarView::Docker, "⊟", "Containers (Docker)"),
                 (SidebarView::Outline, "≡", "Outline"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
@@ -4341,6 +4350,7 @@ impl ZenithApp {
             SidebarView::Plugins => self.plugins_ui(ctx, ui, &p),
             SidebarView::Debug => self.debug_ui(ui, &p),
             SidebarView::Outline => self.outline_ui(ui, &p),
+            SidebarView::Docker => self.docker_ui(ui, &p),
             SidebarView::Tests => {
                 let root = self.workspace.clone();
                 let waker = self.waker.clone();
@@ -7603,6 +7613,147 @@ impl ZenithApp {
             }
         });
         self.runs.rescan_at = Some(Instant::now() + Duration::from_secs(12));
+    }
+
+    /// Containers: grouped by Compose project, with actions, logs and a shell.
+    fn docker_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let root = self.workspace.clone().unwrap_or_else(std::env::temp_dir);
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.docker.poll(remote.as_ref(), &root, Duration::from_secs(3));
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        // Finished actions: report failures.
+        let mut done = vec![];
+        let mut failed = vec![];
+        for (k, (verb, name, rx)) in self.docker_actions.iter().enumerate() {
+            if let Ok(r) = rx.try_recv() {
+                done.push(k);
+                if let Err(e) = r {
+                    failed.push(format!("docker {verb} {name}: {e}"));
+                }
+            }
+        }
+        if !done.is_empty() {
+            self.docker.refresh();
+        }
+        for k in done.into_iter().rev() {
+            self.docker_actions.remove(k);
+        }
+        for m in failed {
+            self.toast(m, NotifyLevel::Error);
+        }
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, "CONTAINERS");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                    self.docker.refresh();
+                }
+            });
+        });
+        if let Some(e) = &self.docker.error {
+            ui.label(RichText::new("Docker isn't available:").small().color(p.warning));
+            ui.label(RichText::new(e).small().color(p.text_dim));
+            return;
+        }
+        if self.docker.containers.is_empty() {
+            ui.label(RichText::new("No containers.").color(p.text_dim));
+            return;
+        }
+        let mut act: Option<(&'static str, crate::docker::Container)> = None;
+        let mut project: Option<&str> = None;
+        let list = self.docker.containers.clone();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for c in &list {
+                if project != Some(c.project.as_str()) {
+                    project = Some(c.project.as_str());
+                    ui.add_space(4.0);
+                    let title =
+                        if c.project.is_empty() { "Containers".to_string() } else { format!("▣ {}", c.project) };
+                    ui.label(RichText::new(title).small().strong().color(p.text_dim));
+                }
+                let r = ui.horizontal(|ui| {
+                    let (dot, color) = match c.state.as_str() {
+                        "running" => ("●", p.success),
+                        "paused" | "restarting" => ("●", p.warning),
+                        _ => ("○", p.text_faint),
+                    };
+                    ui.label(RichText::new(dot).color(color));
+                    ui.label(RichText::new(&c.name).color(p.text)).on_hover_text(format!(
+                        "{}\n{}\n{}{}",
+                        c.image,
+                        c.status,
+                        c.id,
+                        if c.ports.is_empty() { String::new() } else { format!("\n{}", c.ports) }
+                    ));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if c.running() {
+                            if ui.small_button("■").on_hover_text("Stop").clicked() {
+                                act = Some(("stop", c.clone()));
+                            }
+                            if ui.small_button("↻").on_hover_text("Restart").clicked() {
+                                act = Some(("restart", c.clone()));
+                            }
+                            if ui.small_button(">_").on_hover_text("Open a shell in it").clicked() {
+                                act = Some(("shell", c.clone()));
+                            }
+                        } else if ui.small_button("▶").on_hover_text("Start").clicked() {
+                            act = Some(("start", c.clone()));
+                        }
+                        if ui.small_button("📜").on_hover_text("Logs").clicked() {
+                            act = Some(("logs", c.clone()));
+                        }
+                    });
+                });
+                // Second line: image, status and published ports.
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(format!("{} · {}", c.image, c.status)).small().color(p.text_faint));
+                    for port in c.host_ports() {
+                        let u = format!("http://localhost:{port}");
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(format!(":{port}")).small().color(p.accent))
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_text(format!("Open {u} in the preview"))
+                            .clicked()
+                        {
+                            act = Some(("open", crate::docker::Container { ports: u, ..c.clone() }));
+                        }
+                    }
+                });
+                r.response.context_menu(|ui| {
+                    if ui.button("Copy ID").clicked() {
+                        ui.ctx().copy_text(c.id.clone());
+                        ui.close_menu();
+                    }
+                    if !c.running() && ui.button("Remove").clicked() {
+                        act = Some(("rm", c.clone()));
+                        ui.close_menu();
+                    }
+                });
+            }
+        });
+        let Some((verb, c)) = act else { return };
+        match verb {
+            "logs" | "shell" => {
+                let command = if verb == "logs" {
+                    crate::docker::logs_command(&c.name)
+                } else {
+                    crate::docker::shell_command(&c.name)
+                };
+                let cfg = crate::run::RunConfig {
+                    name: format!("{}: {}", if verb == "logs" { "Logs" } else { "Shell" }, c.name),
+                    command,
+                    ..Default::default()
+                };
+                self.start_run_on(cfg, None);
+            }
+            "open" => self.open_preview(&c.ports),
+            _ => {
+                let rx = self.docker.action(remote.as_ref(), root, verb, &c.id);
+                self.docker_actions.push((verb.to_string(), c.name.clone(), rx));
+            }
+        }
     }
 
     /// The Run section at the top of Run and Debug.

@@ -11,6 +11,7 @@ mod crash;
 mod debug;
 mod devices;
 mod diff_view;
+mod docker;
 mod document;
 mod editor_view;
 mod file_tree;
