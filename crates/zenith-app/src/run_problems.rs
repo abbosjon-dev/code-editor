@@ -58,6 +58,14 @@ static PY_FRAME: LazyLock<Regex> = LazyLock::new(|| re(r#"^\s*File "(?P<path>[^"
 static PY_ERROR: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?P<msg>(?:[A-Za-z_][\w.]*)?(?:Error|Exception|Interrupt|Exit)\b.*)$"));
 
+// A Dart stack frame in the app: `#0  main (package:myapp/main.dart:12:5)`
+// (also inside logcat lines: `E/flutter (123): #0 …`).
+static DART_FRAME: LazyLock<Regex> =
+    LazyLock::new(|| re(r"\(package:[\w]+/(?P<path>[^:()]+\.dart):(?P<line>\d+):(?P<col>\d+)\)"));
+// What went wrong, just before the frames.
+static DART_ERROR: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?:^|[\s:)])(?P<msg>(?:Unhandled Exception: )?[A-Z]\w*(?:Exception|Error)\b.*)$"));
+
 /// Lines meaning "it builds now": problems before them are stale.
 fn is_success(l: &str) -> bool {
     let l = l.trim();
@@ -91,6 +99,8 @@ pub fn parse(lines: &[String], cwd: &Path) -> Vec<Problem> {
     let mut out: Vec<Problem> = vec![];
     let mut rust_head: Option<(Severity, String)> = None;
     let mut py_frame: Option<(PathBuf, u32)> = None;
+    // The last Dart exception message, until its first frame in the app.
+    let mut dart_error: Option<String> = None;
     for raw in lines {
         let l = raw.trim_end();
         if is_success(l) {
@@ -119,6 +129,31 @@ pub fn parse(lines: &[String], cwd: &Path) -> Vec<Problem> {
                 );
             }
             continue;
+        }
+        if let Some(c) = DART_FRAME.captures(l) {
+            if let Some(msg) = dart_error.take() {
+                // package:app/x.dart is lib/x.dart of the project.
+                if let Some(path) = resolve(&format!("lib/{}", &c["path"])) {
+                    push(
+                        &mut out,
+                        Problem {
+                            path,
+                            line: c["line"].parse::<u32>().unwrap_or(1).saturating_sub(1),
+                            col: c["col"].parse::<u32>().unwrap_or(1).saturating_sub(1),
+                            severity: Severity::Error,
+                            message: msg,
+                        },
+                    );
+                } else {
+                    dart_error = Some(msg); // a frame in a library: keep looking
+                }
+            }
+            continue;
+        }
+        if let Some(c) = DART_ERROR.captures(l) {
+            if !l.contains(".dart:") {
+                dart_error = Some(c["msg"].trim().to_string());
+            }
         }
         if let Some(c) = PY_FRAME.captures(l) {
             if let Some(path) = resolve(&c["path"]) {
@@ -232,6 +267,23 @@ mod tests {
         assert_eq!(p[0].message, "cannot find value `y` in this scope");
         assert_eq!(p[3].message, "Type 'string' is not assignable to type 'number'.");
         assert_eq!(p[5].message, "undefined: fmtx");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dart_exceptions_in_logcat() {
+        let d = setup();
+        let out = lines(
+            "11-27 10:00:01.000  1234  1250 E flutter : [ERROR:flutter/runtime/dart_vm_initializer.cc(40)] Unhandled Exception: StateError: Bad state: no element\n\
+             11-27 10:00:01.000  1234  1250 E flutter : #0      ListBase.first (package:collection/list.dart:10:3)\n\
+             11-27 10:00:01.000  1234  1250 E flutter : #1      _MyHomePageState.build (package:fapp/main.dart:42:7)\n\
+             11-27 10:00:01.000  1234  1250 E flutter : #2      StatefulElement.build (package:flutter/src/widgets/framework.dart:5592:27)\n",
+        );
+        let p = parse(&out, &d);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].path.ends_with("lib/main.dart"));
+        assert_eq!(p[0].line, 41);
+        assert_eq!(p[0].message, "Unhandled Exception: StateError: Bad state: no element");
         let _ = std::fs::remove_dir_all(&d);
     }
 

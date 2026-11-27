@@ -266,6 +266,87 @@ pub fn scan(remote: Option<RemoteSpec>, root: std::path::PathBuf, flutter: bool)
     rx
 }
 
+/// How much of a device's log to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    All,
+    Warnings,
+    Errors,
+}
+
+impl LogLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            LogLevel::All => "Everything",
+            LogLevel::Warnings => "Warnings and errors",
+            LogLevel::Errors => "Errors only",
+        }
+    }
+}
+
+/// The app's Android package / iOS bundle id, from the project: Flutter's
+/// android/app/build.gradle(.kts) or Expo's app.json.
+pub fn app_id(dir: &Path, ios: bool) -> Option<String> {
+    if let Ok(t) = std::fs::read_to_string(dir.join("app.json")) {
+        let v: serde_json::Value = serde_json::from_str(&t).ok()?;
+        let key = if ios { "/expo/ios/bundleIdentifier" } else { "/expo/android/package" };
+        if let Some(id) = v.pointer(key).and_then(|x| x.as_str()) {
+            return Some(id.to_string());
+        }
+    }
+    if ios {
+        return None;
+    }
+    for f in ["android/app/build.gradle.kts", "android/app/build.gradle"] {
+        let Ok(t) = std::fs::read_to_string(dir.join(f)) else { continue };
+        for l in t.lines() {
+            let l = l.trim();
+            if let Some(rest) = l.strip_prefix("applicationId") {
+                let id = rest.trim().trim_start_matches('=').trim().trim_matches(['"', '\'']);
+                if !id.is_empty() && !id.contains(' ') {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The command that streams a device's log: `adb logcat` for Android,
+/// `simctl … log stream` for an iOS simulator; only `app`'s messages when
+/// given (it must be running for Android).
+pub fn log_command(platform: &str, id: &str, level: LogLevel, app: Option<&str>) -> String {
+    let q = crate::remote::sh_quote;
+    if platform == "ios" {
+        let lvl = match level {
+            LogLevel::All => "debug",
+            _ => "default",
+        };
+        let mut pred = vec![];
+        if let Some(a) = app {
+            pred.push(format!("subsystem BEGINSWITH \"{a}\" OR process == \"Runner\""));
+        }
+        match level {
+            LogLevel::Errors => pred.push("messageType == error OR messageType == fault".into()),
+            LogLevel::Warnings => pred.push("messageType >= default".into()),
+            LogLevel::All => {}
+        }
+        let pred = if pred.is_empty() {
+            String::new()
+        } else {
+            format!(" --predicate {}", q(&pred.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join(" AND ")))
+        };
+        return format!("xcrun simctl spawn {} log stream --style compact --level {lvl}{pred}", q(id));
+    }
+    let filter = match level {
+        LogLevel::All => "",
+        LogLevel::Warnings => " '*:W'",
+        LogLevel::Errors => " '*:E'",
+    };
+    let pid = app.map(|a| format!(" --pid=$(adb -s {} shell pidof -s {})", q(id), q(a))).unwrap_or_default();
+    format!("adb -s {} logcat -v color{pid}{filter}", q(id))
+}
+
 /// The command that starts an emulator / simulator.
 pub fn launch_command(e: &Emulator, tools: &[&str]) -> String {
     let q = crate::remote::sh_quote;
@@ -301,6 +382,37 @@ mod tests {
         );
         assert_eq!(e.len(), 2);
         assert_eq!((e[0].id.as_str(), e[1].platform.as_str()), ("Pixel_8_API_35", "ios"));
+    }
+
+    #[test]
+    fn log_commands_and_app_ids() {
+        assert_eq!(
+            log_command("android", "emulator-5554", LogLevel::Errors, None),
+            "adb -s emulator-5554 logcat -v color '*:E'"
+        );
+        assert_eq!(
+            log_command("android", "R58M", LogLevel::All, Some("com.example.app")),
+            "adb -s R58M logcat -v color --pid=$(adb -s R58M shell pidof -s com.example.app)"
+        );
+        let ios = log_command("ios", "ABCD", LogLevel::Errors, None);
+        assert!(ios.starts_with("xcrun simctl spawn ABCD log stream") && ios.contains("messageType == error"));
+        let d = std::env::temp_dir().join(format!("zenith-appid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("android/app")).unwrap();
+        std::fs::write(
+            d.join("android/app/build.gradle.kts"),
+            "android {\n  defaultConfig {\n    applicationId = \"uz.zenith.demo\"\n  }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(app_id(&d, false).as_deref(), Some("uz.zenith.demo"));
+        std::fs::write(
+            d.join("app.json"),
+            r#"{"expo":{"android":{"package":"uz.expo.app"},"ios":{"bundleIdentifier":"uz.expo.ios"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(app_id(&d, false).as_deref(), Some("uz.expo.app"));
+        assert_eq!(app_id(&d, true).as_deref(), Some("uz.expo.ios"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

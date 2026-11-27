@@ -26,6 +26,8 @@ pub enum PaletteAction {
     StartEmulator(usize),
     /// Mirror the device / simulator with this id.
     DeviceScreen(String),
+    /// Stream the log of the device / simulator with this id.
+    DeviceLogs(String),
     GotoLine(usize),
     SetTheme(String),
     SetSyntaxTheme(String),

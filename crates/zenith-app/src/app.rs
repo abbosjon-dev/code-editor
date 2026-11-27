@@ -1917,7 +1917,7 @@ impl ZenithApp {
                 self.scan_devices(true);
                 self.toast("Looking for devices and emulators…", NotifyLevel::Info);
             }
-            Cmd::StartEmulator | Cmd::ShowDeviceScreen => {
+            Cmd::StartEmulator | Cmd::ShowDeviceScreen | Cmd::ShowDeviceLogs => {
                 let Some(found) = self.runs.found.clone() else {
                     if self.workspace.is_none() {
                         self.toast("Open a folder first", NotifyLevel::Info);
@@ -1942,20 +1942,24 @@ impl ZenithApp {
                         })
                         .collect()
                 } else {
+                    let logs = cmd == Cmd::ShowDeviceLogs;
+                    let act = |id: &str| {
+                        if logs {
+                            PaletteAction::DeviceLogs(id.to_string())
+                        } else {
+                            PaletteAction::DeviceScreen(id.to_string())
+                        }
+                    };
                     let mut v: Vec<Item> = found
                         .devices
                         .iter()
                         .filter(|d| d.platform == "android")
-                        .map(|d| Item {
-                            label: d.label(),
-                            detail: d.id.clone(),
-                            action: PaletteAction::DeviceScreen(d.id.clone()),
-                        })
+                        .map(|d| Item { label: d.label(), detail: d.id.clone(), action: act(&d.id) })
                         .collect();
                     v.extend(found.emulators.iter().filter(|e| e.platform == "ios" && e.booted).map(|e| Item {
                         label: format!("◆ {}", e.name),
-                        detail: "iOS simulator (view only)".into(),
-                        action: PaletteAction::DeviceScreen(e.id.clone()),
+                        detail: if logs { "iOS simulator".into() } else { "iOS simulator (view only)".into() },
+                        action: act(&e.id),
                     }));
                     v
                 };
@@ -1967,7 +1971,11 @@ impl ZenithApp {
                     };
                     self.toast(what, NotifyLevel::Info);
                 } else {
-                    let ph = if cmd == Cmd::StartEmulator { "Start…" } else { "Show the screen of…" };
+                    let ph = match cmd {
+                        Cmd::StartEmulator => "Start…",
+                        Cmd::ShowDeviceLogs => "Show warnings and errors of…",
+                        _ => "Show the screen of…",
+                    };
                     self.palette.show(Mode::Pick, items, ph);
                 }
             }
@@ -2646,6 +2654,21 @@ impl ZenithApp {
                     if let Some(e) = found.emulators.get(i) {
                         self.launch_emulator(e, &found.tools);
                     }
+                }
+            }
+            PaletteAction::DeviceLogs(id) => {
+                let found = self.runs.found.clone().unwrap_or_default();
+                let cwd = self
+                    .runs
+                    .configs
+                    .as_ref()
+                    .and_then(|(c, _)| c.get(self.runs.selected))
+                    .map(|c| c.cwd.clone())
+                    .unwrap_or_default();
+                if let Some(d) = found.devices.iter().find(|d| d.id == id) {
+                    self.open_device_logs("android", &d.id, &d.name, crate::devices::LogLevel::Warnings, None, cwd);
+                } else if let Some(e) = found.emulators.iter().find(|e| e.id == id) {
+                    self.open_device_logs("ios", &e.id, &e.name, crate::devices::LogLevel::Warnings, None, cwd);
                 }
             }
             PaletteAction::DeviceScreen(id) => {
@@ -4040,6 +4063,7 @@ impl ZenithApp {
                 ui.separator();
                 item(ui, Cmd::StartEmulator, "Start Emulator / Simulator…");
                 item(ui, Cmd::ShowDeviceScreen, "Show Device Screen…");
+                item(ui, Cmd::ShowDeviceLogs, "Show Device Logs…");
                 item(ui, Cmd::OpenPreview, "Web Preview…");
                 ui.separator();
                 item(ui, Cmd::DebugStart, "Start Debugging");
@@ -7397,11 +7421,26 @@ impl ZenithApp {
         });
         // Phones and emulators that can be mirrored here.
         let mut screen: Option<(crate::mirror::Target, String)> = None;
+        // The selected project's folder and app ids (to show only its log).
+        let cfg_dir: String = self
+            .runs
+            .configs
+            .as_ref()
+            .and_then(|(c, _)| c.get(self.runs.selected))
+            .map(|c| c.cwd.clone())
+            .unwrap_or_default();
+        let dir = self.workspace.clone().map(|w| if cfg_dir.is_empty() { w.clone() } else { w.join(&cfg_dir) });
+        let app_android = dir.as_ref().and_then(|d| crate::devices::app_id(d, false));
+        let app_ios = dir.as_ref().and_then(|d| crate::devices::app_id(d, true));
+        let mut logs: Option<(&str, String, String, (crate::devices::LogLevel, bool))> = None;
         for d in found.devices.iter().filter(|d| d.platform == "android") {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(d.label()).small().color(p.text));
                 if ui.small_button("📱 Screen").on_hover_text("Show and control its screen here").clicked() {
                     screen = Some((crate::mirror::Target::Android { serial: d.id.clone() }, d.name.clone()));
+                }
+                if let Some(l) = Self::logs_menu(ui, app_android.is_some()) {
+                    logs = Some(("android", d.id.clone(), d.name.clone(), l));
                 }
             });
         }
@@ -7411,7 +7450,22 @@ impl ZenithApp {
                 if ui.small_button("📱 Screen").on_hover_text("Show its screen here (view only)").clicked() {
                     screen = Some((crate::mirror::Target::Ios { udid: e.id.clone() }, e.name.clone()));
                 }
+                if let Some(l) = Self::logs_menu(ui, app_ios.is_some()) {
+                    logs = Some(("ios", e.id.clone(), e.name.clone(), l));
+                }
             });
+        }
+        if let Some((platform, id, name, (level, only_app))) = logs {
+            let app = if only_app {
+                if platform == "ios" {
+                    app_ios.clone()
+                } else {
+                    app_android.clone()
+                }
+            } else {
+                None
+            };
+            self.open_device_logs(platform, &id, &name, level, app, cfg_dir.clone());
         }
         if let Some((t, name)) = screen {
             self.show_device_screen(ui.ctx(), t, name);
@@ -7466,6 +7520,52 @@ impl ZenithApp {
     fn show_device_screen(&mut self, ctx: &egui::Context, target: crate::mirror::Target, name: String) {
         let remote = self.remote.as_ref().map(|r| r.spec.clone());
         self.mirror = Some(crate::mirror::Mirror::start(target, name, remote, ctx.clone()));
+    }
+
+    /// "📜 Logs" menu: a level, and optionally only this app's messages.
+    fn logs_menu(ui: &mut egui::Ui, has_app: bool) -> Option<(crate::devices::LogLevel, bool)> {
+        use crate::devices::LogLevel;
+        let mut pick = None;
+        ui.menu_button(RichText::new("📜 Logs").small(), |ui| {
+            ui.set_min_width(220.0);
+            for l in [LogLevel::Errors, LogLevel::Warnings, LogLevel::All] {
+                if ui.button(l.label()).clicked() {
+                    pick = Some((l, false));
+                    ui.close_menu();
+                }
+            }
+            if has_app {
+                ui.separator();
+                for l in [LogLevel::Warnings, LogLevel::All] {
+                    if ui.button(format!("This app only: {}", l.label().to_lowercase())).clicked() {
+                        pick = Some((l, true));
+                        ui.close_menu();
+                    }
+                }
+            }
+        });
+        pick
+    }
+
+    /// Stream a device's log in a Run tab (errors with app paths go to Problems).
+    fn open_device_logs(
+        &mut self,
+        platform: &str,
+        id: &str,
+        name: &str,
+        level: crate::devices::LogLevel,
+        app: Option<String>,
+        cwd: String,
+    ) {
+        let command = crate::devices::log_command(platform, id, level, app.as_deref());
+        let what = if app.is_some() { "app log" } else { "log" };
+        let c = crate::run::RunConfig {
+            name: format!("{name}: {what} ({})", level.label().to_lowercase()),
+            command,
+            cwd,
+            ..Default::default()
+        };
+        self.start_run_on(c, None);
     }
 
     /// Start an emulator / simulator in the background, then look for

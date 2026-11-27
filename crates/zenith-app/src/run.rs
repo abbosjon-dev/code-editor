@@ -592,7 +592,10 @@ pub fn unwrap_lines(lines: &[String], cols: usize) -> Vec<String> {
             }
             _ => out.push(t.to_string()),
         }
-        let full = cols > 0 && t.chars().count() >= cols.saturating_sub(1);
+        // A line the program cut itself is one terminal row long; longer
+        // ones were wrapped by the terminal (and are already whole).
+        let n = t.chars().count();
+        let full = cols > 0 && n >= cols.saturating_sub(1) && n <= cols;
         // In a narrow pane only a URL cut at the edge is joined (prose
         // would be glued wrongly there).
         let in_url = out.last().and_then(|l| l.split_whitespace().last()).is_some_and(|w| w.contains("://"));
@@ -790,9 +793,13 @@ mod tests {
         let joined = unwrap_lines(&wrapped, 50);
         assert_eq!(joined, ["The DevTools debugger is available at: http://127.0.0.1:4233/x/", "  next"]);
         // Narrow: a URL cut at the edge is joined, prose isn't.
-        assert_eq!(unwrap_lines(&wrapped[..2], 20).len(), 1);
+        let cut = ["at: http://127.0.0".to_string(), ".1:4233/x/".to_string()];
+        assert_eq!(unwrap_lines(&cut, 18), ["at: http://127.0.0.1:4233/x/"]);
         let prose = ["some words that fill".to_string(), "more words".to_string()];
         assert_eq!(unwrap_lines(&prose, 20).len(), 2);
+        // A long logical line (wrapped by the terminal) doesn't swallow the next one.
+        let long = ["x".repeat(70), "11-27 next log line".to_string()];
+        assert_eq!(unwrap_lines(&long, 50).len(), 2);
         let narrow: Vec<String> = [
             "available at:",
             "http://127.0.0.1:4",
