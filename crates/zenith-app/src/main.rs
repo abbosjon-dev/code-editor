@@ -8,6 +8,7 @@ mod commands;
 mod compare;
 mod conflicts;
 mod crash;
+mod db;
 mod debug;
 mod devices;
 mod diff_view;

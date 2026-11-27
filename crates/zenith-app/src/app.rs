@@ -40,6 +40,7 @@ enum SidebarView {
     Tests,
     Outline,
     Docker,
+    Database,
     /// A plugin's panel (index into `PluginHost::panels()`).
     PluginPanel(usize),
 }
@@ -97,6 +98,8 @@ enum InputKind {
     Watch,
     /// `user@host:/path` of a folder to open over SSH.
     RemoteFolder,
+    /// A database URL to add to .zenith/databases.toml.
+    DbConnection,
     /// Edit an option of the breakpoint at (document id, line).
     Breakpoint(u64, usize, crate::editor_view::BpField),
     /// A page to show in the web preview.
@@ -136,6 +139,20 @@ enum Dialog {
         path: PathBuf,
         text: String,
     },
+}
+
+/// The Databases view.
+#[derive(Default)]
+struct DbState {
+    /// Connections for the folder (loaded on first view).
+    conns: Option<Vec<crate::db::Connection>>,
+    selected: usize,
+    tables: Vec<String>,
+    tables_for: Option<String>,
+    tables_rx: Option<std::sync::mpsc::Receiver<crate::db::QueryResult>>,
+    tables_error: Option<String>,
+    filter: String,
+    results: Option<crate::db::Results>,
 }
 
 /// A started run configuration (its output is a bottom terminal tab).
@@ -316,6 +333,8 @@ pub struct ZenithApp {
     /// Zen mode: only the editor, full screen (`Some(was the window already
     /// full screen)` while on).
     zen: Option<bool>,
+    /// Focus the editor in this many frames (after a click elsewhere ends).
+    focus_editor_in: u8,
     /// Two files side by side.
     compare: Option<crate::compare::Compare>,
     /// A paste was requested for "Compare With Clipboard".
@@ -330,6 +349,7 @@ pub struct ZenithApp {
     docker: crate::docker::Docker,
     /// HTTP responses panel.
     http: Option<crate::http_client::Panel>,
+    db: DbState,
     /// Docker actions in flight (verb, container).
     docker_actions: Vec<(String, String, crate::docker::ActionResult)>,
     /// A phone / emulator / simulator screen.
@@ -459,6 +479,7 @@ impl ZenithApp {
             sidebar: SidebarView::Explorer,
             show_sidebar: true,
             zen: None,
+            focus_editor_in: 0,
             compare: None,
             pending_clipboard_compare: false,
             last_esc: f64::MIN,
@@ -469,6 +490,7 @@ impl ZenithApp {
             preview: None,
             docker: Default::default(),
             http: None,
+            db: DbState::default(),
             docker_actions: vec![],
             mirror: None,
             ai: TermPanel::default(),
@@ -1390,6 +1412,7 @@ impl ZenithApp {
             SidebarView::Tests => "tests".into(),
             SidebarView::Outline => "outline".into(),
             SidebarView::Docker => "docker".into(),
+            SidebarView::Database => "database".into(),
             SidebarView::PluginPanel(i) => match self.plugins.panels().get(i) {
                 Some((plugin, panel)) => format!("plugin:{plugin}/{}", panel.id),
                 None => "explorer".into(),
@@ -1471,6 +1494,7 @@ impl ZenithApp {
             "debug" => SidebarView::Debug,
             "tests" => SidebarView::Tests,
             "docker" => SidebarView::Docker,
+            "database" => SidebarView::Database,
             "outline" => SidebarView::Outline,
             other => match other.strip_prefix("plugin:").and_then(|k| k.split_once('/')) {
                 Some((plugin, panel)) => self
@@ -1939,6 +1963,32 @@ impl ZenithApp {
                     kind: InputKind::PreviewUrl,
                     focus: true,
                 });
+            }
+            Cmd::SendHttpRequest
+                if self.docs.get(self.active).is_some_and(|d| {
+                    d.language() == "SQL" || d.path().and_then(|p| p.extension()).is_some_and(|e| e == "sql")
+                }) =>
+            {
+                self.run(ctx, Cmd::RunSqlQuery);
+            }
+            Cmd::RunSqlQuery => {
+                let Some(doc) = self.docs.get(self.active) else { return };
+                let sel = doc.buffer.selected_text();
+                let sql = if sel.trim().is_empty() {
+                    crate::db::statement_at(&doc.buffer.text(), doc.buffer.sel.head)
+                } else {
+                    sel
+                };
+                if sql.trim().is_empty() {
+                    return;
+                }
+                let Some(c) = self.db_connection() else {
+                    self.toast("Pick a database in the Databases view first", NotifyLevel::Info);
+                    self.sidebar = SidebarView::Database;
+                    self.show_sidebar = true;
+                    return;
+                };
+                self.db_query(c, sql);
             }
             Cmd::SendHttpRequest => {
                 let Some(doc) = self.docs.get(self.active) else { return };
@@ -4236,6 +4286,7 @@ impl ZenithApp {
                 (SidebarView::Debug, "▷", "Run and Debug (Ctrl+Shift+D)"),
                 (SidebarView::Tests, "✓", "Testing"),
                 (SidebarView::Docker, "⊟", "Containers (Docker)"),
+                (SidebarView::Database, "⊜", "Databases"),
                 (SidebarView::Outline, "≡", "Outline"),
                 (SidebarView::Agents, "✳", "AI Agents"),
                 (SidebarView::Plugins, "⊞", "Plugins"),
@@ -4396,6 +4447,7 @@ impl ZenithApp {
             SidebarView::Debug => self.debug_ui(ui, &p),
             SidebarView::Outline => self.outline_ui(ui, &p),
             SidebarView::Docker => self.docker_ui(ui, &p),
+            SidebarView::Database => self.database_ui(ui, &p),
             SidebarView::Tests => {
                 let root = self.workspace.clone();
                 let waker = self.waker.clone();
@@ -6677,6 +6729,27 @@ impl ZenithApp {
                 self.save_session();
                 return;
             }
+            InputKind::DbConnection => {
+                let url = name.trim().to_string();
+                let Some(ws) = self.workspace.clone() else { return };
+                let c = crate::db::Connection {
+                    name: crate::db::Connection { name: String::new(), url: url.clone() }
+                        .display_url()
+                        .rsplit(['@', '/'])
+                        .next()
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or("database")
+                        .to_string(),
+                    url,
+                };
+                if c.kind().is_none() {
+                    self.toast("Use postgres://, mysql:// or sqlite:path", NotifyLevel::Warning);
+                    return;
+                }
+                let r = crate::db::save_connection(&ws, c);
+                self.db.conns = None;
+                r
+            }
             InputKind::PreviewUrl => {
                 let mut u = name.trim().to_string();
                 if !u.is_empty() {
@@ -7681,6 +7754,139 @@ impl ZenithApp {
             }
         });
         self.runs.rescan_at = Some(Instant::now() + Duration::from_secs(12));
+    }
+
+    fn db_connection(&mut self) -> Option<crate::db::Connection> {
+        if self.db.conns.is_none() {
+            self.db.conns = Some(self.workspace.as_deref().map(crate::db::connections).unwrap_or_default());
+        }
+        self.db.conns.as_ref()?.get(self.db.selected).cloned()
+    }
+
+    fn db_query(&mut self, c: crate::db::Connection, sql: String) {
+        let root = self.workspace.clone().unwrap_or_else(std::env::temp_dir);
+        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+        self.db.results.get_or_insert_with(Default::default).start(&c, &root, remote, sql);
+    }
+
+    /// Databases: connections, their tables (click to look inside), new query.
+    fn database_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let conn = self.db_connection();
+        let conns = self.db.conns.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            Self::section_header(ui, p, "DATABASES");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("+").on_hover_text("Add a connection (postgres://, mysql://, sqlite:path)").clicked()
+                {
+                    self.dialog = Some(Dialog::Input {
+                        title: "Database URL (postgres://user:pass@host/db, mysql://…, sqlite:path)".into(),
+                        value: String::new(),
+                        kind: InputKind::DbConnection,
+                        focus: true,
+                    });
+                }
+                if ui.small_button("⟳").on_hover_text("Look for databases again").clicked() {
+                    self.db.conns = None;
+                    self.db.tables_for = None;
+                }
+            });
+        });
+        let Some(conn) = conn else {
+            ui.label(
+                RichText::new(
+                    "No databases found. Add one with +, set DATABASE_URL in an .env file, or put a SQLite file in the folder.",
+                )
+                .color(p.text_dim),
+            );
+            return;
+        };
+        let mut sel = self.db.selected;
+        egui::ComboBox::from_id_salt("db-conn").width(ui.available_width() - 4.0).selected_text(&conn.name).show_ui(
+            ui,
+            |ui| {
+                for (i, c) in conns.iter().enumerate() {
+                    ui.selectable_value(&mut sel, i, &c.name).on_hover_text(c.display_url());
+                }
+            },
+        );
+        if sel != self.db.selected {
+            self.db.selected = sel;
+            self.db.tables_for = None;
+            return;
+        }
+        ui.label(RichText::new(conn.display_url()).small().color(p.text_faint));
+        // Tables, read once per connection.
+        if self.db.tables_for.as_deref() != Some(conn.url.as_str()) {
+            self.db.tables_for = Some(conn.url.clone());
+            self.db.tables.clear();
+            self.db.tables_error = None;
+            if let Some(k) = conn.kind() {
+                let root = self.workspace.clone().unwrap_or_else(std::env::temp_dir);
+                let remote = self.remote.as_ref().map(|r| r.spec.clone());
+                self.db.tables_rx = Some(crate::db::query(&conn, &root, remote, crate::db::tables_sql(k).into()));
+            }
+        }
+        if let Some(rx) = &self.db.tables_rx {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.db.tables_rx = None;
+                    self.db.tables_error = r.error;
+                    self.db.tables = r.rows.into_iter().filter_map(|row| row.into_iter().next()).collect();
+                }
+                Err(_) => {
+                    ui.spinner();
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                }
+            }
+        }
+        let mut run: Option<String> = None;
+        ui.horizontal(|ui| {
+            if ui
+                .button("New query")
+                .on_hover_text("A SQL tab for this database (Ctrl+Alt+Enter runs a statement)")
+                .clicked()
+            {
+                self.run(&ui.ctx().clone(), Cmd::NewFile);
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    if let Some(syn) = highlight::syntax_by_name("SQL") {
+                        doc.highlight.set_syntax(syn);
+                    }
+                    doc.buffer.insert(&format!("-- {}\n", conn.name));
+                }
+                // The button's click ends this frame: focus the editor after it.
+                self.focus_editor_in = 2;
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.db.filter).hint_text("Filter tables").desired_width(f32::INFINITY),
+            );
+        });
+        if let Some(e) = &self.db.tables_error {
+            ui.label(RichText::new(e).small().color(p.error));
+        }
+        ui.add_space(4.0);
+        let k = conn.kind().unwrap_or(crate::db::Kind::Sqlite);
+        let filter = self.db.filter.to_lowercase();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for t in self.db.tables.iter().filter(|t| filter.is_empty() || t.to_lowercase().contains(&filter)) {
+                let r = ui.add(egui::Label::new(RichText::new(format!("⊞ {t}")).color(p.text)).sense(Sense::click()));
+                if r.clone().on_hover_text("Show the first 200 rows").clicked() {
+                    run = Some(format!("SELECT * FROM {} LIMIT 200;", crate::db::quote_ident(k, t)));
+                }
+                r.context_menu(|ui| {
+                    if ui.button("Count rows").clicked() {
+                        run = Some(format!("SELECT COUNT(*) AS rows FROM {};", crate::db::quote_ident(k, t)));
+                        ui.close_menu();
+                    }
+                    if ui.button("Copy name").clicked() {
+                        ui.ctx().copy_text(t.clone());
+                        ui.close_menu();
+                    }
+                });
+            }
+        });
+        if let Some(sql) = run {
+            self.db_query(conn, sql);
+        }
     }
 
     /// Containers: grouped by Compose project, with actions, logs and a shell.
@@ -8886,6 +9092,13 @@ impl ZenithApp {
         if std::env::var_os("ZENITH_TEST_CRASH").is_some() && ctx.cumulative_pass_nr() > 5 {
             panic!("ZENITH_TEST_CRASH was set");
         }
+        if self.focus_editor_in > 0 {
+            self.focus_editor_in -= 1;
+            if self.focus_editor_in == 0 {
+                self.focus_editor = true;
+            }
+            ctx.request_repaint();
+        }
         self.poll_loading();
         self.refresh_outline();
         self.poll_runs();
@@ -9060,6 +9273,31 @@ impl ZenithApp {
                 .show(ctx, |ui| self.sidebar_ui(ctx, ui));
         }
         self.terminal_focused = false;
+        if let Some(r) = &mut self.db.results {
+            r.poll();
+            let fs = self.settings.editor_font_size;
+            let mut act = None;
+            egui::SidePanel::right("db-results")
+                .default_width(520.0)
+                .width_range(280.0..=1600.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.bg_panel)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .stroke(Stroke::new(1.0_f32, p.border)),
+                )
+                .show(ctx, |ui| act = r.ui(ui, &p, fs));
+            match act {
+                Some(crate::db::Action::Close) => self.db.results = None,
+                Some(crate::db::Action::OpenText(t)) => {
+                    self.run(ctx, Cmd::NewFile);
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        doc.buffer.insert(&t);
+                    }
+                }
+                None => {}
+            }
+        }
         if let Some(h) = &mut self.http {
             h.poll();
             let fs = self.settings.editor_font_size;
