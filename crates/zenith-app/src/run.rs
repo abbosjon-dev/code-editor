@@ -354,6 +354,10 @@ fn detect_in(dir: &Path, rel: &str) -> Vec<RunConfig> {
     if let Ok(t) = std::fs::read_to_string(dir.join("Cargo.toml")) {
         if dir.join("src/main.rs").exists() || t.contains("[[bin]]") {
             out.push(mk(at("Cargo: run"), "cargo run", Kind::Cargo));
+            // Rebuild and rerun on every change, when cargo-watch is installed.
+            if which::which("cargo-watch").is_ok() {
+                out.push(mk(at("Cargo: watch"), "cargo watch -q -c -x run", Kind::Cargo));
+            }
         }
     }
     // Go.

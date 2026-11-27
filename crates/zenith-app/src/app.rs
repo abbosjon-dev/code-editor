@@ -194,6 +194,10 @@ struct RunState {
     group: Option<String>,
     /// `.env` file to run with (by name, where a project has it).
     env_choice: Option<String>,
+    /// Configurations (by name) restarted when a file in their folder is saved.
+    restart_on_save: std::collections::HashSet<String>,
+    /// Sessions to restart after a save (collected so Save All restarts once).
+    restart_due: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -1113,6 +1117,18 @@ impl ZenithApp {
                 }
                 if let Some(pv) = self.preview.as_mut().filter(|p| p.reload_on_save) {
                     pv.reload();
+                }
+                // Runs in watch mode: restart those whose folder has the file.
+                if let (Some(p), Some(ws)) = (&path, self.workspace.clone()) {
+                    for (i, r) in self.runs.sessions.iter().enumerate() {
+                        let dir = if r.config.cwd.is_empty() { ws.clone() } else { ws.join(&r.config.cwd) };
+                        if self.runs.restart_on_save.contains(&r.config.name)
+                            && p.starts_with(&dir)
+                            && !self.runs.restart_due.contains(&i)
+                        {
+                            self.runs.restart_due.push(i);
+                        }
+                    }
                 }
                 // Flutter: hot reload running apps when Dart code is saved.
                 // (In a debug session the adapter does it; else the Run tabs.)
@@ -7258,6 +7274,12 @@ impl ZenithApp {
     /// Forget closed tabs; look for URLs in the output; forward their ports
     /// from the SSH host.
     fn poll_runs(&mut self) {
+        for i in std::mem::take(&mut self.runs.restart_due) {
+            if let Some(r) = self.runs.sessions.get(i) {
+                let (c, d) = (r.config.clone(), r.device.clone());
+                self.start_run_on(c, d);
+            }
+        }
         if self.runs.rescan_at.is_some_and(|t| Instant::now() >= t) && self.runs.scanning.is_none() {
             self.runs.rescan_at = None;
             let flutter = self.runs.found.as_ref().is_some_and(|f| f.tools.contains(&"flutter"));
@@ -7749,6 +7771,19 @@ impl ZenithApp {
                             if ui.small_button("✕").on_hover_text("Close").clicked() {
                                 act = Some((i, "close"));
                             }
+                            // Watch mode (Flutter hot reloads instead).
+                            if !r.config.build && r.config.kind != crate::run::Kind::Flutter {
+                                let on = self.runs.restart_on_save.contains(&r.config.name);
+                                let label = RichText::new("⟲").color(if on { p.accent } else { p.text_faint });
+                                let tip = if on {
+                                    "Restarts when a file in its folder is saved (click to stop)"
+                                } else {
+                                    "Restart when a file in its folder is saved"
+                                };
+                                if ui.add(egui::Button::new(label).small().selected(on)).on_hover_text(tip).clicked() {
+                                    act = Some((i, "toggle-watch"));
+                                }
+                            }
                             if alive {
                                 if ui.small_button("■").on_hover_text("Stop").clicked() {
                                     act = Some((i, "stop"));
@@ -7941,6 +7976,12 @@ impl ZenithApp {
         if let Some((i, a)) = act {
             match a {
                 "show" => self.show_run_output(i),
+                "toggle-watch" => {
+                    let name = self.runs.sessions[i].config.name.clone();
+                    if !self.runs.restart_on_save.remove(&name) {
+                        self.runs.restart_on_save.insert(name);
+                    }
+                }
                 "stop-group" | "restart-group" => {
                     let g = self.runs.sessions[i].group.clone();
                     let members: Vec<usize> =
