@@ -113,3 +113,5 @@ uchun O(n²) hisob).
 - [x] Bir nechta qurilmada birdaniga ishga tushirish; tezroq qurilma ekrani (raw screencap, scrcpy)
 - [x] Compound run'lar, `.env` fayllar (Flutter `--dart-define-from-file`), Flutter DevTools preview'da
 - [x] Qurilma loglari (logcat, simulator), Dart exception'lari Problems'da
+- [x] HTTP so'rovlar (`.http` fayllar, curl), ma'lumotlar bazasi paneli (sqlite3/psql/mysql), Docker paneli
+- [x] Saqlaganda run'ni qayta ishga tushirish (watch rejimi)

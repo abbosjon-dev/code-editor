@@ -219,6 +219,29 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
   hammasi, yoki faqat shu ilova — paket nomi loyihadan olinadi), iOS simulator `log stream`. Dart exception'lari
   (`package:app/x.dart:42`) Problems paneliga tushadi va bosganda kodning o'sha qatoriga olib boradi. iOS simulator ekrani — ko'rish rejimida (Apple boshqarish API'sini bermaydi).
 
+## HTTP so'rovlar, ma'lumotlar bazasi, Docker
+
+- **HTTP (`.http` / `.rest` fayllar).** So'rovlar `###` bilan ajratiladi, `@base = http://localhost:3000` o'zgaruvchilari
+  `{{base}}` ko'rinishida ishlatiladi (tanlangan `.env` va muhit o'zgaruvchilari ham). Kursor turgan so'rov
+  `Ctrl+Alt+Enter` yoki fayl tepasidagi **▶ Send request** bilan yuboriladi (SSH papkada — serverning o'zidan).
+  Javob paneli: status, vaqt, hajm, JSON chiroyli formatda, sarlavhalar, Copy / Open / Send again, oxirgi 30 ta javob.
+  *Run → New HTTP Request File* — shablon.
+  ```http
+  @base = http://localhost:8000
+
+  ### Mahsulotlar
+  GET {{base}}/items
+  Authorization: Bearer {{TOKEN}}
+  ```
+- **Ma'lumotlar bazalari** (⊜ paneli) — SQLite, PostgreSQL, MySQL/MariaDB (o'z CLI'lari orqali: `sqlite3`, `psql`, `mysql`).
+  Ulanishlar avtomatik topiladi: `.env`dagi `DATABASE_URL`, papkadagi SQLite fayllar, `.zenith/databases.toml`; **+** bilan
+  qo'shish. Jadvalni bosing — birinchi 200 qator; **New query** — SQL tab, `Ctrl+Alt+Enter` belgilangan yoki kursor
+  turgan so'rovni bajaradi. Natija jadvalda (NULL alohida, katakni bosing — nusxa), CSV sifatida ochish, xatolar.
+- **Konteynerlar** (⊟ paneli) — `docker ps -a` Compose loyihalari bo'yicha: start / stop / restart, loglar, ichida
+  shell (`>_`), port bosilsa preview'da ochiladi, o'ng tugma — Remove.
+- **⟲ Saqlaganda qayta ishga tushirish** — Run kartasidagi ⟲ yoqilsa, papkadagi fayl saqlanganda sessiya qayta
+  ishga tushadi (backend serverlar uchun). `cargo-watch` o'rnatilgan bo'lsa — *Cargo: watch* ham chiqadi.
+
 ## Testlar
 
 **Testing** paneli (✓ belgisi) loyihadagi testlarni topadi: **Rust** (`cargo test` — lib, bin va `tests/`
@@ -426,6 +449,7 @@ matn obyektlari bilan (`ciw`, `da(`, `ci"`, `yi{`), `dd yy cc x X D C s S r ~ J 
 | Yon panel | `Ctrl+B` | `⌘B` |
 | Zen rejimi | `Ctrl+Alt+Z` (chiqish: `Esc Esc`) | `⌘⌥Z` |
 | Loyihani ishga tushirish (Run) | `Ctrl+F5` | `⌘F5` |
+| HTTP so'rov / SQL so'rovni bajarish | `Ctrl+Alt+Enter` | `⌘⌥↩` |
 | Import'larni tartiblash | `Shift+Alt+O` | `⇧⌥O` |
 | Masshtab | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | `⌘=` / `⌘-` / `⌘0` |
 
