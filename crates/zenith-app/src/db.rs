@@ -401,7 +401,8 @@ mod tests {
         assert_eq!(env, [("MYSQL_PWD".to_string(), "p@ss".to_string())]);
         assert!(!args.iter().any(|a| a.contains("ss")));
         let sq = Connection { name: "c".into(), url: "sqlite:data/app.db".into() };
-        assert_eq!(client(&sq, Path::new("/w")).unwrap().1.last().unwrap(), "/w/data/app.db");
+        let expected = Path::new("/w").join("data/app.db").to_string_lossy().into_owned();
+        assert_eq!(client(&sq, Path::new("/w")).unwrap().1.last().unwrap(), &expected);
         assert_eq!(quote_ident(Kind::Postgres, "audit.log\"x"), "\"audit\".\"log\"\"x\"");
         assert_eq!(quote_ident(Kind::Mysql, "users"), "`users`");
     }

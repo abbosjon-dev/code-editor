@@ -214,8 +214,9 @@ fn push(out: &mut Vec<Problem>, p: Problem) {
 mod tests {
     use super::*;
 
-    fn setup() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("zenith-runp-{}", std::process::id()));
+    /// A project for one test (tests run in parallel: each gets its own).
+    fn setup(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("zenith-runp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         for f in ["src/main.rs", "lib/main.dart", "src/app.ts", "main.go", "app.py", "hello.c"] {
             let p = d.join(f);
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn finds_compiler_errors() {
-        let d = setup();
+        let d = setup("compiler");
         let out = lines(
             "   Compiling x v0.1.0\n\
              error[E0425]: cannot find value `y` in this scope\n\
@@ -272,7 +273,7 @@ mod tests {
 
     #[test]
     fn dart_exceptions_in_logcat() {
-        let d = setup();
+        let d = setup("dart");
         let out = lines(
             "11-27 10:00:01.000  1234  1250 E flutter : [ERROR:flutter/runtime/dart_vm_initializer.cc(40)] Unhandled Exception: StateError: Bad state: no element\n\
              11-27 10:00:01.000  1234  1250 E flutter : #0      ListBase.first (package:collection/list.dart:10:3)\n\
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn python_traceback_and_success_clears() {
-        let d = setup();
+        let d = setup("python");
         let py = d.join("app.py").to_string_lossy().into_owned();
         let out = lines(&format!(
             "Traceback (most recent call last):\n  File \"{py}\", line 10, in <module>\n    main()\n  File \"/usr/lib/python3/x.py\", line 3, in f\nNameError: name 'x' is not defined\n"
