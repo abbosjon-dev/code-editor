@@ -328,6 +328,8 @@ pub struct ZenithApp {
     /// The web preview panel.
     preview: Option<crate::preview::Preview>,
     docker: crate::docker::Docker,
+    /// HTTP responses panel.
+    http: Option<crate::http_client::Panel>,
     /// Docker actions in flight (verb, container).
     docker_actions: Vec<(String, String, crate::docker::ActionResult)>,
     /// A phone / emulator / simulator screen.
@@ -466,6 +468,7 @@ impl ZenithApp {
             runs: RunState::default(),
             preview: None,
             docker: Default::default(),
+            http: None,
             docker_actions: vec![],
             mirror: None,
             ai: TermPanel::default(),
@@ -1936,6 +1939,45 @@ impl ZenithApp {
                     kind: InputKind::PreviewUrl,
                     focus: true,
                 });
+            }
+            Cmd::SendHttpRequest => {
+                let Some(doc) = self.docs.get(self.active) else { return };
+                let is_http = doc.path().and_then(|p| p.extension()).is_some_and(|e| e == "http" || e == "rest");
+                if !is_http {
+                    self.toast(
+                        "Put the caret in a request of a .http file (HTTP: New Request File)",
+                        NotifyLevel::Info,
+                    );
+                    return;
+                }
+                let text = doc.buffer.text();
+                let line = doc.buffer.cursor_pos().line;
+                // {{name}}: the file's @variables, then the picked env file, then the environment.
+                let env_vars: Vec<(String, String)> = match (&self.runs.env_choice, doc.path().and_then(|p| p.parent()))
+                {
+                    (Some(f), Some(dir)) => std::fs::read_to_string(dir.join(f))
+                        .or_else(|_| std::fs::read_to_string(self.workspace.clone().unwrap_or_default().join(f)))
+                        .map(|t| crate::run::parse_env_file(&t))
+                        .unwrap_or_default(),
+                    _ => vec![],
+                };
+                let extra = |k: &str| {
+                    env_vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).or_else(|| std::env::var(k).ok())
+                };
+                match crate::http_client::request_at(&text, line, &extra) {
+                    Some(req) => {
+                        let remote = self.remote.as_ref().map(|r| r.spec.clone());
+                        self.http.get_or_insert_with(Default::default).start(req, remote);
+                    }
+                    None => self.toast("No request here (a line like: GET https://…)", NotifyLevel::Info),
+                }
+            }
+            Cmd::NewHttpRequest => {
+                self.run(ctx, Cmd::NewFile);
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    doc.buffer.insert(crate::http_client::TEMPLATE);
+                }
+                self.toast("Save it as a .http file, then Ctrl+Alt+Enter in a request", NotifyLevel::Info);
             }
             Cmd::RefreshDevices => {
                 self.scan_devices(true);
@@ -3865,6 +3907,7 @@ impl ZenithApp {
             (cs, Key::F5, Cmd::DebugRestart, true),
             (Modifiers::SHIFT, Key::F5, Cmd::DebugStop, true),
             (cmd, Key::F5, Cmd::RunProject, true),
+            (ca, Key::Enter, Cmd::SendHttpRequest, false),
             (Modifiers::NONE, Key::F5, Cmd::DebugStart, true),
             (Modifiers::NONE, Key::F6, Cmd::DebugPause, true),
             (Modifiers::NONE, Key::F9, Cmd::ToggleBreakpoint, false),
@@ -4089,6 +4132,8 @@ impl ZenithApp {
                 item(ui, Cmd::ShowDeviceScreen, "Show Device Screen…");
                 item(ui, Cmd::ShowDeviceLogs, "Show Device Logs…");
                 item(ui, Cmd::OpenPreview, "Web Preview…");
+                item(ui, Cmd::NewHttpRequest, "New HTTP Request File");
+                item(ui, Cmd::SendHttpRequest, "Send HTTP Request");
                 ui.separator();
                 item(ui, Cmd::DebugStart, "Start Debugging");
                 item(ui, Cmd::OpenRunConfig, "Open run.toml");
@@ -5168,6 +5213,13 @@ impl ZenithApp {
         }
         // Breadcrumbs.
         let is_md = self.docs.get(shown).is_some_and(|d| d.language().starts_with("Markdown"));
+        let is_http = self
+            .docs
+            .get(shown)
+            .and_then(|d| d.path())
+            .and_then(|p| p.extension())
+            .is_some_and(|e| e == "http" || e == "rest");
+        let mut send_http = false;
         if let Some((line, col)) = self.crumb_jump.take() {
             if let Some(doc) = self.docs.get_mut(shown) {
                 let idx = doc.buffer.pos_to_char(zenith_core::Position::new(line, col));
@@ -5207,6 +5259,19 @@ impl ZenithApp {
                         });
                     }
                 }
+                if is_http {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        let label = RichText::new("▶ Send request").size(12.0).color(p.accent);
+                        if ui
+                            .add(egui::Button::new(label).frame(false))
+                            .on_hover_text("Send the request under the caret (Ctrl+Alt+Enter)")
+                            .clicked()
+                        {
+                            send_http = true;
+                        }
+                    });
+                }
                 if is_md {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(10.0);
@@ -5228,6 +5293,9 @@ impl ZenithApp {
             });
             if jump.is_some() {
                 self.crumb_jump = jump;
+            }
+            if send_http {
+                self.run(ctx, Cmd::SendHttpRequest);
             }
         }
         let review = self.settings.review_external_changes;
@@ -8992,6 +9060,37 @@ impl ZenithApp {
                 .show(ctx, |ui| self.sidebar_ui(ctx, ui));
         }
         self.terminal_focused = false;
+        if let Some(h) = &mut self.http {
+            h.poll();
+            let fs = self.settings.editor_font_size;
+            let mut act = None;
+            egui::SidePanel::right("http-panel")
+                .default_width(480.0)
+                .width_range(280.0..=1400.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.bg_panel)
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .stroke(Stroke::new(1.0_f32, p.border)),
+                )
+                .show(ctx, |ui| act = h.ui(ui, &p, fs));
+            match act {
+                Some(crate::http_client::Action::Close) => self.http = None,
+                Some(crate::http_client::Action::OpenBody(body)) => {
+                    self.run(ctx, Cmd::NewFile);
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        doc.buffer.insert(&body);
+                    }
+                }
+                Some(crate::http_client::Action::Resend(req)) => {
+                    let remote = self.remote.as_ref().map(|r| r.spec.clone());
+                    if let Some(h) = &mut self.http {
+                        h.start(req, remote);
+                    }
+                }
+                None => {}
+            }
+        }
         if self.mirror.is_some() {
             let mut close = false;
             egui::SidePanel::right("device-mirror")

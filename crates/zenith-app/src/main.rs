@@ -20,6 +20,7 @@ mod git;
 mod git_log;
 mod highlight;
 mod history;
+mod http_client;
 mod imports;
 mod inline_ai;
 mod keymap;
