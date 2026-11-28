@@ -363,6 +363,7 @@ pub struct ZenithApp {
     profile_view: Option<crate::profile::View>,
     /// Coverage of changed lines: (against the branch base?, result, summary).
     changes_cov: Option<ChangesCov>,
+    show_project_setup: bool,
     /// Profiling sessions: (terminal tab, the file it will write, title).
     pending_profiles: Vec<(u64, PathBuf, String)>,
     /// Show coverage in the gutter (and keep reloading the report).
@@ -515,6 +516,7 @@ impl ZenithApp {
             coverage: Default::default(),
             profile_view: None,
             changes_cov: None,
+            show_project_setup: false,
             pending_profiles: vec![],
             show_coverage: false,
             coverage_checked: None,
@@ -2095,6 +2097,13 @@ impl ZenithApp {
                         }
                     }
                 }
+            }
+            Cmd::ProjectSetup => {
+                if self.workspace.is_none() {
+                    self.toast("Open a folder first", NotifyLevel::Info);
+                    return;
+                }
+                self.show_project_setup = true;
             }
             Cmd::CoverageOfChanges => {
                 let branch = self.changes_cov.as_ref().is_some_and(|c| c.branch);
@@ -4305,6 +4314,7 @@ impl ZenithApp {
                 item(ui, Cmd::SendHttpRequest, "Send HTTP Request");
                 ui.separator();
                 item(ui, Cmd::DebugStart, "Start Debugging");
+                item(ui, Cmd::ProjectSetup, "Project Setup…");
                 item(ui, Cmd::OpenRunConfig, "Open run.toml");
                 item(ui, Cmd::OpenLaunchConfig, "Open launch.toml");
             });
@@ -9508,6 +9518,10 @@ impl eframe::App for ZenithApp {
             || self.compare.is_some()
             || self.history.is_some()
             || self.inline_edit.is_some()
+            || self.show_project_setup
+            || self.changes_cov.is_some()
+            || self.line_history.is_some()
+            || self.profile_view.is_some()
             || ctx.memory(|m| m.any_popup_open());
         if let Some(pv) = &mut self.preview {
             if covered {
@@ -9934,6 +9948,38 @@ impl ZenithApp {
         self.settings_window(ctx);
         self.inline_edit_window(ctx);
         self.changes_cov_window(ctx);
+        if self.show_project_setup {
+            let mut open = true;
+            let root = self.workspace.clone().unwrap_or_default();
+            let act = crate::project_setup::ui(ctx, &self.colors.clone(), &root, &mut open);
+            self.show_project_setup = open;
+            match act {
+                Some(crate::project_setup::Action::Open(k)) => {
+                    use crate::project_setup::Kind;
+                    match k {
+                        Kind::Run => self.run(ctx, Cmd::OpenRunConfig),
+                        Kind::Launch => self.run(ctx, Cmd::OpenLaunchConfig),
+                        Kind::Settings => self.run(ctx, Cmd::OpenWorkspaceSettings),
+                        Kind::Databases => {
+                            let p = k.path(&root);
+                            if !p.exists() {
+                                let _ = std::fs::create_dir_all(p.parent().unwrap_or(&root));
+                                let _ = std::fs::write(&p, crate::db::TEMPLATE);
+                                self.db.conns = None;
+                            }
+                            self.open_file(&p);
+                        }
+                    }
+                    self.show_project_setup = false;
+                }
+                Some(crate::project_setup::Action::AddIgnores) => {
+                    if let Err(e) = crate::project_setup::add_ignores(&root) {
+                        self.toast(format!(".gitignore: {e}"), NotifyLevel::Error);
+                    }
+                }
+                None => {}
+            }
+        }
         if let Some(v) = &mut self.profile_view {
             let mut open = true;
             let act = v.ui(ctx, &self.colors.clone(), &mut open);

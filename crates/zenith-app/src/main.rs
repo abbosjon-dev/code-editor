@@ -36,6 +36,7 @@ mod outline;
 mod palette;
 mod preview;
 mod profile;
+mod project_setup;
 mod qr;
 mod remote;
 mod review;

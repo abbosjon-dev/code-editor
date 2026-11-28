@@ -289,6 +289,20 @@ struct File {
     connections: Vec<Connection>,
 }
 
+/// A new `.zenith/databases.toml`.
+pub const TEMPLATE: &str = r#"# Database connections for the Databases view. Commit this file; keep
+# passwords out of it: use an env file (DATABASE_URL=… in .env is found
+# automatically) or a connection without a password (pgpass, socket auth).
+
+# [[connections]]
+# name = "Local Postgres"
+# url = "postgres://app@localhost:5432/app_dev"
+#
+# [[connections]]
+# name = "Fixtures"
+# url = "sqlite:data/fixtures.db"
+"#;
+
 pub fn config_path(root: &Path) -> PathBuf {
     root.join(".zenith").join("databases.toml")
 }
