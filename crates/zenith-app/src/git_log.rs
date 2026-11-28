@@ -87,6 +87,34 @@ pub fn message(run: &Runner, hash: &str) -> String {
     run.git(&["show", "-s", "--format=%B%n— %an <%ae>, %ad", "--date=local", hash]).unwrap_or_default()
 }
 
+/// How lines `from..=to` (1-based) of `file` changed: newest commit first,
+/// each with the part of its diff that touched them (`git log -L`).
+pub fn line_history(
+    run: &Runner,
+    file: &str,
+    from: usize,
+    to: usize,
+    limit: usize,
+) -> Result<Vec<(Commit, String)>, String> {
+    let range = format!("-L{from},{to}:{file}");
+    let n = format!("-n{limit}");
+    let out = run.git(&["log", "--format=%x1e%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1f%D", n.as_str(), range.as_str()])?;
+    Ok(parse_line_history(&out))
+}
+
+pub fn parse_line_history(out: &str) -> Vec<(Commit, String)> {
+    out.split('\x1e')
+        .filter_map(|rec| {
+            let (head, patch) = rec.split_once('\n').unwrap_or((rec, ""));
+            let mut c = parse_log(&format!("{head}\x1e"));
+            let c = c.pop()?;
+            // Keep the hunks (from "@@"), not the diff --git / index lines.
+            let diff: Vec<&str> = patch.lines().skip_while(|l| !l.starts_with("@@")).collect();
+            Some((c, diff.join("\n").trim_end().to_string()))
+        })
+        .collect()
+}
+
 /// One row of the graph: the commit's lane, the lanes passing through,
 /// and the lanes its parents continue in (drawn to the next row).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -222,6 +250,9 @@ mod tests {
         assert_eq!(file_at(&run, &log[1].hash, "b.txt"), "");
         let first_files = changed_files(&run, None, &log[1].hash).unwrap();
         assert_eq!(first_files.len(), 1);
+        let lh = line_history(&run, "a.txt", 1, 1, 10).unwrap();
+        assert_eq!(lh.iter().map(|(c, _)| c.subject.as_str()).collect::<Vec<_>>(), ["second", "first"]);
+        assert!(lh[0].1.contains("-one") && lh[0].1.contains("+two"), "{}", lh[0].1);
         let hist = super::log(&run, Some("b.txt"), 50).unwrap();
         assert_eq!(hist.len(), 1);
         assert!(message(&run, &log[0].hash).starts_with("second"));

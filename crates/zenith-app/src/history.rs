@@ -42,6 +42,9 @@ pub struct History {
     /// Scroll the diff to its first change once (it just arrived).
     diff_jump: bool,
     waker: Arc<dyn Fn() + Send + Sync>,
+    /// Select this commit once the log has loaded.
+    pub select_hash: Option<String>,
+    scroll_to_selected: bool,
 }
 
 /// What the window asks the app to do.
@@ -93,6 +96,8 @@ impl History {
             filter: String::new(),
             diff_jump: false,
             waker,
+            select_hash: None,
+            scroll_to_selected: false,
         };
         h.reload();
         h
@@ -172,8 +177,11 @@ impl History {
                     self.rows = git_log::lanes(&c);
                     self.commits = c;
                     self.error = None;
+                    let want = self.select_hash.take();
+                    self.scroll_to_selected = want.is_some();
+                    let at = want.and_then(|h| self.commits.iter().position(|c| c.hash == h)).unwrap_or(0);
                     if !self.commits.is_empty() {
-                        self.select(0, false);
+                        self.select(at, false);
                     }
                 }
                 Err(e) => self.error = Some(e),
@@ -291,106 +299,108 @@ impl History {
         let row_h = 24.0;
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
         let mut clicked = None;
-        egui::ScrollArea::vertical().id_salt("history-list").auto_shrink([false, false]).show_rows(
-            ui,
-            row_h,
-            shown.len(),
-            |ui, range| {
-                for &i in &shown[range] {
-                    let c = &self.commits[i];
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
-                    let selected = self.selected == Some(i) || self.compare == Some(i);
-                    if selected {
-                        ui.painter().rect_filled(rect, 3.0, p.accent_soft);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, 3.0, p.bg_hover);
+        let mut area = egui::ScrollArea::vertical().id_salt("history-list").auto_shrink([false, false]);
+        // A commit picked from elsewhere (line history): bring it into view once.
+        if std::mem::take(&mut self.scroll_to_selected) {
+            if let Some(pos) = self.selected.and_then(|s| shown.iter().position(|&i| i == s)) {
+                area = area.vertical_scroll_offset((pos as f32 * row_h - 120.0).max(0.0));
+            }
+        }
+        area.show_rows(ui, row_h, shown.len(), |ui, range| {
+            for &i in &shown[range] {
+                let c = &self.commits[i];
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+                let selected = self.selected == Some(i) || self.compare == Some(i);
+                if selected {
+                    ui.painter().rect_filled(rect, 3.0, p.accent_soft);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 3.0, p.bg_hover);
+                }
+                if graph {
+                    let r = &self.rows[i];
+                    let x = |l: usize| rect.min.x + 6.0 + l as f32 * LANE_W;
+                    let (top, mid, bot) = (rect.min.y, rect.center().y, rect.max.y);
+                    for &l in &r.through {
+                        ui.painter().line_segment(
+                            [egui::pos2(x(l), top), egui::pos2(x(l), bot)],
+                            Stroke::new(1.5_f32, lane_color(l)),
+                        );
                     }
-                    if graph {
-                        let r = &self.rows[i];
-                        let x = |l: usize| rect.min.x + 6.0 + l as f32 * LANE_W;
-                        let (top, mid, bot) = (rect.min.y, rect.center().y, rect.max.y);
-                        for &l in &r.through {
-                            ui.painter().line_segment(
-                                [egui::pos2(x(l), top), egui::pos2(x(l), bot)],
-                                Stroke::new(1.5_f32, lane_color(l)),
-                            );
-                        }
-                        // The line coming into the commit from the newer one above.
-                        let incoming = i > 0
-                            && (self.rows[i - 1].to_parents.contains(&r.lane)
-                                || self.rows[i - 1].through.contains(&r.lane));
-                        if incoming {
-                            ui.painter().line_segment(
-                                [egui::pos2(x(r.lane), top), egui::pos2(x(r.lane), mid)],
-                                Stroke::new(1.5_f32, lane_color(r.lane)),
-                            );
-                        }
-                        for &l in &r.from_above {
-                            ui.painter().line_segment(
-                                [egui::pos2(x(l), top), egui::pos2(x(r.lane), mid)],
-                                Stroke::new(1.5_f32, lane_color(l)),
-                            );
-                        }
-                        for &l in &r.to_parents {
-                            ui.painter().line_segment(
-                                [egui::pos2(x(r.lane), mid), egui::pos2(x(l), bot)],
-                                Stroke::new(1.5_f32, lane_color(l)),
-                            );
-                        }
-                        let merge = c.parents.len() > 1;
-                        ui.painter().circle(
-                            egui::pos2(x(r.lane), mid),
-                            if merge { 3.5 } else { 4.0 },
-                            if merge { p.bg } else { lane_color(r.lane) },
+                    // The line coming into the commit from the newer one above.
+                    let incoming = i > 0
+                        && (self.rows[i - 1].to_parents.contains(&r.lane)
+                            || self.rows[i - 1].through.contains(&r.lane));
+                    if incoming {
+                        ui.painter().line_segment(
+                            [egui::pos2(x(r.lane), top), egui::pos2(x(r.lane), mid)],
                             Stroke::new(1.5_f32, lane_color(r.lane)),
                         );
                     }
-                    // Text: refs, subject, author · time.
-                    let mut job = egui::text::LayoutJob::default();
-                    let font = egui::FontId::proportional(13.0);
-                    if !c.refs.is_empty() {
-                        job.append(
-                            &format!(" {} ", short_refs(&c.refs)),
-                            0.0,
-                            egui::TextFormat {
-                                font_id: egui::FontId::proportional(11.0),
-                                color: p.accent,
-                                background: p.accent_soft,
-                                ..Default::default()
-                            },
+                    for &l in &r.from_above {
+                        ui.painter().line_segment(
+                            [egui::pos2(x(l), top), egui::pos2(x(r.lane), mid)],
+                            Stroke::new(1.5_f32, lane_color(l)),
                         );
-                        job.append(" ", 0.0, egui::TextFormat::default());
                     }
-                    job.append(
-                        &c.subject,
-                        0.0,
-                        egui::TextFormat { font_id: font.clone(), color: p.text, ..Default::default() },
+                    for &l in &r.to_parents {
+                        ui.painter().line_segment(
+                            [egui::pos2(x(r.lane), mid), egui::pos2(x(l), bot)],
+                            Stroke::new(1.5_f32, lane_color(l)),
+                        );
+                    }
+                    let merge = c.parents.len() > 1;
+                    ui.painter().circle(
+                        egui::pos2(x(r.lane), mid),
+                        if merge { 3.5 } else { 4.0 },
+                        if merge { p.bg } else { lane_color(r.lane) },
+                        Stroke::new(1.5_f32, lane_color(r.lane)),
                     );
+                }
+                // Text: refs, subject, author · time.
+                let mut job = egui::text::LayoutJob::default();
+                let font = egui::FontId::proportional(13.0);
+                if !c.refs.is_empty() {
                     job.append(
-                        &format!("   {} · {}", c.author, crate::git::relative_time(c.time, now)),
+                        &format!(" {} ", short_refs(&c.refs)),
                         0.0,
                         egui::TextFormat {
-                            font_id: egui::FontId::proportional(11.5),
-                            color: p.text_faint,
+                            font_id: egui::FontId::proportional(11.0),
+                            color: p.accent,
+                            background: p.accent_soft,
                             ..Default::default()
                         },
                     );
-                    job.wrap.max_rows = 1;
-                    job.wrap.max_width = rect.width() - lanes_w - 8.0;
-                    job.wrap.break_anywhere = true;
-                    let galley = ui.fonts(|f| f.layout_job(job));
-                    ui.painter().galley(
-                        egui::pos2(rect.min.x + lanes_w, rect.center().y - galley.size().y / 2.0),
-                        galley,
-                        p.text,
-                    );
-                    let resp = resp.on_hover_text(format!("{}  {}", c.short, c.subject));
-                    if resp.clicked() {
-                        clicked = Some((i, ui.input(|i| i.modifiers.command)));
-                    }
+                    job.append(" ", 0.0, egui::TextFormat::default());
                 }
-            },
-        );
+                job.append(
+                    &c.subject,
+                    0.0,
+                    egui::TextFormat { font_id: font.clone(), color: p.text, ..Default::default() },
+                );
+                job.append(
+                    &format!("   {} · {}", c.author, crate::git::relative_time(c.time, now)),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(11.5),
+                        color: p.text_faint,
+                        ..Default::default()
+                    },
+                );
+                job.wrap.max_rows = 1;
+                job.wrap.max_width = rect.width() - lanes_w - 8.0;
+                job.wrap.break_anywhere = true;
+                let galley = ui.fonts(|f| f.layout_job(job));
+                ui.painter().galley(
+                    egui::pos2(rect.min.x + lanes_w, rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    p.text,
+                );
+                let resp = resp.on_hover_text(format!("{}  {}", c.short, c.subject));
+                if resp.clicked() {
+                    clicked = Some((i, ui.input(|i| i.modifiers.command)));
+                }
+            }
+        });
         if let Some((i, cmp)) = clicked {
             self.select(i, cmp);
         }

@@ -25,6 +25,7 @@ mod http_client;
 mod imports;
 mod inline_ai;
 mod keymap;
+mod line_history;
 mod lsp;
 mod marketplace;
 mod mcp_ui;

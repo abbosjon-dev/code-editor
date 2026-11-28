@@ -531,6 +531,16 @@ pub fn editor_ui(
                             }
                         }
                     }
+                    if doc.blame.is_some() {
+                        ui.separator();
+                        let cmd = crate::commands::Cmd::GitLineHistory;
+                        let label =
+                            if has_sel { "Git: History of Selected Lines" } else { "Git: History of This Block" };
+                        if ui.button(label).clicked() {
+                            actions.push(EditorAction::Run(cmd));
+                            ui.close_menu();
+                        }
+                    }
                     ui.separator();
                     if ui.button("✳ Send Selection to AI Agent").clicked() {
                         actions.push(EditorAction::SendSelectionToAgent);

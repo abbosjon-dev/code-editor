@@ -393,6 +393,9 @@ pub struct ZenithApp {
     outline: crate::outline::Outline,
     /// The Git History window, with the repository root it belongs to.
     history: Option<(crate::history::History, PathBuf)>,
+    line_history: Option<crate::line_history::LineHistory>,
+    /// The repository of the line history (to open a commit in History).
+    line_history_root: Option<PathBuf>,
     /// A symbol picked in the breadcrumb (line, column), applied next frame.
     crumb_jump: Option<(usize, usize)>,
     /// The outline row last scrolled to (follows the caret).
@@ -527,6 +530,8 @@ impl ZenithApp {
             settings_search: String::new(),
             outline: Default::default(),
             history: None,
+            line_history: None,
+            line_history_root: None,
             outline_follow: None,
             crumb_jump: None,
             split: false,
@@ -2674,6 +2679,34 @@ impl ZenithApp {
             },
             Cmd::SyncPush => self.start_sync(crate::sync_ui::SyncOp::Push),
             Cmd::SyncPull => self.start_sync(crate::sync_ui::SyncOp::Pull),
+            Cmd::GitLineHistory => {
+                let Some(doc) = self.docs.get(self.active) else { return };
+                let Some(path) = doc.path().map(Path::to_path_buf) else { return };
+                let Some(g) = self.git_for(&path) else {
+                    self.toast("Not a Git repository", NotifyLevel::Info);
+                    return;
+                };
+                let (root, run) = (g.root.clone(), g.runner());
+                let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")) else { return };
+                // The selection's lines, else the block (function, class…) around the caret.
+                let (a, b) = (doc.buffer.sel.start(), doc.buffer.sel.end());
+                let (la, lb) = (doc.buffer.char_to_pos(a).line, doc.buffer.char_to_pos(b.max(a)).line);
+                let (from, to) = if a != b {
+                    (la, lb)
+                } else {
+                    let sf = doc.syntax_folds();
+                    match crate::folding::enclosing_header(&doc.buffer, la, sf.as_deref()) {
+                        Some(h) => (h, crate::folding::fold_end(&doc.buffer, h, sf.as_deref()).unwrap_or(h).max(la)),
+                        None => (la, la),
+                    }
+                };
+                if doc.buffer.is_dirty() {
+                    self.toast("Showing the history of the saved file", NotifyLevel::Info);
+                }
+                self.line_history =
+                    Some(crate::line_history::LineHistory::new(run, rel, from + 1, to + 1, self.waker.clone()));
+                self.line_history_root = Some(root);
+            }
             Cmd::GitHistory | Cmd::GitFileHistory => {
                 let file = self.docs.get(self.active).and_then(|d| d.path()).map(Path::to_path_buf);
                 let path = if cmd == Cmd::GitFileHistory { file.clone() } else { None };
@@ -9482,6 +9515,24 @@ impl ZenithApp {
         self.changes_window(ctx);
         self.settings_window(ctx);
         self.inline_edit_window(ctx);
+        if let Some(lh) = &mut self.line_history {
+            let mut open = true;
+            let fs = self.settings.editor_font_size;
+            let act = lh.ui(ctx, &self.colors.clone(), fs, &mut open);
+            if !open {
+                self.line_history = None;
+            }
+            if let (Some(crate::line_history::Action::ShowCommit(hash)), Some(root)) =
+                (act, self.line_history_root.clone())
+            {
+                if let Some(g) = self.git_for(&root) {
+                    let title = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let mut h = crate::history::History::new(g.runner(), None, title, self.waker.clone());
+                    h.select_hash = Some(hash);
+                    self.history = Some((h, root));
+                }
+            }
+        }
         if let Some((h, root)) = &mut self.history {
             let mut open = true;
             let fs = self.settings.editor_font_size;
