@@ -350,6 +350,10 @@ pub struct ZenithApp {
     /// HTTP responses panel.
     http: Option<crate::http_client::Panel>,
     db: DbState,
+    coverage: crate::coverage::Coverage,
+    /// Show coverage in the gutter (and keep reloading the report).
+    show_coverage: bool,
+    coverage_checked: Option<Instant>,
     /// Docker actions in flight (verb, container).
     docker_actions: Vec<(String, String, crate::docker::ActionResult)>,
     /// A phone / emulator / simulator screen.
@@ -494,6 +498,9 @@ impl ZenithApp {
             docker: Default::default(),
             http: None,
             db: DbState::default(),
+            coverage: Default::default(),
+            show_coverage: false,
+            coverage_checked: None,
             docker_actions: vec![],
             mirror: None,
             ai: TermPanel::default(),
@@ -2033,6 +2040,42 @@ impl ZenithApp {
                     doc.buffer.insert(crate::http_client::TEMPLATE);
                 }
                 self.toast("Save it as a .http file, then Ctrl+Alt+Enter in a request", NotifyLevel::Info);
+            }
+            Cmd::ToggleCoverage => {
+                self.show_coverage = !self.show_coverage;
+                self.coverage_checked = None;
+                self.coverage.source = None;
+                self.refresh_coverage();
+                if self.show_coverage {
+                    match (&self.coverage.source, &self.coverage.error) {
+                        (_, Some(e)) => self.toast(e.clone(), NotifyLevel::Warning),
+                        (None, _) => self.toast(
+                            "No coverage report yet (lcov.info, coverage.xml, coverage.out…) — Run Tests with Coverage",
+                            NotifyLevel::Info,
+                        ),
+                        (Some((p, _)), _) => {
+                            let (c, t) = self.coverage.total();
+                            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            let pct = (c * 100).checked_div(t).unwrap_or(0);
+                            self.toast(format!("Coverage from {name}: {pct}% of {t} lines"), NotifyLevel::Info);
+                        }
+                    }
+                }
+            }
+            Cmd::RunTestsWithCoverage => {
+                let Some(ws) = self.workspace.clone() else { return };
+                match crate::coverage::command(&ws) {
+                    Some((lang, command)) => {
+                        self.show_coverage = true;
+                        let c = crate::run::RunConfig {
+                            name: format!("{lang}: tests with coverage"),
+                            command,
+                            ..Default::default()
+                        };
+                        self.start_run_on(c, None);
+                    }
+                    None => self.toast("No test setup recognized (Cargo, Flutter, npm, Go, Python)", NotifyLevel::Info),
+                }
             }
             Cmd::RefreshDevices => {
                 self.scan_devices(true);
@@ -4215,6 +4258,8 @@ impl ZenithApp {
                 item(ui, Cmd::ShowDeviceScreen, "Show Device Screen…");
                 item(ui, Cmd::ShowDeviceLogs, "Show Device Logs…");
                 item(ui, Cmd::OpenPreview, "Web Preview…");
+                item(ui, Cmd::RunTestsWithCoverage, "Run Tests with Coverage");
+                item(ui, Cmd::ToggleCoverage, "Show / Hide Coverage");
                 item(ui, Cmd::NewHttpRequest, "New HTTP Request File");
                 item(ui, Cmd::SendHttpRequest, "Send HTTP Request");
                 ui.separator();
@@ -5853,6 +5898,17 @@ impl ZenithApp {
                 let r = ui.add(egui::Label::new(small(format!("⎇ {b}"))).sense(Sense::click()));
                 if r.on_hover_text("Switch branch").clicked() {
                     cmd = Some(Cmd::GitSwitchBranch);
+                }
+            }
+            if self.show_coverage {
+                let path = self.docs.get(self.active).and_then(|d| d.path()).map(|p| p.canonicalize().unwrap_or(p.to_path_buf()));
+                if let Some((c, t)) = path.and_then(|p| self.coverage.summary(&p)).filter(|(_, t)| *t > 0) {
+                    let pct = c * 100 / t;
+                    let color = if pct >= 80 { p.success } else if pct >= 50 { p.warning } else { p.error };
+                    let r = ui.add(egui::Label::new(RichText::new(format!("☂ {pct}%")).size(12.0).color(color)).sense(Sense::click()));
+                    if r.on_hover_text(format!("{c} of {t} lines of this file ran in the tests — click to hide coverage")).clicked() {
+                        cmd = Some(Cmd::ToggleCoverage);
+                    }
                 }
             }
             if let Some(i) = self.current_run() {
@@ -7789,6 +7845,33 @@ impl ZenithApp {
         self.runs.rescan_at = Some(Instant::now() + Duration::from_secs(12));
     }
 
+    /// Reload the coverage report when it changes; give open files theirs.
+    fn refresh_coverage(&mut self) {
+        if !self.show_coverage {
+            if self.docs.iter().any(|d| d.coverage.is_some()) {
+                for d in &mut self.docs {
+                    d.coverage = None;
+                }
+            }
+            return;
+        }
+        let Some(ws) = self.workspace.clone() else { return };
+        let due = self.coverage_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        let changed = due && {
+            self.coverage_checked = Some(Instant::now());
+            self.coverage.refresh(&ws)
+        };
+        for d in &mut self.docs {
+            let want = d.path().and_then(|p| {
+                let p = p.canonicalize().unwrap_or(p.to_path_buf());
+                self.coverage.for_file(&p).cloned()
+            });
+            if changed || d.coverage.is_none() != want.is_none() {
+                d.coverage = want.map(std::sync::Arc::new);
+            }
+        }
+    }
+
     fn db_connection(&mut self) -> Option<crate::db::Connection> {
         if self.db.conns.is_none() {
             self.db.conns = Some(self.workspace.as_deref().map(crate::db::connections).unwrap_or_default());
@@ -9180,6 +9263,7 @@ impl ZenithApp {
         }
         self.poll_loading();
         self.refresh_outline();
+        self.refresh_coverage();
         self.poll_runs();
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);

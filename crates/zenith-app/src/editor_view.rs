@@ -980,6 +980,21 @@ pub fn editor_ui(
                         );
                     }
                 }
+                // Test coverage: a bar right of the gutter (green ran, red didn't).
+                if let Some(cov) = &doc.coverage {
+                    let x = clip.min.x + gutter_w + 1.0;
+                    for line in first..last {
+                        let Some(&hits) = cov.get(&line) else { continue };
+                        if fm.is_hidden(line) {
+                            continue;
+                        }
+                        let y0 = y_of_line(line);
+                        let y1 = rect.min.y + (fm.last_row_of(line) + 1) as f32 * m.line_h;
+                        let color =
+                            if hits > 0 { p.success.gamma_multiply(0.75) } else { p.error.gamma_multiply(0.85) };
+                        painter.rect_filled(Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + 3.0, y1)), 0.0, color);
+                    }
+                }
                 let bulb_line = doc.lsp_active && doc.diagnostics.iter().any(|d| d.line == cursor.line);
                 if bulb_line && !fm.is_hidden(cursor.line) && cursor.line >= first && cursor.line < last {
                     let y = y_of_line(cursor.line) + m.line_h / 2.0;

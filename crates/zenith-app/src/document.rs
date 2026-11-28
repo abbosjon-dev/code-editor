@@ -158,6 +158,8 @@ pub struct Document {
     pub md_preview: bool,
     /// Per-line blame of the file on disk (valid while the buffer is clean).
     pub blame: Option<Vec<crate::git::BlameLine>>,
+    /// Test coverage of this file (line → hits), when shown.
+    pub coverage: Option<std::sync::Arc<crate::coverage::FileCoverage>>,
     pub blame_rx: Option<std::sync::mpsc::Receiver<Vec<crate::git::BlameLine>>>,
     /// Line whose git change popup (gutter click) is open.
     pub hunk_popup: Option<usize>,
@@ -280,6 +282,7 @@ impl Document {
             show_git_diff: false,
             md_preview: false,
             blame: None,
+            coverage: None,
             blame_rx: None,
             hunk_popup: None,
             git_diff: Default::default(),

@@ -7,6 +7,7 @@ mod changeset;
 mod commands;
 mod compare;
 mod conflicts;
+mod coverage;
 mod crash;
 mod db;
 mod debug;
