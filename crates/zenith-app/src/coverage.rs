@@ -171,8 +171,10 @@ pub fn parse_cobertura(text: &str) -> Vec<(String, FileCoverage)> {
             }
         }
         // With a <source>, the filename is relative to it.
-        let file = match sources.first().filter(|s| Path::new(s.as_str()).is_absolute()) {
-            Some(src) if !Path::new(&file).is_absolute() => format!("{}/{file}", src.trim_end_matches('/')),
+        let file = match sources.first().filter(|s| !s.is_empty()) {
+            Some(src) if !Path::new(&file).is_absolute() && !file.starts_with('/') => {
+                format!("{}/{file}", src.trim_end_matches(['/', '\\']))
+            }
             _ => file,
         };
         out.push((file, f));
@@ -249,6 +251,8 @@ mod tests {
             </classes></package></packages></coverage>"#;
         let c = parse_cobertura(xml);
         assert_eq!(c[0].0, "/w/app.py");
+        let rel = parse_cobertura(&xml.replace("<source>/w</source>", "<source>src</source>"));
+        assert_eq!(rel[0].0, "src/app.py");
         assert_eq!((c[0].1.get(&0), c[0].1.get(&2)), (Some(&1), Some(&0)));
         let go = "mode: set\nexample.com/m/pkg/x.go:3.14,5.2 2 1\nexample.com/m/pkg/x.go:7.2,7.20 1 0\n";
         let g = parse_go(go);
