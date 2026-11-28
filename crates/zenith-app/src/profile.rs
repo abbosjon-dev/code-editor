@@ -178,6 +178,71 @@ impl Profile {
     }
 }
 
+/// A baseline to compare with: per node of the current profile, its share
+/// of the time there (None: the call path didn't exist then), and the
+/// change in self time per function (percentage points, biggest first).
+pub struct Comparison {
+    pub name: String,
+    pub base_pct: Vec<Option<f64>>,
+    pub self_changes: Vec<(Frame, f64)>,
+}
+
+pub fn compare(cur: &Profile, base: &Profile, name: String) -> Comparison {
+    type Key = (String, Option<String>);
+    // Baseline: share of each call path.
+    let mut paths: HashMap<Vec<Key>, f64> = HashMap::new();
+    let bt = base.total.max(1) as f64;
+    let mut stack: Vec<(usize, Vec<Key>)> = vec![(0, vec![])];
+    while let Some((i, path)) = stack.pop() {
+        paths.insert(path.clone(), base.nodes[i].total as f64 * 100.0 / bt);
+        for &c in &base.nodes[i].children {
+            let mut p = path.clone();
+            p.push(base.nodes[c].frame.key());
+            stack.push((c, p));
+        }
+    }
+    let mut base_pct = vec![None; cur.nodes.len()];
+    let mut stack: Vec<(usize, Vec<Key>)> = vec![(0, vec![])];
+    while let Some((i, path)) = stack.pop() {
+        base_pct[i] = paths.get(&path).copied();
+        for &c in &cur.nodes[i].children {
+            let mut p = path.clone();
+            p.push(cur.nodes[c].frame.key());
+            stack.push((c, p));
+        }
+    }
+    // Self time per function, before and now.
+    let ct = cur.total.max(1) as f64;
+    let mut map: HashMap<Key, (Frame, f64, f64)> = HashMap::new();
+    for (f, n) in &cur.hot_functions {
+        map.entry(f.key()).or_insert((f.clone(), 0.0, 0.0)).2 += *n as f64 * 100.0 / ct;
+    }
+    for (f, n) in &base.hot_functions {
+        map.entry(f.key()).or_insert((f.clone(), 0.0, 0.0)).1 += *n as f64 * 100.0 / bt;
+    }
+    let mut self_changes: Vec<(Frame, f64)> = map.into_values().map(|(f, before, now)| (f, now - before)).collect();
+    self_changes.retain(|(_, d)| d.abs() >= 0.5);
+    self_changes.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+    Comparison { name, base_pct, self_changes }
+}
+
+/// Profiles saved in a folder's `.zenith` (newest first).
+pub fn saved_profiles(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir.join(".zenith"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            n.starts_with("profile-") && (n.ends_with(".folded") || n.ends_with(".perf"))
+        })
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    v.sort_by_key(|e| std::cmp::Reverse(e.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
 /// How a profile is shown.
 #[derive(Debug, PartialEq)]
 pub enum Output {
@@ -248,11 +313,26 @@ pub struct View {
     /// The node the graph is zoomed to.
     zoom: usize,
     search: String,
+    /// The file it was read from (to offer older ones to compare with).
+    pub file: Option<PathBuf>,
+    compare: Option<Comparison>,
+    error: Option<String>,
 }
 
 impl View {
     pub fn new(title: String, profile: Profile, root: PathBuf) -> Self {
-        Self { title, profile, root, zoom: 0, search: String::new() }
+        Self { title, profile, root, zoom: 0, search: String::new(), file: None, compare: None, error: None }
+    }
+
+    fn set_baseline(&mut self, path: &Path) {
+        match Profile::load(path) {
+            Ok(b) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.compare = Some(compare(&self.profile, &b, name));
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
     }
 
     fn path_of(&self, f: &Frame) -> Option<(PathBuf, u32)> {
@@ -283,7 +363,45 @@ impl View {
                             .hint_text("Highlight functions…")
                             .desired_width(220.0),
                     );
+                    // Compare with an earlier profile of the same folder.
+                    if let Some(file) = self.file.clone() {
+                        let dir = file.parent().and_then(|d| d.parent()).map(Path::to_path_buf).unwrap_or_default();
+                        let others: Vec<PathBuf> = saved_profiles(&dir).into_iter().filter(|p| *p != file).collect();
+                        if !others.is_empty() {
+                            let current = self.compare.as_ref().map_or("Compare with…".to_string(), |c| format!("vs {}", c.name));
+                            let mut pick: Option<Option<PathBuf>> = None;
+                            egui::ComboBox::from_id_salt("profile-compare").selected_text(current).show_ui(ui, |ui| {
+                                if ui.selectable_label(self.compare.is_none(), "No comparison").clicked() {
+                                    pick = Some(None);
+                                }
+                                for o in &others {
+                                    let when = std::fs::metadata(o)
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|t| t.elapsed().ok())
+                                        .map(|d| ago(d.as_secs()))
+                                        .unwrap_or_default();
+                                    let name = o.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    if ui.button(format!("{name}  ({when})")).clicked() {
+                                        pick = Some(Some(o.clone()));
+                                    }
+                                }
+                            });
+                            match pick {
+                                Some(Some(p)) => self.set_baseline(&p),
+                                Some(None) => self.compare = None,
+                                None => {}
+                            }
+                        }
+                    }
+                    if self.compare.is_some() {
+                        ui.label(RichText::new("■ slower").small().color(Color32::from_rgb(0xe0, 0x50, 0x50)));
+                        ui.label(RichText::new("■ faster").small().color(Color32::from_rgb(0x4f, 0x8f, 0xe8)));
+                    }
                 });
+                if let Some(e) = &self.error {
+                    ui.label(RichText::new(e).small().color(p.warning));
+                }
                 ui.separator();
                 let avail = ui.available_size();
                 let side_w = (avail.x * 0.3).clamp(220.0, 420.0);
@@ -302,6 +420,33 @@ impl View {
                     ui.allocate_ui_with_layout(egui::vec2(side_w, avail.y), top_down, |ui| {
                         ui.set_max_width(side_w);
                         egui::ScrollArea::vertical().id_salt("hot").auto_shrink([false, false]).show(ui, |ui| {
+                            if let Some(c) = &self.compare {
+                                ui.label(RichText::new(format!("Changed since {}", c.name)).small().strong());
+                                ui.label(
+                                    RichText::new(
+                                        "Shares of each run's time: when one function gets faster, the others' shares grow.",
+                                    )
+                                    .small()
+                                    .color(p.text_faint),
+                                );
+                                if c.self_changes.is_empty() {
+                                    ui.label(RichText::new("No function changed by 0.5% or more").small().color(p.text_dim));
+                                }
+                                for (f, d) in c.self_changes.iter().take(20) {
+                                    let color = if *d > 0.0 { Color32::from_rgb(0xe0, 0x50, 0x50) } else { Color32::from_rgb(0x4f, 0x8f, 0xe8) };
+                                    let r = ui.add(
+                                        egui::Label::new(RichText::new(format!("{d:+5.1}%  {}", f.name)).small().monospace().color(color))
+                                            .truncate()
+                                            .sense(Sense::click()),
+                                    );
+                                    if r.clicked() {
+                                        if let Some((path, line)) = self.path_of(f) {
+                                            action = Some(Action::Open(path, line));
+                                        }
+                                    }
+                                }
+                                ui.add_space(8.0);
+                            }
                             ui.label(RichText::new("Most time in the function itself").small().strong());
                             for (f, n) in self.profile.hot_functions.iter().take(25) {
                                 let pct = *n as f64 * 100.0 / total as f64;
@@ -382,7 +527,15 @@ impl View {
             let y = rect.min.y + (n.depth - root_depth) as f32 * row_h;
             let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w - 1.0, row_h - 1.0));
             let matched = !search.is_empty() && n.frame.name.to_lowercase().contains(&search);
-            let color = if matched { p.accent } else { frame_color(&n.frame.name, i == 0) };
+            let now_pct = n.total as f64 * 100.0 / self.profile.total.max(1) as f64;
+            let delta = self.compare.as_ref().map(|c| now_pct - c.base_pct[i].unwrap_or(0.0));
+            let color = if matched {
+                p.accent
+            } else if let Some(d) = delta {
+                diff_color(d)
+            } else {
+                frame_color(&n.frame.name, i == 0)
+            };
             let resp = ui.interact(r, ui.id().with(("flame", i)), Sense::click());
             painter.rect_filled(r, 2.0, if resp.hovered() { color.gamma_multiply(1.25) } else { color });
             if w > 30.0 {
@@ -397,8 +550,13 @@ impl View {
             }
             let pct = n.total as f64 * 100.0 / self.profile.total.max(1) as f64;
             let self_pct = n.self_time as f64 * 100.0 / self.profile.total.max(1) as f64;
+            let change = match (delta, self.compare.as_ref().and_then(|c| c.base_pct[i])) {
+                (Some(d), Some(b)) => format!("\nwas {b:.1}%, now {now_pct:.1}% ({d:+.1})"),
+                (Some(_), None) => "\nnew: not in the earlier profile".into(),
+                _ => String::new(),
+            };
             let resp = resp.on_hover_text(format!(
-                "{}\n{}{} samples · {pct:.1}% (itself {self_pct:.1}%)\nClick: zoom · double-click: open the code",
+                "{}\n{}{} samples · {pct:.1}% (itself {self_pct:.1}%){change}\nClick: zoom · double-click: open the code",
                 n.frame.name,
                 n.frame.file.as_ref().map(|f| format!("{f}:{}\n", n.frame.line.unwrap_or(0))).unwrap_or_default(),
                 n.total
@@ -436,6 +594,28 @@ fn frame_color(name: &str, root: bool) -> Color32 {
     let g = 90 + ((h >> 8) % 120) as u8;
     let b = 40 + ((h >> 16) % 50) as u8;
     Color32::from_rgb(r, g, b)
+}
+
+/// Red when it takes more of the time than before, blue when less, grey
+/// when about the same (percentage points of the whole).
+fn diff_color(d: f64) -> Color32 {
+    let t = (d.abs() / 10.0).clamp(0.0, 1.0) as f32;
+    let grey = Color32::from_rgb(0xb8, 0xb8, 0xc4);
+    if d.abs() < 0.5 {
+        return grey;
+    }
+    let target = if d > 0.0 { Color32::from_rgb(0xe0, 0x50, 0x50) } else { Color32::from_rgb(0x4f, 0x8f, 0xe8) };
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * (0.35 + 0.65 * t)) as u8;
+    Color32::from_rgb(mix(grey.r(), target.r()), mix(grey.g(), target.g()), mix(grey.b(), target.b()))
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86400),
+    }
 }
 
 fn fit(s: &str, chars: usize) -> String {
@@ -489,6 +669,21 @@ myapp  1234 100.001001:     1001 cycles:\n\
         let names: Vec<&str> = s[0].0.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["myapp", "__libc_start_main", "main", "work::hot"]);
         assert_eq!(s[0].1, 2);
+    }
+
+    #[test]
+    fn compares_profiles() {
+        let before = Profile::build(&parse_collapsed("m;a 50\nm;b 50\n"));
+        let now = Profile::build(&parse_collapsed("m;a 80\nm;b 10\nm;c 10\n"));
+        let c = compare(&now, &before, "old".into());
+        let pct = |name: &str| {
+            let i = now.nodes.iter().position(|n| n.frame.name == name).unwrap();
+            c.base_pct[i]
+        };
+        assert_eq!(pct("a"), Some(50.0));
+        assert_eq!(pct("c"), None); // new path
+        let names: Vec<(&str, i64)> = c.self_changes.iter().map(|(f, d)| (f.name.as_str(), d.round() as i64)).collect();
+        assert_eq!(names, [("b", -40), ("a", 30), ("c", 10)]);
     }
 
     #[test]

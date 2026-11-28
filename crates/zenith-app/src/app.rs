@@ -7938,7 +7938,9 @@ impl ZenithApp {
                     root
                 };
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.profile_view = Some(crate::profile::View::new(title, p, root));
+                let mut v = crate::profile::View::new(title, p, root);
+                v.file = Some(path.to_path_buf());
+                self.profile_view = Some(v);
             }
             Err(e) => self.toast(e, NotifyLevel::Error),
         }
