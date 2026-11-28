@@ -276,3 +276,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+// ------------------------------------------------------------------ changed lines
+
+/// Lines (0-based) added or changed per file in a `git diff -U0` (paths
+/// relative to the repository).
+pub fn changed_lines(diff: &str) -> HashMap<String, Vec<usize>> {
+    let mut out: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut file: Option<String> = None;
+    for l in diff.lines() {
+        if let Some(p) = l.strip_prefix("+++ ") {
+            file = p.strip_prefix("b/").map(str::to_string).filter(|_| p != "/dev/null");
+        } else if let (Some(h), Some(f)) = (l.strip_prefix("@@ "), &file) {
+            // @@ -a,b +c,d @@
+            let Some(new) = h.split_whitespace().find(|w| w.starts_with('+')) else { continue };
+            let new = &new[1..];
+            let (start, count) = match new.split_once(',') {
+                Some((s, c)) => (s.parse::<usize>().unwrap_or(0), c.parse::<usize>().unwrap_or(0)),
+                None => (new.parse::<usize>().unwrap_or(0), 1),
+            };
+            if count > 0 && start > 0 {
+                out.entry(f.clone()).or_default().extend((start - 1)..(start - 1 + count));
+            }
+        }
+    }
+    out
+}
+
+/// Coverage of the changed lines of one file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangedFile {
+    pub path: PathBuf,
+    pub covered: usize,
+    /// Changed lines the tests don't run (0-based).
+    pub uncovered: Vec<usize>,
+}
+
+/// Changed lines that are executable (in the report), covered or not.
+/// Files the report doesn't know are skipped (not code, or not tested).
+pub fn changes_coverage(cov: &Coverage, changed: &HashMap<String, Vec<usize>>, repo: &Path) -> Vec<ChangedFile> {
+    let mut out: Vec<ChangedFile> = changed
+        .iter()
+        .filter_map(|(rel, lines)| {
+            let p = repo.join(rel);
+            let p = p.canonicalize().unwrap_or(p);
+            let f = cov.for_file(&p)?;
+            let mut covered = 0;
+            let mut uncovered = vec![];
+            for l in lines {
+                match f.get(l) {
+                    Some(&h) if h > 0 => covered += 1,
+                    Some(_) => uncovered.push(*l),
+                    None => {}
+                }
+            }
+            (covered + uncovered.len() > 0).then_some(ChangedFile { path: p, covered, uncovered })
+        })
+        .collect();
+    out.sort_by(|a, b| b.uncovered.len().cmp(&a.uncovered.len()).then(a.path.cmp(&b.path)));
+    out
+}
+
+#[cfg(test)]
+mod changed_tests {
+    use super::*;
+
+    #[test]
+    fn diff_lines_and_their_coverage() {
+        let diff = "diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -2 +2,2 @@ def add\n-x\n+y\n+z\n@@ -9,0 +11 @@\n+w\ndiff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let c = changed_lines(diff);
+        assert_eq!(c.get("calc.py"), Some(&vec![1, 2, 10]));
+        assert!(!c.contains_key("gone.py"));
+        let d = std::env::temp_dir().join(format!("zenith-covdiff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("calc.py"), "x\n").unwrap();
+        let mut cov = Coverage::default();
+        let p = d.join("calc.py").canonicalize().unwrap();
+        cov.files.insert(p.clone(), FileCoverage::from([(1, 3), (2, 0), (5, 1)]));
+        let r = changes_coverage(&cov, &c, &d);
+        assert_eq!(r, [ChangedFile { path: p, covered: 1, uncovered: vec![2] }]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

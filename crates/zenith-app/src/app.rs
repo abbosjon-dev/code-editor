@@ -141,6 +141,15 @@ enum Dialog {
     },
 }
 
+/// "Coverage of changes" window.
+struct ChangesCov {
+    /// Against the branch's base (else: uncommitted changes, against HEAD).
+    branch: bool,
+    base: String,
+    files: Vec<crate::coverage::ChangedFile>,
+    error: Option<String>,
+}
+
 /// The Databases view.
 #[derive(Default)]
 struct DbState {
@@ -352,6 +361,8 @@ pub struct ZenithApp {
     db: DbState,
     coverage: crate::coverage::Coverage,
     profile_view: Option<crate::profile::View>,
+    /// Coverage of changed lines: (against the branch base?, result, summary).
+    changes_cov: Option<ChangesCov>,
     /// Profiling sessions: (terminal tab, the file it will write, title).
     pending_profiles: Vec<(u64, PathBuf, String)>,
     /// Show coverage in the gutter (and keep reloading the report).
@@ -503,6 +514,7 @@ impl ZenithApp {
             db: DbState::default(),
             coverage: Default::default(),
             profile_view: None,
+            changes_cov: None,
             pending_profiles: vec![],
             show_coverage: false,
             coverage_checked: None,
@@ -2083,6 +2095,10 @@ impl ZenithApp {
                         }
                     }
                 }
+            }
+            Cmd::CoverageOfChanges => {
+                let branch = self.changes_cov.as_ref().is_some_and(|c| c.branch);
+                self.compute_changes_coverage(branch);
             }
             Cmd::RunTestsWithCoverage => {
                 let Some(ws) = self.workspace.clone() else { return };
@@ -4284,6 +4300,7 @@ impl ZenithApp {
                 item(ui, Cmd::OpenProfile, "Open Profile…");
                 item(ui, Cmd::RunTestsWithCoverage, "Run Tests with Coverage");
                 item(ui, Cmd::ToggleCoverage, "Show / Hide Coverage");
+                item(ui, Cmd::CoverageOfChanges, "Coverage of Changes…");
                 item(ui, Cmd::NewHttpRequest, "New HTTP Request File");
                 item(ui, Cmd::SendHttpRequest, "Send HTTP Request");
                 ui.separator();
@@ -7940,6 +7957,151 @@ impl ZenithApp {
         }
     }
 
+    /// Which changed lines the tests run: against HEAD (uncommitted work) or
+    /// the branch's base (everything on this branch).
+    fn compute_changes_coverage(&mut self, branch: bool) {
+        let Some(ws) = self.workspace.clone() else { return };
+        self.show_coverage = true;
+        self.coverage_checked = None;
+        self.refresh_coverage();
+        let mut v = ChangesCov { branch, base: "HEAD".into(), files: vec![], error: None };
+        let Some(g) = self.git_for(&ws) else {
+            v.error = Some("Not a Git repository".into());
+            self.changes_cov = Some(v);
+            return;
+        };
+        let (run, repo) = (g.runner(), g.root.clone());
+        if branch {
+            let base = ["origin/main", "origin/master", "main", "master"]
+                .iter()
+                .find_map(|b| run.git(&["merge-base", "HEAD", b]).ok().map(|h| (b.to_string(), h.trim().to_string())));
+            match base {
+                Some((name, hash)) => {
+                    v.base = format!("{name} ({})", &hash[..hash.len().min(8)]);
+                    v.files = self.diff_coverage(&run, &repo, &hash, &mut v.error);
+                }
+                None => v.error = Some("No main / master branch to compare with".into()),
+            }
+        } else {
+            v.files = self.diff_coverage(&run, &repo, "HEAD", &mut v.error);
+        }
+        if v.error.is_none() && self.coverage.source.is_none() {
+            v.error = Some("No coverage report yet — Run Tests with Coverage first".into());
+        }
+        self.changes_cov = Some(v);
+    }
+
+    fn diff_coverage(
+        &self,
+        run: &crate::git::Runner,
+        repo: &Path,
+        base: &str,
+        error: &mut Option<String>,
+    ) -> Vec<crate::coverage::ChangedFile> {
+        match run.git(&["diff", "-U0", "--no-color", "--no-ext-diff", base]) {
+            Ok(diff) => crate::coverage::changes_coverage(&self.coverage, &crate::coverage::changed_lines(&diff), repo),
+            Err(e) => {
+                *error = Some(e);
+                vec![]
+            }
+        }
+    }
+
+    fn changes_cov_window(&mut self, ctx: &egui::Context) {
+        let Some(v) = &self.changes_cov else { return };
+        let p = self.colors.clone();
+        let mut open = true;
+        let mut jump: Option<(PathBuf, usize)> = None;
+        let mut switch: Option<bool> = None;
+        let ws = self.workspace.clone().unwrap_or_default();
+        egui::Window::new("Coverage of changes")
+            .id(egui::Id::new("zenith-changes-cov"))
+            .open(&mut open)
+            .default_size(egui::vec2(520.0, 420.0))
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!v.branch, "Uncommitted changes").clicked() {
+                        switch = Some(false);
+                    }
+                    if ui
+                        .selectable_label(v.branch, "This branch")
+                        .on_hover_text("Everything since the main branch")
+                        .clicked()
+                    {
+                        switch = Some(true);
+                    }
+                    ui.label(RichText::new(format!("vs {}", v.base)).small().color(p.text_faint));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("⟳").on_hover_text("Compute again").clicked() {
+                            switch = Some(v.branch);
+                        }
+                    });
+                });
+                ui.separator();
+                if let Some(e) = &v.error {
+                    ui.label(RichText::new(e).color(p.warning));
+                    return;
+                }
+                let covered: usize = v.files.iter().map(|f| f.covered).sum();
+                let total: usize = covered + v.files.iter().map(|f| f.uncovered.len()).sum::<usize>();
+                if total == 0 {
+                    ui.label(RichText::new("No changed lines that the coverage report knows about.").color(p.text_dim));
+                    return;
+                }
+                let pct = covered * 100 / total;
+                let color = if pct >= 80 {
+                    p.success
+                } else if pct >= 50 {
+                    p.warning
+                } else {
+                    p.error
+                };
+                ui.label(
+                    RichText::new(format!("{pct}% of changed lines are tested ({covered} of {total})"))
+                        .strong()
+                        .color(color),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for f in &v.files {
+                        let rel = f.path.strip_prefix(&ws).unwrap_or(&f.path).to_string_lossy().replace('\\', "/");
+                        let n = f.covered + f.uncovered.len();
+                        ui.horizontal(|ui| {
+                            let c = if f.uncovered.is_empty() { p.success } else { p.text };
+                            ui.label(RichText::new(rel).color(c));
+                            ui.label(RichText::new(format!("{}/{n}", f.covered)).small().color(p.text_faint));
+                        });
+                        if !f.uncovered.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(12.0);
+                                ui.label(RichText::new("not tested:").small().color(p.error));
+                                for &l in &f.uncovered {
+                                    if ui.small_button(format!("{}", l + 1)).clicked() {
+                                        jump = Some((f.path.clone(), l));
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        if !open {
+            self.changes_cov = None;
+        }
+        if let Some(b) = switch {
+            self.compute_changes_coverage(b);
+        }
+        if let Some((path, line)) = jump {
+            if self.open_file(&path) {
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    doc.goto_line(line);
+                }
+                self.focus_editor = true;
+            }
+        }
+    }
+
     /// Reload the coverage report when it changes; give open files theirs.
     fn refresh_coverage(&mut self) {
         if !self.show_coverage {
@@ -9761,6 +9923,7 @@ impl ZenithApp {
         self.changes_window(ctx);
         self.settings_window(ctx);
         self.inline_edit_window(ctx);
+        self.changes_cov_window(ctx);
         if let Some(v) = &mut self.profile_view {
             let mut open = true;
             let act = v.ui(ctx, &self.colors.clone(), &mut open);
