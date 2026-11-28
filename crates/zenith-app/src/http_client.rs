@@ -245,6 +245,44 @@ pub enum Action {
     /// Open the body in a new editor tab.
     OpenBody(String),
     Resend(Request),
+    /// Ask the AI agent about the request and its response.
+    AskAi(String),
+}
+
+/// A prompt about a request and its response (body cut short).
+pub fn ai_prompt(r: &Response) -> String {
+    let q = &r.request;
+    let mut s = String::from("Look at this HTTP request and its response: explain the result and, if something is wrong, why and how to fix it (in the request or the server code of this project).\n\n");
+    s.push_str(&format!("```http\n{} {}\n", q.method, q.url));
+    for (k, v) in &q.headers {
+        // Don't hand secrets to the agent.
+        let v = if k.eq_ignore_ascii_case("authorization")
+            || k.to_lowercase().contains("token")
+            || k.to_lowercase().contains("key")
+        {
+            "•••"
+        } else {
+            v.as_str()
+        };
+        s.push_str(&format!("{k}: {v}\n"));
+    }
+    if !q.body.is_empty() {
+        s.push_str(&format!("\n{}\n", q.body.chars().take(2000).collect::<String>()));
+    }
+    s.push_str("```\n");
+    match &r.error {
+        Some(e) => s.push_str(&format!("No response: {e}\n")),
+        None => {
+            s.push_str(&format!("Response: {} {} in {} ms\n```\n", r.status, r.reason, r.millis));
+            for (k, v) in r.headers.iter().take(15) {
+                s.push_str(&format!("{k}: {v}\n"));
+            }
+            let body = r.pretty_body();
+            let cut: String = body.chars().take(4000).collect();
+            s.push_str(&format!("\n{cut}{}\n```\n", if body.chars().count() > 4000 { "\n…(cut)" } else { "" }));
+        }
+    }
+    s
 }
 
 /// The response panel: the current response and earlier ones.
@@ -320,6 +358,9 @@ impl Panel {
         });
         if let Some(e) = &r.error {
             ui.label(RichText::new(e).color(p.error));
+            if ui.button("✳ Ask AI").clicked() {
+                action = Some(Action::AskAi(ai_prompt(r)));
+            }
         } else {
             ui.horizontal(|ui| {
                 let color = match r.status {
@@ -333,6 +374,13 @@ impl Panel {
                     RichText::new(format!("{} ms · {}", r.millis, size(r.body.len()))).small().color(p.text_faint),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("✳ Ask AI")
+                        .on_hover_text("Send the request and response to the AI agent")
+                        .clicked()
+                    {
+                        action = Some(Action::AskAi(ai_prompt(r)));
+                    }
                     if ui.small_button("↻ Send again").clicked() {
                         action = Some(Action::Resend(r.request.clone()));
                     }
@@ -426,5 +474,13 @@ mod tests {
         assert_eq!(body, "{\"ok\":true}");
         let r = Response { headers, body, ..Default::default() };
         assert_eq!(r.pretty_body(), "{\n  \"ok\": true\n}");
+        let req = Request {
+            method: "GET".into(),
+            url: "http://x".into(),
+            headers: vec![("Authorization".into(), "Bearer s3cret".into())],
+            ..Default::default()
+        };
+        let p = ai_prompt(&Response { request: req, status: 500, ..r });
+        assert!(p.contains("Authorization: •••") && !p.contains("s3cret") && p.contains("500"));
     }
 }

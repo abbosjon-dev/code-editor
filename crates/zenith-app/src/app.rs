@@ -8037,6 +8037,12 @@ impl ZenithApp {
                         act = Some(("rm", c.clone()));
                         ui.close_menu();
                     }
+                    ui.separator();
+                    let q = if c.running() { "✳ Ask AI about its logs" } else { "✳ Ask AI why it stopped" };
+                    if ui.button(q).clicked() {
+                        act = Some(("ai", c.clone()));
+                        ui.close_menu();
+                    }
                 });
             }
         });
@@ -8056,6 +8062,16 @@ impl ZenithApp {
                 self.start_run_on(cfg, None);
             }
             "open" => self.open_preview(&c.ports),
+            "ai" => {
+                // The agent runs the commands itself (it sees the full output).
+                let state = if c.running() { "is running" } else { "is not running" };
+                let prompt = format!(
+                    "The Docker container `{}` (image `{}`) {state}: {}. Look at `docker logs --tail 200 {}` and `docker inspect {}`, \
+                     explain what is going on (errors, why it stopped or restarts) and how to fix it in this project.",
+                    c.name, c.image, c.status, c.name, c.name
+                );
+                self.send_to_agent(prompt, true, None);
+            }
             _ => {
                 let rx = self.docker.action(remote.as_ref(), root, verb, &c.id);
                 self.docker_actions.push((verb.to_string(), c.name.clone(), rx));
@@ -8305,9 +8321,18 @@ impl ZenithApp {
                         let text = RichText::new(format!("⊗ {errs}  ⚠ {warns}  — show in Problems"))
                             .small()
                             .color(if errs > 0 { p.error } else { p.warning });
-                        if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() {
-                            act = Some((i, "problems"));
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() {
+                                act = Some((i, "problems"));
+                            }
+                            if ui
+                                .small_button("✳ Fix with AI")
+                                .on_hover_text("Send the errors and the end of the output to the AI agent")
+                                .clicked()
+                            {
+                                act = Some((i, "ai-fix"));
+                            }
+                        });
                     }
                     if alive && !r.config.kind.keys().is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -8454,6 +8479,27 @@ impl ZenithApp {
                         }
                     }
                     self.runs.group = None;
+                }
+                "ai-fix" => {
+                    let r = &self.runs.sessions[i];
+                    let ws = self.workspace.clone().unwrap_or_default();
+                    let mut prompt = format!(
+                        "`{}` (run in this project with `{}`) reports these problems. Find the cause and fix the code.\n\n",
+                        r.config.name, r.config.command
+                    );
+                    for pr in r.problems.iter().take(20) {
+                        let rel = pr.path.strip_prefix(&ws).unwrap_or(&pr.path).to_string_lossy().replace('\\', "/");
+                        prompt.push_str(&format!("- {rel}:{}:{} {}\n", pr.line + 1, pr.col + 1, pr.message));
+                    }
+                    // The end of its output, for context.
+                    if let Some(term) = self.bottom.tabs.iter().find(|t| t.id == r.tab).and_then(|t| t.term.as_ref()) {
+                        let lines = term.logical_lines();
+                        let tail: Vec<&str> =
+                            lines.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).rev().take(40).collect();
+                        let tail: Vec<&str> = tail.into_iter().rev().collect();
+                        prompt.push_str(&format!("\nLast output:\n```\n{}\n```\n", tail.join("\n")));
+                    }
+                    self.send_to_agent(prompt, true, None);
                 }
                 "problems" => {
                     self.sidebar = SidebarView::Problems;
@@ -9322,6 +9368,7 @@ impl ZenithApp {
                 .show(ctx, |ui| act = r.ui(ui, &p, fs));
             match act {
                 Some(crate::db::Action::Close) => self.db.results = None,
+                Some(crate::db::Action::AskAi(prompt)) => self.send_to_agent(prompt, true, None),
                 Some(crate::db::Action::OpenText(t)) => {
                     self.run(ctx, Cmd::NewFile);
                     if let Some(doc) = self.docs.get_mut(self.active) {
@@ -9353,6 +9400,7 @@ impl ZenithApp {
                         doc.buffer.insert(&body);
                     }
                 }
+                Some(crate::http_client::Action::AskAi(prompt)) => self.send_to_agent(prompt, true, None),
                 Some(crate::http_client::Action::Resend(req)) => {
                     let remote = self.remote.as_ref().map(|r| r.spec.clone());
                     if let Some(h) = &mut self.http {

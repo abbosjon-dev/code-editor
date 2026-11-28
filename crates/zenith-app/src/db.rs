@@ -467,6 +467,33 @@ mod tests {
 pub enum Action {
     Close,
     OpenText(String),
+    /// Ask the AI agent (the prompt, with the query and its result).
+    AskAi(String),
+}
+
+/// A prompt about a query and its result (rows cut to a sample).
+pub fn ai_prompt(conn: &str, r: &QueryResult, question: &str) -> String {
+    let mut s = format!("{question}\n\nDatabase: {conn}\nQuery:\n```sql\n{}\n```\n", r.sql.trim());
+    match &r.error {
+        Some(e) => s.push_str(&format!("It failed with:\n```\n{e}\n```\n")),
+        None if r.columns.is_empty() => s.push_str("It ran without returning rows.\n"),
+        None => {
+            s.push_str(&format!(
+                "Result ({} rows{}), first rows as TSV:\n```\n{}",
+                r.rows.len(),
+                if r.truncated { "+" } else { "" },
+                r.columns.join("\t")
+            ));
+            for row in r.rows.iter().take(30) {
+                let cells: Vec<String> =
+                    row.iter().map(|v| v.chars().take(80).collect::<String>().replace('\n', " ")).collect();
+                s.push('\n');
+                s.push_str(&cells.join("\t"));
+            }
+            s.push_str("\n```\n");
+        }
+    }
+    s
 }
 
 /// Query results next to the code.
@@ -545,8 +572,16 @@ impl Results {
             }
             return action;
         };
+        let conn_name = self.history.get(self.shown).map(|(n, _)| n.clone()).unwrap_or_default();
         if let Some(e) = &r.error {
             ui.label(RichText::new(e).color(p.error).monospace());
+            if ui.button("✳ Fix with AI").on_hover_text("Send the query and the error to the AI agent").clicked() {
+                action = Some(Action::AskAi(ai_prompt(
+                    &conn_name,
+                    r,
+                    "This SQL query fails. Explain why and give a corrected query.",
+                )));
+            }
             return action;
         }
         ui.horizontal(|ui| {
@@ -556,6 +591,13 @@ impl Results {
             ui.label(RichText::new(what).color(p.success));
             ui.label(RichText::new(format!("{} ms", r.millis)).small().color(p.text_faint));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✳ Ask AI").on_hover_text("Send the query and a sample of the result to the AI agent").clicked() {
+                    action = Some(Action::AskAi(ai_prompt(
+                        &conn_name,
+                        r,
+                        "Look at this query and its result: explain what it shows, and point out anything odd or a faster way to write it.",
+                    )));
+                }
                 if !r.columns.is_empty() {
                     if ui.small_button("Open as CSV").clicked() {
                         action = Some(Action::OpenText(to_csv(r)));
