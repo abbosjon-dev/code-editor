@@ -7907,13 +7907,21 @@ impl ZenithApp {
                 let title = cfg.name.clone();
                 let c = crate::run::RunConfig { name: format!("Profile: {}", cfg.name), command, ..cfg };
                 self.start_run_on(c, None);
-                if let Some(r) = self.runs.sessions.last() {
-                    self.pending_profiles.push((r.tab, dir.join(out), title));
+                match out {
+                    crate::profile::Output::File(out) => {
+                        if let Some(r) = self.runs.sessions.last() {
+                            self.pending_profiles.push((r.tab, dir.join(out), title));
+                        }
+                        self.toast(
+                            "Profiling — the flame graph opens when the program ends (stop it to finish early)",
+                            NotifyLevel::Info,
+                        );
+                    }
+                    crate::profile::Output::Browser => self.toast(
+                        "Profiling with samply — when the program ends the profile opens in the browser",
+                        NotifyLevel::Info,
+                    ),
                 }
-                self.toast(
-                    "Profiling — the flame graph opens when the program ends (stop it to finish early)",
-                    NotifyLevel::Info,
-                );
             }
             Err(e) => self.toast(e, NotifyLevel::Warning),
         }
@@ -8483,7 +8491,7 @@ impl ZenithApp {
                         if can_profile
                             && ui
                                 .small_button("⏱ Profile")
-                                .on_hover_text("Run it under the profiler and show a flame graph (py-spy for Python, perf otherwise)")
+                                .on_hover_text("Run it under the profiler and show a flame graph (py-spy for Python; perf on Linux, else samply)")
                                 .clicked()
                         {
                             profile = Some(cfg.clone());

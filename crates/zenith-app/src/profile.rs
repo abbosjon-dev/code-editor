@@ -178,41 +178,61 @@ impl Profile {
     }
 }
 
-/// The profiling command for a run command line, and the file it writes
-/// (relative to the run's folder).
-pub fn wrap(kind: crate::run::Kind, command: &str, out_stem: &str) -> Result<(String, String), String> {
+/// How a profile is shown.
+#[derive(Debug, PartialEq)]
+pub enum Output {
+    /// A file the editor reads into its flame graph (relative to the run's folder).
+    File(String),
+    /// samply shows it in the Firefox Profiler in the browser.
+    Browser,
+}
+
+/// The profiling command for a run command line: py-spy for Python (any
+/// OS); perf on Linux (in-editor flame graph); samply elsewhere, or when
+/// perf is missing (macOS, Windows, Linux — opens in the browser).
+pub fn wrap(kind: crate::run::Kind, command: &str, out_stem: &str) -> Result<(String, Output), String> {
+    let has = |t: &str| which::which(t).is_ok();
+    pick(kind, command, out_stem, has("py-spy"), has("perf") && cfg!(target_os = "linux"), has("samply"))
+}
+
+fn pick(
+    kind: crate::run::Kind,
+    command: &str,
+    out_stem: &str,
+    py_spy: bool,
+    perf: bool,
+    samply: bool,
+) -> Result<(String, Output), String> {
     let q = crate::remote::sh_quote;
-    match kind {
-        crate::run::Kind::Python => {
-            if which::which("py-spy").is_err() {
-                return Err("Profiling Python needs py-spy: pip install py-spy".into());
-            }
-            let out = format!("{out_stem}.folded");
-            // py-spy starts the program itself: its words follow `--`.
-            Ok((format!("py-spy record -r 200 -f raw -o {} -- {command}", q(&out)), out))
+    if kind == crate::run::Kind::Python {
+        if !py_spy {
+            return Err("Profiling Python needs py-spy: pip install py-spy".into());
         }
-        _ => {
-            if which::which("perf").is_err() {
-                return Err(if cfg!(target_os = "macos") {
-                    "Native profiling uses perf (Linux). On macOS open a profile made with another tool (Run › Open Profile…)".into()
-                } else {
-                    "Profiling needs perf (apt install linux-tools-generic), or py-spy for Python".into()
-                });
-            }
-            let data = format!("{out_stem}.data");
-            let out = format!("{out_stem}.perf");
-            Ok((
-                format!(
-                    "perf record -F 999 -g -o {} -- sh -c {} ; perf script -i {} > {}",
-                    q(&data),
-                    q(command),
-                    q(&data),
-                    q(&out)
-                ),
-                out,
-            ))
-        }
+        let out = format!("{out_stem}.folded");
+        // py-spy starts the program itself: its words follow `--`.
+        return Ok((format!("py-spy record -r 200 -f raw -o {} -- {command}", q(&out)), Output::File(out)));
     }
+    if perf {
+        let data = format!("{out_stem}.data");
+        let out = format!("{out_stem}.perf");
+        return Ok((
+            format!(
+                "perf record -F 999 -g -o {} -- sh -c {} ; perf script -i {} > {}",
+                q(&data),
+                q(command),
+                q(&data),
+                q(&out)
+            ),
+            Output::File(out),
+        ));
+    }
+    if samply {
+        // samply records the program (and what it starts), then serves the
+        // profile to the Firefox Profiler with symbols.
+        return Ok((format!("samply record -- {command}"), Output::Browser));
+    }
+    Err("Profiling needs samply (cargo install samply — macOS, Windows, Linux) or perf on Linux; py-spy for Python"
+        .into())
 }
 
 pub enum Action {
@@ -472,11 +492,16 @@ myapp  1234 100.001001:     1001 cycles:\n\
     }
 
     #[test]
-    fn wraps_commands() {
-        if which::which("py-spy").is_ok() {
-            let (cmd, out) = wrap(crate::run::Kind::Python, "python3 main.py", ".zenith/profile-1").unwrap();
-            assert_eq!(cmd, "py-spy record -r 200 -f raw -o .zenith/profile-1.folded -- python3 main.py");
-            assert_eq!(out, ".zenith/profile-1.folded");
-        }
+    fn picks_a_profiler() {
+        use crate::run::Kind;
+        let (cmd, out) = pick(Kind::Python, "python3 main.py", ".zenith/p", true, false, false).unwrap();
+        assert_eq!(cmd, "py-spy record -r 200 -f raw -o .zenith/p.folded -- python3 main.py");
+        assert_eq!(out, Output::File(".zenith/p.folded".into()));
+        assert!(pick(Kind::Python, "python3 main.py", "p", false, true, true).is_err());
+        let (cmd, out) = pick(Kind::Cargo, "cargo run --release", "p", false, true, true).unwrap();
+        assert!(cmd.starts_with("perf record") && out == Output::File("p.perf".into()));
+        let (cmd, out) = pick(Kind::Cargo, "cargo run --release", "p", false, false, true).unwrap();
+        assert_eq!((cmd.as_str(), out), ("samply record -- cargo run --release", Output::Browser));
+        assert!(pick(Kind::Go, "go run .", "p", false, false, false).unwrap_err().contains("samply"));
     }
 }
