@@ -115,3 +115,4 @@ uchun O(n²) hisob).
 - [x] Qurilma loglari (logcat, simulator), Dart exception'lari Problems'da
 - [x] HTTP so'rovlar (`.http` fayllar, curl), ma'lumotlar bazasi paneli (sqlite3/psql/mysql), Docker paneli
 - [x] Saqlaganda run'ni qayta ishga tushirish (watch rejimi)
+- [x] Qator tarixi (`git log -L`), test coverage gutter'da, profiler va flame graph, AI'ga kontekst yuborish (DB/HTTP/Docker/Run)

@@ -242,6 +242,20 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
 - **⟲ Saqlaganda qayta ishga tushirish** — Run kartasidagi ⟲ yoqilsa, papkadagi fayl saqlanganda sessiya qayta
   ishga tushadi (backend serverlar uchun). `cargo-watch` o'rnatilgan bo'lsa — *Cargo: watch* ham chiqadi.
 
+## Coverage, profiler, qator tarixi
+
+- **Test coverage** — *Run → Run Tests with Coverage* testlarni coverage bilan ishga tushiradi (cargo llvm-cov,
+  `flutter test --coverage`, jest/vitest, `go test -coverprofile`, coverage.py). Gutter yonida: **yashil** — test bajargan
+  qator, **qizil** — bajarilmagan; status qatorida faylning foizi (`☂ 66%`). lcov, Cobertura XML va Go hisobotlari
+  o'qiladi va o'zgarganda qayta yuklanadi.
+- **Profiler** — Run panelidagi **⏱ Profile**: dastur py-spy (Python) yoki perf (Rust, Go, C…) ostida ishlaydi, tugagach
+  **flame graph** ochiladi (bosish — zoom, ikki marta bosish — kodga o'tish, nom bo'yicha qidiruv) va eng ko'p vaqt olgan
+  funksiyalar hamda qatorlar ro'yxati. *Run → Open Profile…* — boshqa vositalardan olingan profil (collapsed / perf script).
+- **Qator tarixi** — belgilangan qatorlar yoki kursor turgan funksiya qaysi commit'larda va qanday o'zgargani
+  (*Git: Show Line History* yoki editorda o'ng tugma): har commit xabari va o'sha qatorlar diff'i bilan.
+- **✳ AI bilan** — so'rov natijasi, HTTP javobi, konteyner va Run xatolari yonidagi ✳ tugmalari kerakli kontekstni
+  (SQL va xato, so'rov va javob — tokenlar yashirilgan, xatolar va chiqish oxiri) AI agentga yuboradi.
+
 ## Testlar
 
 **Testing** paneli (✓ belgisi) loyihadagi testlarni topadi: **Rust** (`cargo test` — lib, bin va `tests/`
