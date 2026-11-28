@@ -251,6 +251,13 @@ Tarmoqdagi (`192.168…`) URL yonidagi **▦** — telefonda ochish uchun QR kod
 - **Profiler** — Run panelidagi **⏱ Profile**: dastur py-spy (Python) yoki perf (Rust, Go, C…) ostida ishlaydi, tugagach
   **flame graph** ochiladi (bosish — zoom, ikki marta bosish — kodga o'tish, nom bo'yicha qidiruv) va eng ko'p vaqt olgan
   funksiyalar hamda qatorlar ro'yxati. *Run → Open Profile…* — boshqa vositalardan olingan profil (collapsed / perf script).
+- **O'zgarishlar coverage'i** — *Testing: Coverage of Changes*: commit qilinmagan o'zgarishlar yoki butun branch (main'dan
+  beri) qatorlarining necha foizi testlangan, testsiz qolgan qator raqamlari (bosing — o'sha joyga o'tadi).
+- **Profillarni solishtirish** — profil oynasidagi *Compare with…*: oldingi profil bilan farq (qizil — ko'proq vaqt,
+  ko'k — kamroq), eng ko'p o'zgargan funksiyalar ro'yxati. Native profillash: Linux'da perf (editor ichida),
+  macOS / Windows'da **samply** (Firefox Profiler brauzerda ochiladi, `cargo install samply`).
+- **Project setup** — *Run → Project Setup…*: `.zenith/` dagi run.toml, launch.toml, databases.toml, settings.toml holati
+  (bor/yo'q, nechta konfiguratsiya, xatolar), shablondan yaratish, profillarni `.gitignore`ga qo'shish.
 - **Qator tarixi** — belgilangan qatorlar yoki kursor turgan funksiya qaysi commit'larda va qanday o'zgargani
   (*Git: Show Line History* yoki editorda o'ng tugma): har commit xabari va o'sha qatorlar diff'i bilan.
 - **✳ AI bilan** — so'rov natijasi, HTTP javobi, konteyner va Run xatolari yonidagi ✳ tugmalari kerakli kontekstni
