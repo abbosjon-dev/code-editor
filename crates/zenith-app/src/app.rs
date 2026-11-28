@@ -351,6 +351,9 @@ pub struct ZenithApp {
     http: Option<crate::http_client::Panel>,
     db: DbState,
     coverage: crate::coverage::Coverage,
+    profile_view: Option<crate::profile::View>,
+    /// Profiling sessions: (terminal tab, the file it will write, title).
+    pending_profiles: Vec<(u64, PathBuf, String)>,
     /// Show coverage in the gutter (and keep reloading the report).
     show_coverage: bool,
     coverage_checked: Option<Instant>,
@@ -499,6 +502,8 @@ impl ZenithApp {
             http: None,
             db: DbState::default(),
             coverage: Default::default(),
+            profile_view: None,
+            pending_profiles: vec![],
             show_coverage: false,
             coverage_checked: None,
             docker_actions: vec![],
@@ -2040,6 +2045,23 @@ impl ZenithApp {
                     doc.buffer.insert(crate::http_client::TEMPLATE);
                 }
                 self.toast("Save it as a .http file, then Ctrl+Alt+Enter in a request", NotifyLevel::Info);
+            }
+            Cmd::ProfileRun => {
+                let (configs, _) = self.run_configurations();
+                let Some(cfg) = configs.get(self.runs.selected.min(configs.len().saturating_sub(1))).cloned() else {
+                    self.toast("Nothing to profile: add a run configuration", NotifyLevel::Info);
+                    return;
+                };
+                self.profile_config(cfg);
+            }
+            Cmd::OpenProfile => {
+                let mut d = rfd::FileDialog::new();
+                if let Some(ws) = &self.workspace {
+                    d = d.set_directory(ws);
+                }
+                if let Some(path) = d.pick_file() {
+                    self.open_profile(&path);
+                }
             }
             Cmd::ToggleCoverage => {
                 self.show_coverage = !self.show_coverage;
@@ -4258,6 +4280,8 @@ impl ZenithApp {
                 item(ui, Cmd::ShowDeviceScreen, "Show Device Screen…");
                 item(ui, Cmd::ShowDeviceLogs, "Show Device Logs…");
                 item(ui, Cmd::OpenPreview, "Web Preview…");
+                item(ui, Cmd::ProfileRun, "Profile");
+                item(ui, Cmd::OpenProfile, "Open Profile…");
                 item(ui, Cmd::RunTestsWithCoverage, "Run Tests with Coverage");
                 item(ui, Cmd::ToggleCoverage, "Show / Hide Coverage");
                 item(ui, Cmd::NewHttpRequest, "New HTTP Request File");
@@ -7845,6 +7869,77 @@ impl ZenithApp {
         self.runs.rescan_at = Some(Instant::now() + Duration::from_secs(12));
     }
 
+    /// Run a configuration under the profiler; the flame graph opens when
+    /// it ends.
+    fn profile_config(&mut self, cfg: crate::run::RunConfig) {
+        let Some(ws) = self.workspace.clone() else { return };
+        if self.remote.is_some() {
+            self.toast("Profiling runs on this computer only (not over SSH) for now", NotifyLevel::Info);
+            return;
+        }
+        if !cfg.compound.is_empty() {
+            self.toast("Pick one configuration (not a compound) to profile", NotifyLevel::Info);
+            return;
+        }
+        let dir = if cfg.cwd.is_empty() { ws.clone() } else { ws.join(&cfg.cwd) };
+        let _ = std::fs::create_dir_all(dir.join(".zenith"));
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let stem = format!(".zenith/profile-{stamp}");
+        match crate::profile::wrap(cfg.kind, &cfg.command, &stem) {
+            Ok((command, out)) => {
+                let title = cfg.name.clone();
+                let c = crate::run::RunConfig { name: format!("Profile: {}", cfg.name), command, ..cfg };
+                self.start_run_on(c, None);
+                if let Some(r) = self.runs.sessions.last() {
+                    self.pending_profiles.push((r.tab, dir.join(out), title));
+                }
+                self.toast(
+                    "Profiling — the flame graph opens when the program ends (stop it to finish early)",
+                    NotifyLevel::Info,
+                );
+            }
+            Err(e) => self.toast(e, NotifyLevel::Warning),
+        }
+    }
+
+    fn open_profile(&mut self, path: &Path) {
+        match crate::profile::Profile::load(path) {
+            Ok(p) => {
+                let root = self.workspace.clone().unwrap_or_else(|| path.parent().unwrap_or(path).to_path_buf());
+                // py-spy paths are relative to where the program ran.
+                let root = if path.parent().and_then(|d| d.file_name()).is_some_and(|n| n == ".zenith") {
+                    path.parent().and_then(|d| d.parent()).map(Path::to_path_buf).unwrap_or(root)
+                } else {
+                    root
+                };
+                let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.profile_view = Some(crate::profile::View::new(title, p, root));
+            }
+            Err(e) => self.toast(e, NotifyLevel::Error),
+        }
+    }
+
+    /// Profiling sessions that ended: open their flame graphs.
+    fn poll_profiles(&mut self) {
+        let ended: Vec<usize> = (0..self.pending_profiles.len())
+            .filter(|&k| {
+                let tab = self.pending_profiles[k].0;
+                !self.bottom.tabs.iter().any(|t| t.id == tab && t.is_alive())
+            })
+            .collect();
+        for k in ended.into_iter().rev() {
+            let (_, out, title) = self.pending_profiles.remove(k);
+            if out.exists() {
+                self.open_profile(&out);
+                if let Some(v) = &mut self.profile_view {
+                    v.title = title;
+                }
+            } else {
+                self.toast("The profiler wrote no samples (did the program start?)", NotifyLevel::Warning);
+            }
+        }
+    }
+
     /// Reload the coverage report when it changes; give open files theirs.
     fn refresh_coverage(&mut self) {
         if !self.show_coverage {
@@ -8169,6 +8264,7 @@ impl ZenithApp {
         let mut start: Option<crate::run::RunConfig> = None;
         // (label, command, per device)
         let mut build: Option<(String, String, bool)> = None;
+        let mut profile: Option<crate::run::RunConfig> = None;
         ui.horizontal(|ui| {
             Self::section_header(ui, p, "RUN");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -8219,8 +8315,20 @@ impl ZenithApp {
                 let cfg = &configs[new_sel];
                 let tasks = crate::run::build_tasks(cfg, &ws);
                 let dir = if cfg.cwd.is_empty() { ws.clone() } else { ws.join(&cfg.cwd) };
-                if !tasks.is_empty() || kind == crate::run::Kind::Flutter {
+                let can_profile = !cfg.build && cfg.compound.is_empty();
+                if !tasks.is_empty() || kind == crate::run::Kind::Flutter || can_profile {
                     ui.horizontal(|ui| {
+                        if can_profile
+                            && ui
+                                .small_button("⏱ Profile")
+                                .on_hover_text("Run it under the profiler and show a flame graph (py-spy for Python, perf otherwise)")
+                                .clicked()
+                        {
+                            profile = Some(cfg.clone());
+                        }
+                        if tasks.is_empty() && kind != crate::run::Kind::Flutter {
+                            return;
+                        }
                         ui.menu_button(RichText::new("🔨 Build").small(), |ui| {
                             ui.set_min_width(260.0);
                             for (label, command) in &tasks {
@@ -8603,6 +8711,9 @@ impl ZenithApp {
         }
         if let Some(c) = start {
             self.start_run(c);
+        }
+        if let Some(c) = profile {
+            self.profile_config(c);
         }
         if let Some((label, command, per_device)) = build {
             let sel = &configs[self.runs.selected.min(configs.len() - 1)];
@@ -9264,6 +9375,9 @@ impl ZenithApp {
         self.poll_loading();
         self.refresh_outline();
         self.refresh_coverage();
+        if !self.pending_profiles.is_empty() {
+            self.poll_profiles();
+        }
         self.poll_runs();
         if self.style_dirty {
             theme::apply_style(ctx, &self.colors, self.settings.ui_font_size);
@@ -9647,6 +9761,21 @@ impl ZenithApp {
         self.changes_window(ctx);
         self.settings_window(ctx);
         self.inline_edit_window(ctx);
+        if let Some(v) = &mut self.profile_view {
+            let mut open = true;
+            let act = v.ui(ctx, &self.colors.clone(), &mut open);
+            if !open {
+                self.profile_view = None;
+            }
+            if let Some(crate::profile::Action::Open(path, line)) = act {
+                if self.open_file(&path) {
+                    if let Some(doc) = self.docs.get_mut(self.active) {
+                        doc.goto_line(line.saturating_sub(1) as usize);
+                    }
+                    self.focus_editor = true;
+                }
+            }
+        }
         if let Some(lh) = &mut self.line_history {
             let mut open = true;
             let fs = self.settings.editor_font_size;

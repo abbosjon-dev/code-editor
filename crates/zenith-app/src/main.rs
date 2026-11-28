@@ -35,6 +35,7 @@ mod mirror;
 mod outline;
 mod palette;
 mod preview;
+mod profile;
 mod qr;
 mod remote;
 mod review;
